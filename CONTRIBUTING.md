@@ -22,6 +22,7 @@
 3. Keep adapters (I/O) separated from orchestration logic.
 4. Add tests for behavioral changes.
 5. Any architecture-impacting change requires an ADR in `docs/adr`.
+6. For `scripts/*.ps1`, declare script platform metadata (`# platform: any|windows`) and follow `docs/automation-guardrails.md`.
 
 ## CI Contract
 

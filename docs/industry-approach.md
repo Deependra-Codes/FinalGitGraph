@@ -133,6 +133,14 @@ Implemented Slice G:
 4. CI performance budget gate (`scripts/perf-budget.ps1` + Rust CI workflow step)
 5. guardrail checks requiring perf gate artifacts and script contract
 
+Implemented Slice H:
+
+1. cross-platform automation guardrail policy (`docs/automation-guardrails.md`)
+2. script-level platform metadata contract (`# platform: any|windows`)
+3. static portable-script checks against OS-specific shell/env assumptions
+4. CI script contract probe lane before heavy build/test stages
+5. script runtime hardening for home/path resolution across Windows and Linux runners
+
 ## Phase 2 Exit Criteria
 
 1. Deterministic re-index with no data drift for same repo state.

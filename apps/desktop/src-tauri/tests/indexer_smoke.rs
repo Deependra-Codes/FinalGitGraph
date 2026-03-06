@@ -197,6 +197,7 @@ fn graph_traversal_and_shortest_path_work() {
     .unwrap_or_else(|error| panic!("no path query: {error}"));
     assert!(!no_parent_path.found);
     assert!(no_parent_path.path.is_empty());
+    assert!(no_parent_path.visited_nodes >= 1);
 }
 
 #[test]

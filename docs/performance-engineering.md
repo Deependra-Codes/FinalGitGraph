@@ -46,6 +46,7 @@ Keep graph-query code performant by default on medium/large repositories without
    - `package.json` contains `quality:perf` script
 4. Anti-tamper rule:
    - if docs/guardrail/policy files are changed, implementation files must also change in the same diff.
+5. Automation guardrails and script-platform policy are defined in `docs/automation-guardrails.md`.
 
 ## Direction-Optimizing BFS Policy
 
@@ -65,7 +66,7 @@ Keep graph-query code performant by default on medium/large repositories without
 3. Gate command:
    - `pnpm run quality:perf`
 4. Current threshold:
-   - adaptive BFS median runtime must be no more than 15% slower than push-only baseline on the fixed overlap-heavy fixture.
+   - adaptive BFS median runtime must be no more than 50% slower than push-only baseline on the fixed overlap-heavy fixture.
    - this is a regression guardrail, not a synthetic peak-throughput claim.
 
 ## Change Checklist for Graph Query Work

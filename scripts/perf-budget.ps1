@@ -1,5 +1,7 @@
+# platform: any
 param(
-    [string]$CargoTargetRoot = ""
+    [string]$CargoTargetRoot = "",
+    [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +30,17 @@ $env:CARGO_TARGET_DIR = $CargoTargetRoot
 
 Push-Location $repoRoot
 try {
+    if ($ProbeOnly) {
+        $cargoCommand = Get-Command "cargo" -ErrorAction SilentlyContinue
+        if ($null -eq $cargoCommand) {
+            throw "cargo was not found in PATH while probing performance script."
+        }
+        Write-Host "Performance budget probe passed."
+        Write-Host "Home: $userHome"
+        Write-Host "Cargo target: $CargoTargetRoot"
+        return
+    }
+
     Write-Host "Running graph traversal performance budget..."
     cargo test `
         --package gitgraph-lab-core `

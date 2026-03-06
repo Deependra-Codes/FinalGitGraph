@@ -42,6 +42,7 @@ Create a deterministic, industry-grade Rust system from day zero so both humans 
     dev-loop.ps1              # one-command development gate switch
   apps/desktop/src-tauri/     # current Rust product crate
   docs/adr/                   # architecture decision records
+  docs/automation-guardrails.md
 ```
 
 ## Rust Architecture Contract
@@ -87,8 +88,10 @@ Definition of done:
 1. Performance-sensitive graph query code follows `docs/performance-engineering.md`.
 2. Guardrails reject String-heavy frontier state in `application/graph_queries.rs`.
 3. Rust CI includes dedicated `Performance Budget` gate for direction-optimizing BFS.
-4. Guardrails block docs/guardrail-only diffs when no implementation files are changed.
-5. Any future identity/storage strategy change for graph query internals must be documented via ADR.
+4. Rust CI includes cross-platform `Script Contract Probe` for automation script portability.
+5. Guardrails enforce script platform metadata and portable-script policy.
+6. Guardrails block docs/guardrail-only diffs when no implementation files are changed.
+7. Any future identity/storage strategy change for graph query internals must be documented via ADR.
 
 ## Phase 2 (System Hardening)
 

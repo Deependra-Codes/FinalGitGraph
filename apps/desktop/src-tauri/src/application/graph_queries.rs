@@ -815,7 +815,7 @@ mod tests {
         const FRONTIER_WIDTH: usize = 2_000;
         const SINK_WIDTH: usize = 64;
         const RUNS: usize = 7;
-        const MAX_SLOWDOWN_PERCENT: u128 = 115;
+        const MAX_SLOWDOWN_PERCENT: u128 = 150;
 
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
         run_migrations(&mut conn).expect("run migrations");

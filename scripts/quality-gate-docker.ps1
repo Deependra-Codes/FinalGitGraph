@@ -1,3 +1,4 @@
+# platform: any
 param(
     [string]$Image = "rust:1.94",
     [switch]$Fast

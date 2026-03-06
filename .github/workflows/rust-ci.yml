@@ -34,6 +34,10 @@ jobs:
       - name: Set Default Rust
         run: rustup default 1.94.0
 
+      - name: Script Contract Probe
+        shell: pwsh
+        run: ./scripts/perf-budget.ps1 -ProbeOnly
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:

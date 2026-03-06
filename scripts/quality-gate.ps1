@@ -1,3 +1,4 @@
+# platform: any
 param(
     [ValidateSet("x64", "x86")]
     [string]$Arch = "x64",
@@ -9,12 +10,21 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+$userHome = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+    $env:USERPROFILE
+} elseif (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
+    $env:HOME
+} else {
+    (Resolve-Path "~").Path
+}
+$pathSeparator = if ($env:OS -eq "Windows_NT") { ";" } else { ":" }
+
+$cargoBin = Join-Path $userHome ".cargo/bin"
 if (Test-Path $cargoBin) {
-    $env:Path = "$cargoBin;$env:Path"
+    $env:Path = "$cargoBin$pathSeparator$env:Path"
 }
 if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
-    $CargoTargetRoot = Join-Path $env:USERPROFILE ".cargo-target\gitgraph-lab"
+    $CargoTargetRoot = Join-Path $userHome ".cargo-target/gitgraph-lab"
 }
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null

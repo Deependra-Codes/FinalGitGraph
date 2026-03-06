@@ -1,3 +1,4 @@
+# platform: any
 param()
 
 $ErrorActionPreference = "Stop"
@@ -35,8 +36,8 @@ function Get-ChangedFiles {
 
     Push-Location $RepoRoot
     try {
-        $working = Invoke-GitLines -Arguments "diff --name-only -- ."
-        $staged = Invoke-GitLines -Arguments "diff --name-only --cached -- ."
+        $working = Invoke-GitLines -Arguments @("diff", "--name-only", "--", ".")
+        $staged = Invoke-GitLines -Arguments @("diff", "--name-only", "--cached", "--", ".")
         foreach ($entry in @($working + $staged)) {
             if (-not [string]::IsNullOrWhiteSpace($entry)) {
                 $changed.Add((Normalize-RepoPath $entry))
@@ -48,9 +49,9 @@ function Get-ChangedFiles {
             $env:GITHUB_EVENT_NAME -eq "pull_request" -and
             -not [string]::IsNullOrWhiteSpace($env:GITHUB_BASE_REF)
         ) {
-            Invoke-GitQuiet -Arguments "fetch --no-tags --depth=200 origin $($env:GITHUB_BASE_REF)" | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $pullRequestDiff = Invoke-GitLines -Arguments "diff --name-only origin/$($env:GITHUB_BASE_REF)...HEAD"
+            $fetchExitCode = Invoke-GitQuiet -Arguments @("fetch", "--no-tags", "--depth=200", "origin", $env:GITHUB_BASE_REF)
+            if ($fetchExitCode -eq 0) {
+                $pullRequestDiff = Invoke-GitLines -Arguments @("diff", "--name-only", "origin/$($env:GITHUB_BASE_REF)...HEAD")
                 foreach ($entry in $pullRequestDiff) {
                     if (-not [string]::IsNullOrWhiteSpace($entry)) {
                         $changed.Add((Normalize-RepoPath $entry))
@@ -60,9 +61,9 @@ function Get-ChangedFiles {
         }
 
         if ($changed.Count -eq 0) {
-            Invoke-GitQuiet -Arguments "rev-parse --verify HEAD~1" | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $headDiff = Invoke-GitLines -Arguments "diff --name-only HEAD~1..HEAD"
+            $verifyExitCode = Invoke-GitQuiet -Arguments @("rev-parse", "--verify", "HEAD~1")
+            if ($verifyExitCode -eq 0) {
+                $headDiff = Invoke-GitLines -Arguments @("diff", "--name-only", "HEAD~1..HEAD")
                 foreach ($entry in $headDiff) {
                     if (-not [string]::IsNullOrWhiteSpace($entry)) {
                         $changed.Add((Normalize-RepoPath $entry))
@@ -78,35 +79,68 @@ function Get-ChangedFiles {
     return @($changed | Sort-Object -Unique)
 }
 
-function Invoke-GitLines {
-    param([string]$Arguments)
+function Invoke-GitCommand {
+    param(
+        [string[]]$Arguments,
+        [switch]$Quiet
+    )
 
-    $isWindowsPlatform = $env:OS -eq "Windows_NT"
-    if ($isWindowsPlatform) {
-        $output = cmd /c "git $Arguments 2>nul"
-    } else {
-        $output = & /bin/bash -lc "git $Arguments 2>/dev/null"
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+
+    try {
+        $process = Start-Process `
+            -FilePath "git" `
+            -ArgumentList $Arguments `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath
+
+        $global:LASTEXITCODE = $process.ExitCode
+        $output = @()
+        if (-not $Quiet -and (Test-Path $stdoutPath)) {
+            $output = Get-Content -Path $stdoutPath -ErrorAction SilentlyContinue
+        }
+
+        return @{
+            ExitCode = $process.ExitCode
+            Output   = $output
+        }
     }
-    if ($LASTEXITCODE -ne 0 -or $null -eq $output) {
+    catch {
+        $global:LASTEXITCODE = 1
+        return @{
+            ExitCode = 1
+            Output   = @()
+        }
+    }
+    finally {
+        Remove-Item -Path $stdoutPath -ErrorAction SilentlyContinue
+        Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-GitLines {
+    param([string[]]$Arguments)
+
+    $result = Invoke-GitCommand -Arguments $Arguments
+    if ($result.ExitCode -ne 0 -or $null -eq $result.Output) {
         return @()
     }
     return @(
-        $output |
+        $result.Output |
         ForEach-Object { $_.Trim() } |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
 }
 
 function Invoke-GitQuiet {
-    param([string]$Arguments)
+    param([string[]]$Arguments)
 
-    $isWindowsPlatform = $env:OS -eq "Windows_NT"
-    if ($isWindowsPlatform) {
-        cmd /c "git $Arguments 1>nul 2>nul" | Out-Null
-    } else {
-        & /bin/bash -lc "git $Arguments >/dev/null 2>/dev/null" | Out-Null
-    }
-    return $LASTEXITCODE
+    $result = Invoke-GitCommand -Arguments $Arguments -Quiet
+    return $result.ExitCode
 }
 
 Write-Host "Checking repository guardrails..."
@@ -212,7 +246,8 @@ $requiredDocs = @(
     "docs/engineering-system.md",
     "docs/from-scratch-system.md",
     "docs/adr/README.md",
-    "docs/performance-engineering.md"
+    "docs/performance-engineering.md",
+    "docs/automation-guardrails.md"
 )
 foreach ($docPath in $requiredDocs) {
     $fullPath = Join-Path $repoRoot $docPath
@@ -220,6 +255,56 @@ foreach ($docPath in $requiredDocs) {
         Add-Pass "Required governance doc present: $docPath"
     } else {
         Add-Failure "Required governance doc missing: $docPath"
+    }
+}
+
+$scriptDir = Join-Path $repoRoot "scripts"
+if (-not (Test-Path $scriptDir)) {
+    Add-Failure "Missing scripts directory: $scriptDir"
+} else {
+    $scriptFiles = Get-ChildItem -Path $scriptDir -File -Filter "*.ps1"
+    $metadataPattern = '^\s*#\s*platform:\s*(any|windows)\s*$'
+    $portableForbiddenChecks = @(
+        @{ Pattern = '\bcmd\s*/c\b'; Message = "portable scripts must not use cmd /c directly" },
+        @{ Pattern = '/bin/bash'; Message = "portable scripts must not hardcode /bin/bash" },
+        @{ Pattern = '\$env:Path\s*=\s*".*;.*\$env:Path'; Message = "portable scripts must not hardcode ';' path separator" },
+        @{ Pattern = '[12]>\s*nul\b'; Message = "portable scripts must not rely on Windows null redirection" }
+    )
+
+    foreach ($scriptFile in $scriptFiles) {
+        $relativePath = Normalize-RepoPath($scriptFile.FullName.Substring($repoRoot.Length + 1))
+        $firstLines = Get-Content -Path $scriptFile.FullName -TotalCount 8
+        $platform = $null
+        foreach ($line in $firstLines) {
+            if ($line -match $metadataPattern) {
+                $platform = $matches[1].ToLowerInvariant()
+                break
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($platform)) {
+            Add-Failure "Script missing platform metadata ('# platform: any|windows'): $relativePath"
+            continue
+        }
+
+        Add-Pass "Script platform metadata present: $relativePath ($platform)"
+        if ($platform -eq "any" -and $relativePath -ne "scripts/enforce-guardrails.ps1") {
+            $content = Get-Content -Path $scriptFile.FullName -Raw
+            $violations = New-Object System.Collections.Generic.List[string]
+            if ($content -match '\$env:USERPROFILE' -and $content -notmatch '\$env:HOME') {
+                $violations.Add("portable scripts using USERPROFILE must also provide HOME fallback")
+            }
+            foreach ($check in $portableForbiddenChecks) {
+                if ($content -match $check.Pattern) {
+                    $violations.Add($check.Message)
+                }
+            }
+
+            if ($violations.Count -gt 0) {
+                $message = ($violations | Select-Object -Unique) -join "; "
+                Add-Failure "Portable script policy violation in ${relativePath}: $message"
+            }
+        }
     }
 }
 
@@ -281,6 +366,12 @@ if (Test-Path $workflowPath) {
         Add-Pass "Rust CI workflow includes Performance Budget step."
     } else {
         Add-Failure "Rust CI workflow must include a Performance Budget step."
+    }
+
+    if (Select-String -Path $workflowPath -Pattern "Script Contract Probe" -Quiet) {
+        Add-Pass "Rust CI workflow includes Script Contract Probe step."
+    } else {
+        Add-Failure "Rust CI workflow must include a Script Contract Probe step."
     }
 }
 

@@ -1,3 +1,4 @@
+# platform: windows
 param(
     [ValidateSet("x64", "x86")]
     [string]$Arch = "x64",

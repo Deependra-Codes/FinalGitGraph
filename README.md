@@ -61,6 +61,8 @@ Run a one-shot environment check before development/testing:
 pnpm run guardrails
 ```
 
+Automation policy reference: `docs/automation-guardrails.md`
+
 Combined safe commands:
 
 ```powershell

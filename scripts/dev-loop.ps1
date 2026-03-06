@@ -1,3 +1,4 @@
+# platform: any
 param(
     [ValidateSet("docker", "host")]
     [string]$BackendMode = "docker",

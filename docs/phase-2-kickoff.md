@@ -103,3 +103,13 @@ Completed:
 3. Added ignored release perf budget test (`perf_budget_direction_optimizing_bfs`).
 4. Added `scripts/perf-budget.ps1` and `quality:perf` package script.
 5. Wired Rust CI with `Performance Budget` step and updated guardrails to require perf gate artifacts.
+
+## Phase 2 Slice H Status (2026-03-07)
+
+Completed:
+
+1. Added repository-wide automation guardrail contract doc (`docs/automation-guardrails.md`).
+2. Added script platform metadata contract (`# platform: any|windows`) enforced in guardrails.
+3. Added portable-script policy checks to block OS-specific assumptions in cross-platform scripts.
+4. Added `Script Contract Probe` in Rust CI (`./scripts/perf-budget.ps1 -ProbeOnly`) for both runner OSes.
+5. Hardened automation scripts for cross-platform home/path resolution.
