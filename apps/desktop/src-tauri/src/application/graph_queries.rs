@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use rusqlite::Connection;
 
@@ -54,17 +54,21 @@ impl CompactNodeMap {
 
 #[derive(Default)]
 struct DenseSet {
-    bits: Vec<u8>,
+    words: Vec<u64>,
     count: usize,
 }
 
 impl DenseSet {
     fn insert(&mut self, id: NodeId) -> bool {
-        if id >= self.bits.len() {
-            self.bits.resize(id + 1, 0);
+        let word_index = id / u64::BITS as usize;
+        let bit_mask = 1u64 << (id % u64::BITS as usize);
+
+        if word_index >= self.words.len() {
+            self.words.resize(word_index + 1, 0);
         }
-        if self.bits[id] == 0 {
-            self.bits[id] = 1;
+
+        if self.words[word_index] & bit_mask == 0 {
+            self.words[word_index] |= bit_mask;
             self.count = self.count.saturating_add(1);
             true
         } else {
@@ -73,7 +77,12 @@ impl DenseSet {
     }
 
     fn contains(&self, id: NodeId) -> bool {
-        self.bits.get(id).copied().unwrap_or_default() == 1
+        let word_index = id / u64::BITS as usize;
+        let bit_mask = 1u64 << (id % u64::BITS as usize);
+        self.words
+            .get(word_index)
+            .map(|word| *word & bit_mask != 0)
+            .unwrap_or(false)
     }
 
     fn count(&self) -> usize {
@@ -81,14 +90,12 @@ impl DenseSet {
     }
 
     fn union_count(&self, other: &Self) -> usize {
-        let max_len = self.bits.len().max(other.bits.len());
+        let max_len = self.words.len().max(other.words.len());
         let mut total = 0usize;
         for index in 0..max_len {
-            let left = self.bits.get(index).copied().unwrap_or_default();
-            let right = other.bits.get(index).copied().unwrap_or_default();
-            if left == 1 || right == 1 {
-                total += 1;
-            }
+            let left = self.words.get(index).copied().unwrap_or_default();
+            let right = other.words.get(index).copied().unwrap_or_default();
+            total = total.saturating_add((left | right).count_ones() as usize);
         }
         total
     }
@@ -460,7 +467,10 @@ fn traverse_topological(
 ) -> AppResult<(Vec<(NodeId, usize)>, bool)> {
     let (reachable, depths, truncated_reachable) =
         collect_reachable_bfs(conn, repo_id, start_id, direction, max_nodes, nodes)?;
-    let reachable_set: HashSet<NodeId> = reachable.iter().copied().collect();
+    let mut reachable_set = DenseSet::default();
+    for node_id in &reachable {
+        reachable_set.insert(*node_id);
+    }
 
     let mut indegree: HashMap<NodeId, usize> = reachable
         .iter()
@@ -478,10 +488,12 @@ fn traverse_topological(
     for source_id in &reachable {
         let source_rowid = nodes.rowid_for_id(*source_id);
         let mut filtered = Vec::new();
-        for neighbor_rowid in neighbors.get(&source_rowid).cloned().unwrap_or_default() {
-            let neighbor_id = nodes.intern(neighbor_rowid);
-            if reachable_set.contains(&neighbor_id) {
-                filtered.push(neighbor_id);
+        if let Some(source_neighbors) = neighbors.get(&source_rowid) {
+            for &neighbor_rowid in source_neighbors {
+                let neighbor_id = nodes.intern(neighbor_rowid);
+                if reachable_set.contains(neighbor_id) {
+                    filtered.push(neighbor_id);
+                }
             }
         }
 
@@ -527,9 +539,12 @@ fn traverse_topological(
 
     let mut truncated = truncated_reachable || ordered.len() < reachable.len();
     if ordered.len() < reachable.len() {
-        let present: HashSet<NodeId> = ordered.iter().map(|(node_id, _)| *node_id).collect();
+        let mut present = DenseSet::default();
+        for (node_id, _) in &ordered {
+            present.insert(*node_id);
+        }
         for source_id in reachable {
-            if !present.contains(&source_id) {
+            if !present.contains(source_id) {
                 ordered.push((
                     source_id,
                     depths.get(&source_id).copied().unwrap_or_default(),
@@ -578,12 +593,14 @@ fn collect_reachable_bfs(
             order.push(source_id);
             let source_rowid = nodes.rowid_for_id(source_id);
 
-            for neighbor_rowid in neighbors.get(&source_rowid).cloned().unwrap_or_default() {
-                let neighbor_id = nodes.intern(neighbor_rowid);
-                if visited.insert(neighbor_id) {
-                    let next_depth = depth.saturating_add(1);
-                    depths.insert(neighbor_id, next_depth);
-                    queue.push_back((neighbor_id, next_depth));
+            if let Some(source_neighbors) = neighbors.get(&source_rowid) {
+                for &neighbor_rowid in source_neighbors {
+                    let neighbor_id = nodes.intern(neighbor_rowid);
+                    if visited.insert(neighbor_id) {
+                        let next_depth = depth.saturating_add(1);
+                        depths.insert(neighbor_id, next_depth);
+                        queue.push_back((neighbor_id, next_depth));
+                    }
                 }
             }
 
@@ -650,17 +667,19 @@ fn expand_frontier(
 
     for source_id in level_nodes {
         let source_rowid = nodes.rowid_for_id(source_id);
-        for neighbor_rowid in neighbors.get(&source_rowid).cloned().unwrap_or_default() {
-            let neighbor_id = nodes.intern(neighbor_rowid);
-            if current_side.visited.insert(neighbor_id) {
-                ensure_slot(&mut current_side.predecessors, neighbor_id);
-                current_side.predecessors[neighbor_id] = Some(source_id);
+        if let Some(source_neighbors) = neighbors.get(&source_rowid) {
+            for &neighbor_rowid in source_neighbors {
+                let neighbor_id = nodes.intern(neighbor_rowid);
+                if current_side.visited.insert(neighbor_id) {
+                    ensure_slot(&mut current_side.predecessors, neighbor_id);
+                    current_side.predecessors[neighbor_id] = Some(source_id);
 
-                if visited_other_side.contains(neighbor_id) {
-                    return Ok(Some(neighbor_id));
+                    if visited_other_side.contains(neighbor_id) {
+                        return Ok(Some(neighbor_id));
+                    }
+
+                    current_side.frontier.push_back(neighbor_id);
                 }
-
-                current_side.frontier.push_back(neighbor_id);
             }
         }
     }

@@ -48,7 +48,7 @@ function Get-ChangedFiles {
             $env:GITHUB_EVENT_NAME -eq "pull_request" -and
             -not [string]::IsNullOrWhiteSpace($env:GITHUB_BASE_REF)
         ) {
-            cmd /c "git fetch --no-tags --depth=200 origin $($env:GITHUB_BASE_REF) 1>nul 2>nul" | Out-Null
+            Invoke-GitQuiet -Arguments "fetch --no-tags --depth=200 origin $($env:GITHUB_BASE_REF)" | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 $pullRequestDiff = Invoke-GitLines -Arguments "diff --name-only origin/$($env:GITHUB_BASE_REF)...HEAD"
                 foreach ($entry in $pullRequestDiff) {
@@ -60,7 +60,7 @@ function Get-ChangedFiles {
         }
 
         if ($changed.Count -eq 0) {
-            cmd /c "git rev-parse --verify HEAD~1 1>nul 2>nul" | Out-Null
+            Invoke-GitQuiet -Arguments "rev-parse --verify HEAD~1" | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 $headDiff = Invoke-GitLines -Arguments "diff --name-only HEAD~1..HEAD"
                 foreach ($entry in $headDiff) {
@@ -81,7 +81,12 @@ function Get-ChangedFiles {
 function Invoke-GitLines {
     param([string]$Arguments)
 
-    $output = cmd /c "git $Arguments 2>nul"
+    $isWindowsPlatform = $env:OS -eq "Windows_NT"
+    if ($isWindowsPlatform) {
+        $output = cmd /c "git $Arguments 2>nul"
+    } else {
+        $output = & /bin/bash -lc "git $Arguments 2>/dev/null"
+    }
     if ($LASTEXITCODE -ne 0 -or $null -eq $output) {
         return @()
     }
@@ -90,6 +95,18 @@ function Invoke-GitLines {
         ForEach-Object { $_.Trim() } |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
     )
+}
+
+function Invoke-GitQuiet {
+    param([string]$Arguments)
+
+    $isWindowsPlatform = $env:OS -eq "Windows_NT"
+    if ($isWindowsPlatform) {
+        cmd /c "git $Arguments 1>nul 2>nul" | Out-Null
+    } else {
+        & /bin/bash -lc "git $Arguments >/dev/null 2>/dev/null" | Out-Null
+    }
+    return $LASTEXITCODE
 }
 
 Write-Host "Checking repository guardrails..."
