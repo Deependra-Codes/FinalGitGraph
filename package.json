@@ -10,6 +10,7 @@
     "guardrails": "powershell -ExecutionPolicy Bypass -File ./scripts/enforce-guardrails.ps1",
     "quality:rust": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate.ps1",
     "quality:rust:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate.ps1 -Fast",
+    "quality:perf": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-budget.ps1",
     "quality:rust:docker": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate-docker.ps1",
     "quality:rust:docker:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate-docker.ps1 -Fast",
     "dev:gate": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-loop.ps1",

@@ -12,7 +12,8 @@
 1. Run `pnpm run guardrails`.
 2. Use `pnpm run dev:gate:fast` during active development.
 3. Run `pnpm run dev:gate` before opening PR / merge.
-4. If Windows policy blocks local build scripts (`os error 4551`), keep Docker backend lane as default.
+4. If graph traversal/runtime performance paths changed, run `pnpm run quality:perf`.
+5. If Windows policy blocks local build scripts (`os error 4551`), keep Docker backend lane as default.
 
 ## Coding Rules
 

@@ -3,19 +3,22 @@ use std::path::{Path, PathBuf};
 use rusqlite::params;
 
 use crate::adapters::db::{
-    clear_repository_index_data, delete_file_changes_for_commits, load_commit_window,
-    load_index_checkpoint, open_database, run_migrations, set_repository_indexed_at,
-    synchronize_refs, upsert_file_changes, upsert_index_checkpoint, upsert_repository,
+    clear_repository_index_data, delete_file_changes_for_commits, load_commit_rowid,
+    load_commit_window, load_index_checkpoint, open_database, run_migrations,
+    set_repository_indexed_at, synchronize_refs, upsert_file_changes, upsert_index_checkpoint,
+    upsert_repository,
 };
 use crate::adapters::git::{
     load_commits, load_commits_since, load_file_changes_for_commits, load_refs, validate_repository,
 };
+use crate::application::graph_queries;
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowResponse, IndexCheckpoint, IndexingMode, IndexingStats,
-    RepositorySummary,
+    CommitWindowCursor, CommitWindowResponse, GraphDirection, GraphTraversalResponse,
+    GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, RepositorySummary,
+    ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
-use crate::support::error::AppResult;
+use crate::support::error::{AppError, AppResult};
 
 const DEFAULT_WINDOW_LIMIT: usize = 100;
 const MAX_WINDOW_LIMIT: usize = 500;
@@ -204,6 +207,68 @@ impl Indexer {
             next_cursor,
             has_more,
         })
+    }
+
+    pub fn traverse_graph(
+        &self,
+        path: &Path,
+        start_sha: &str,
+        strategy: GraphTraversalStrategy,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<GraphTraversalResponse> {
+        let canonical_repo = validate_repository(path)?;
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+
+        let repo_id = upsert_repository(
+            &conn,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
+        )?;
+
+        let Some(start_rowid) = load_commit_rowid(&conn, repo_id, start_sha)? else {
+            return Err(AppError::InvalidArgument(format!(
+                "start commit not indexed for repository: {start_sha}"
+            )));
+        };
+
+        graph_queries::traverse_graph(&conn, repo_id, start_rowid, strategy, direction, max_nodes)
+    }
+
+    pub fn shortest_path(
+        &self,
+        path: &Path,
+        from_sha: &str,
+        to_sha: &str,
+        direction: GraphDirection,
+    ) -> AppResult<ShortestPathResponse> {
+        let canonical_repo = validate_repository(path)?;
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+
+        let repo_id = upsert_repository(
+            &conn,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
+        )?;
+
+        let Some(from_rowid) = load_commit_rowid(&conn, repo_id, from_sha)? else {
+            return Err(AppError::InvalidArgument(format!(
+                "source commit not indexed for repository: {from_sha}"
+            )));
+        };
+        let Some(to_rowid) = load_commit_rowid(&conn, repo_id, to_sha)? else {
+            return Err(AppError::InvalidArgument(format!(
+                "target commit not indexed for repository: {to_sha}"
+            )));
+        };
+
+        graph_queries::shortest_path(
+            &conn, repo_id, from_sha, to_sha, direction, from_rowid, to_rowid,
+        )
     }
 }
 

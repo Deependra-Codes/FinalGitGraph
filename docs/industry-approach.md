@@ -97,6 +97,42 @@ Implemented Slice B:
 2. incremental replay cleanup for file-level rows
 3. parser + integration validation for file change ingestion
 
+Implemented Slice C:
+
+1. DAG traversal APIs (`bfs`, `dfs`, `topological`)
+2. shortest-path API across `parents`/`children`/`both` directions
+3. integration validation for traversal and shortest-path contracts
+
+Implemented Slice D:
+
+1. bidirectional BFS shortest-path engine for better scaling behavior
+2. non-linear branch/merge fixture coverage for graph-query correctness
+3. directional guardrails validation (`both` + topological rejection, traversal truncation signaling)
+
+Implemented Slice E:
+
+1. modular graph-query extraction into dedicated application module (`graph_queries`)
+2. batched frontier neighbor retrieval in DB adapter to reduce graph-query I/O round-trips
+3. batched BFS/topological and bidirectional-path expansion over indexed commit graph
+4. stronger repo-scoped DB unit coverage for neighbor-batch semantics
+5. typed `invalid_argument` error semantics for invalid graph-query inputs
+
+Implemented Slice F:
+
+1. integer graph-query identity path (`rowid` -> compact `NodeId`) replacing SHA-string hot-path state
+2. rowid-based adapter primitives for commit lookup and neighbor expansion (single + batch)
+3. dense integer traversal/path state with SHA materialization only at API boundary
+4. ADR-backed performance decision (`0005`) and explicit performance guardrail doc
+5. guardrail enforcement against String-heavy frontier state regression
+
+Implemented Slice G:
+
+1. direction-optimizing BFS (`push`/`pull`) with deterministic mode-switch heuristic
+2. destination-driven pull expansion query path with deduplicated rowid frontier generation
+3. release-mode perf budget test for BFS hot path (`perf_budget_direction_optimizing_bfs`)
+4. CI performance budget gate (`scripts/perf-budget.ps1` + Rust CI workflow step)
+5. guardrail checks requiring perf gate artifacts and script contract
+
 ## Phase 2 Exit Criteria
 
 1. Deterministic re-index with no data drift for same repo state.

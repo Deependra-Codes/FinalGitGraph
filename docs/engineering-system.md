@@ -65,8 +65,9 @@ Crate split trigger (Phase 2):
 1. `pnpm run guardrails`
 2. `pnpm run dev:gate:fast` during iteration (Docker backend default).
 3. `pnpm run dev:gate` before PR/merge.
-4. If host backend run is needed, use `dev:gate:host*` variants.
-5. Implement change only after touched layer(s) are explicitly identified.
+4. `pnpm run quality:perf` for graph traversal performance-sensitive changes.
+5. If host backend run is needed, use `dev:gate:host*` variants.
+6. Implement change only after touched layer(s) are explicitly identified.
 
 Definition of done:
 
@@ -80,6 +81,14 @@ Definition of done:
 1. Any architecture change touching boundaries, data model, runtime model, or security requires an ADR.
 2. Add a new file under `docs/adr` using the template in `docs/adr/README.md`.
 3. ADR status lifecycle: `Proposed` -> `Accepted` -> `Superseded` (if replaced later).
+
+## Performance Governance
+
+1. Performance-sensitive graph query code follows `docs/performance-engineering.md`.
+2. Guardrails reject String-heavy frontier state in `application/graph_queries.rs`.
+3. Rust CI includes dedicated `Performance Budget` gate for direction-optimizing BFS.
+4. Guardrails block docs/guardrail-only diffs when no implementation files are changed.
+5. Any future identity/storage strategy change for graph query internals must be documented via ADR.
 
 ## Phase 2 (System Hardening)
 

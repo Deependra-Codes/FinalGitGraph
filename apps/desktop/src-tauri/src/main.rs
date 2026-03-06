@@ -1,15 +1,16 @@
 use std::env;
 
 use gitgraph_lab_core::application::commands::{
-    get_commit_window, index_commits_with_mode, scan_repository,
+    get_commit_window, get_graph_traversal, get_shortest_path, index_commits_with_mode,
+    scan_repository,
 };
-use gitgraph_lab_core::domain::models::IndexingMode;
+use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- window <repo_path> [limit] [db_path]"
+            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- window <repo_path> [limit] [db_path]\n  cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]\n  cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
         );
         std::process::exit(1);
     }
@@ -21,8 +22,12 @@ fn main() {
         "scan" => run_scan(repo_path, args.get(3).map(String::as_str)),
         "index" => run_index(repo_path, &args[3..]),
         "window" => run_window(repo_path, &args[3..]),
+        "traverse" => run_traverse(repo_path, &args[3..]),
+        "path" => run_path(repo_path, &args[3..]),
         _ => {
-            eprintln!("Unknown command: {action}. Use 'scan', 'index', or 'window'.");
+            eprintln!(
+                "Unknown command: {action}. Use 'scan', 'index', 'window', 'traverse', or 'path'."
+            );
             std::process::exit(1);
         }
     }
@@ -113,6 +118,134 @@ fn run_window(repo_path: &str, tail_args: &[String]) {
         }
         Err(error) => {
             eprintln!("window failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_traverse(repo_path: &str, tail_args: &[String]) {
+    if tail_args.is_empty() {
+        eprintln!(
+            "traverse usage: cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]"
+        );
+        std::process::exit(1);
+    }
+
+    let start_sha = tail_args[0].as_str();
+    let mut strategy = GraphTraversalStrategy::Bfs;
+    let mut direction = GraphDirection::Parents;
+    let mut max_nodes = 200usize;
+
+    if let Some(strategy_raw) = tail_args.get(1) {
+        match GraphTraversalStrategy::parse(strategy_raw) {
+            Some(parsed) => strategy = parsed,
+            None => {
+                eprintln!(
+                    "invalid traversal strategy '{strategy_raw}'. Use bfs, dfs, or topological."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(direction_raw) = tail_args.get(2) {
+        match GraphDirection::parse(direction_raw) {
+            Some(parsed) => direction = parsed,
+            None => {
+                eprintln!(
+                    "invalid graph direction '{direction_raw}'. Use parents, children, or both."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(max_nodes_raw) = tail_args.get(3) {
+        match max_nodes_raw.parse::<usize>() {
+            Ok(parsed) => max_nodes = parsed,
+            Err(_) => {
+                eprintln!("invalid max_nodes '{max_nodes_raw}'. Use a positive integer.");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let db_path = tail_args.get(4).map(String::as_str);
+
+    match get_graph_traversal(
+        repo_path,
+        db_path,
+        start_sha,
+        strategy,
+        direction,
+        Some(max_nodes),
+    ) {
+        Ok(response) => {
+            println!(
+                "Traversal strategy={:?} direction={:?} nodes={} truncated={}",
+                response.strategy,
+                response.direction,
+                response.nodes.len(),
+                response.truncated
+            );
+            for node in response.nodes {
+                println!("{} {}", node.depth, node.sha);
+            }
+        }
+        Err(error) => {
+            eprintln!("traverse failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_path(repo_path: &str, tail_args: &[String]) {
+    if tail_args.len() < 2 {
+        eprintln!(
+            "path usage: cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
+        );
+        std::process::exit(1);
+    }
+
+    let from_sha = tail_args[0].as_str();
+    let to_sha = tail_args[1].as_str();
+    let mut direction = GraphDirection::Parents;
+
+    if let Some(direction_raw) = tail_args.get(2) {
+        match GraphDirection::parse(direction_raw) {
+            Some(parsed) => direction = parsed,
+            None => {
+                eprintln!(
+                    "invalid graph direction '{direction_raw}'. Use parents, children, or both."
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let db_path = tail_args.get(3).map(String::as_str);
+
+    match get_shortest_path(repo_path, db_path, from_sha, to_sha, direction) {
+        Ok(response) => {
+            if response.found {
+                println!(
+                    "Shortest path direction={:?} length={} visited={}",
+                    response.direction,
+                    response.path.len(),
+                    response.visited_nodes
+                );
+                for sha in response.path {
+                    println!("{sha}");
+                }
+            } else {
+                println!(
+                    "No path found direction={:?} visited={}",
+                    response.direction, response.visited_nodes
+                );
+            }
+        }
+        Err(error) => {
+            eprintln!("path failed: {error}");
             std::process::exit(1);
         }
     }

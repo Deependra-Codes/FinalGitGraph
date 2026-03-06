@@ -52,3 +52,54 @@ Completed:
 1. `file_changes` ingestion from Git numstat output (full + incremental).
 2. Incremental replay cleanup for file-change rows.
 3. Added parser/unit coverage and integration validation.
+
+## Phase 2 Slice C Status (2026-03-07)
+
+Completed:
+
+1. Added DAG traversal API surface (`bfs`, `dfs`, `topological`) over indexed commit graph.
+2. Added shortest-path API with configurable graph direction (`parents`, `children`, `both`).
+3. Added CLI actions for local verification:
+   - `traverse`
+   - `path`
+4. Added integration test coverage for traversal and shortest-path behavior.
+
+## Phase 2 Slice D Status (2026-03-07)
+
+Completed:
+
+1. Upgraded shortest-path query to bidirectional BFS for better large-graph behavior.
+2. Added non-linear branch/merge integration fixture coverage for graph queries.
+3. Validated directional reachability, traversal truncation signaling, and topological-direction guardrails.
+
+## Phase 2 Slice E Status (2026-03-07)
+
+Completed:
+
+1. Extracted graph query logic into `application/graph_queries.rs` for stronger modularity and clearer orchestration boundaries.
+2. Added batched graph-neighbor DB lookups (`load_neighbor_shas_batch`) using temporary-node joins to reduce per-node query overhead.
+3. Upgraded BFS/topological and bidirectional shortest-path expansion to use batched frontier neighbor loading.
+4. Added DB-level unit coverage for repo-scoped batched neighbor retrieval.
+5. Hardened argument error semantics by returning `invalid_argument` for invalid graph query inputs (topological+both, missing indexed SHA).
+
+## Phase 2 Slice F Status (2026-03-07)
+
+Completed:
+
+1. Switched graph query runtime identity from SHA strings to integer commit row IDs + compact node IDs.
+2. Added rowid-based DB primitives:
+   - commit sha <-> rowid resolution
+   - single and batched rowid neighbor loading
+3. Reworked traversal/path internals to dense integer state while preserving response DTOs.
+4. Added ADR `0005-integer-graph-query-state.md`.
+5. Added `docs/performance-engineering.md` and enforced it via guardrails.
+
+## Phase 2 Slice G Status (2026-03-07)
+
+Completed:
+
+1. Added direction-optimizing BFS mode selection (`push`/`pull`) for traversal.
+2. Added destination-driven pull frontier DB path with deterministic rowid ordering.
+3. Added ignored release perf budget test (`perf_budget_direction_optimizing_bfs`).
+4. Added `scripts/perf-budget.ps1` and `quality:perf` package script.
+5. Wired Rust CI with `Performance Budget` step and updated guardrails to require perf gate artifacts.

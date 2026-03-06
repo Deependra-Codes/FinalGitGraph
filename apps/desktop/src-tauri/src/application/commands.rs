@@ -2,8 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::application::indexer::Indexer;
 use crate::domain::models::{
-    CommandError, CommitWindowCursor, CommitWindowRequest, CommitWindowResponse,
-    IndexRepositoryRequest, IndexingMode, IndexingStats, RepositorySummary, ScanRepositoryRequest,
+    CommandError, CommitWindowCursor, CommitWindowRequest, CommitWindowResponse, GraphDirection,
+    GraphTraversalRequest, GraphTraversalResponse, GraphTraversalStrategy, IndexRepositoryRequest,
+    IndexingMode, IndexingStats, RepositorySummary, ScanRepositoryRequest, ShortestPathRequest,
+    ShortestPathResponse,
 };
 
 pub fn scan_repository(
@@ -73,6 +75,69 @@ pub fn get_commit_window_with_request(
             Path::new(&request.path),
             Some(request.limit),
             request.cursor,
+        )
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn get_graph_traversal(
+    path: &str,
+    db_path: Option<&str>,
+    start_sha: &str,
+    strategy: GraphTraversalStrategy,
+    direction: GraphDirection,
+    max_nodes: Option<usize>,
+) -> Result<GraphTraversalResponse, CommandError> {
+    get_graph_traversal_with_request(GraphTraversalRequest {
+        path: path.to_string(),
+        db_path: db_path.map(ToString::to_string),
+        start_sha: start_sha.to_string(),
+        strategy,
+        direction,
+        max_nodes: max_nodes.unwrap_or(200),
+    })
+}
+
+pub fn get_graph_traversal_with_request(
+    request: GraphTraversalRequest,
+) -> Result<GraphTraversalResponse, CommandError> {
+    let indexer = build_indexer(request.db_path.as_deref());
+    indexer
+        .traverse_graph(
+            Path::new(&request.path),
+            &request.start_sha,
+            request.strategy,
+            request.direction,
+            request.max_nodes,
+        )
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn get_shortest_path(
+    path: &str,
+    db_path: Option<&str>,
+    from_sha: &str,
+    to_sha: &str,
+    direction: GraphDirection,
+) -> Result<ShortestPathResponse, CommandError> {
+    get_shortest_path_with_request(ShortestPathRequest {
+        path: path.to_string(),
+        db_path: db_path.map(ToString::to_string),
+        from_sha: from_sha.to_string(),
+        to_sha: to_sha.to_string(),
+        direction,
+    })
+}
+
+pub fn get_shortest_path_with_request(
+    request: ShortestPathRequest,
+) -> Result<ShortestPathResponse, CommandError> {
+    let indexer = build_indexer(request.db_path.as_deref());
+    indexer
+        .shortest_path(
+            Path::new(&request.path),
+            &request.from_sha,
+            &request.to_sha,
+            request.direction,
         )
         .map_err(|error| error.into_command_error())
 }

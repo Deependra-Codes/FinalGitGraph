@@ -10,6 +10,8 @@ pub enum AppError {
     NotGitRepository(String),
     #[error("git command failed: {0}")]
     GitCommand(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("parse error: {0}")]
     Parse(String),
     #[error("io error: {0}")]
@@ -26,6 +28,7 @@ impl AppError {
             Self::PathNotFound(_) => "path_not_found",
             Self::NotGitRepository(_) => "not_git_repository",
             Self::GitCommand(_) => "git_command_failed",
+            Self::InvalidArgument(_) => "invalid_argument",
             Self::Parse(_) => "parse_error",
             Self::Io(_) => "io_error",
             Self::Db(_) => "database_error",

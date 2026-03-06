@@ -20,6 +20,8 @@ cargo run -- scan <path-to-git-repo>
 cargo run -- index <path-to-git-repo>
 cargo run -- index <path-to-git-repo> incremental
 cargo run -- window <path-to-git-repo> 50
+cargo run -- traverse <path-to-git-repo> <start-sha> bfs parents 200
+cargo run -- path <path-to-git-repo> <from-sha> <to-sha> both
 ```
 
 `index` output now includes `file_changes` count along with commits/edges/refs.
@@ -90,6 +92,12 @@ Unified one-command dev loop (recommended):
 ```powershell
 pnpm run dev:gate:fast
 pnpm run dev:gate
+```
+
+Graph traversal performance budget gate:
+
+```powershell
+pnpm run quality:perf
 ```
 
 Host fallback variants:
