@@ -472,12 +472,11 @@ fn traverse_topological(
         reachable_set.insert(*node_id);
     }
 
-    let mut indegree: HashMap<NodeId, usize> = reachable
-        .iter()
-        .copied()
-        .map(|node_id| (node_id, 0usize))
-        .collect();
-    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    let mut indegree: HashMap<NodeId, usize> = HashMap::with_capacity(reachable.len());
+    for node_id in &reachable {
+        indegree.insert(*node_id, 0usize);
+    }
+    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::with_capacity(reachable.len());
 
     let reachable_rowids: Vec<i64> = reachable
         .iter()
