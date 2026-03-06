@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+  "apps/desktop/src-tauri",
+]
+default-members = [
+  "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.94"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"

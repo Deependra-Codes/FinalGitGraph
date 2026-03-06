@@ -1,0 +1,8 @@
+target/
+apps/desktop/src-tauri/target/
+.gitgraph-lab/
+.cargo-install-target/
+.tmp/
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,8 @@
+[build]
+target-dir = "target"
+
+[alias]
+xcheck = "check --workspace --locked"
+xclippy = "clippy --workspace --all-targets -- -D warnings"
+xfmt = "fmt --all -- --check"
+xtest = "test --workspace --locked"

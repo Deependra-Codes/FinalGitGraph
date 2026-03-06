@@ -1,0 +1,22 @@
+{
+  "name": "gitgraph-lab",
+  "private": true,
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=24.12.0 <25"
+  },
+  "scripts": {
+    "preflight": "powershell -ExecutionPolicy Bypass -File ./scripts/preflight.ps1",
+    "guardrails": "powershell -ExecutionPolicy Bypass -File ./scripts/enforce-guardrails.ps1",
+    "quality:rust": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate.ps1",
+    "quality:rust:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate.ps1 -Fast",
+    "quality:rust:docker": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate-docker.ps1",
+    "quality:rust:docker:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/quality-gate-docker.ps1 -Fast",
+    "dev:gate": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-loop.ps1",
+    "dev:gate:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-loop.ps1 -Fast",
+    "dev:gate:host": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-loop.ps1 -BackendMode host",
+    "dev:gate:host:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-loop.ps1 -BackendMode host -Fast",
+    "safe:fast": "pnpm run guardrails && pnpm run dev:gate:fast",
+    "safe:full": "pnpm run guardrails && pnpm run dev:gate"
+  }
+}

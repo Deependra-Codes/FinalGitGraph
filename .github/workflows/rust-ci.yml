@@ -1,0 +1,56 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-quality:
+    name: Backend Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guardrail Policy Check
+        shell: pwsh
+        run: ./scripts/enforce-guardrails.ps1
+
+      - name: Install Rust 1.94.0 + components
+        run: rustup toolchain install 1.94.0 --profile default --component rustfmt --component clippy
+
+      - name: Set Default Rust
+        run: rustup default 1.94.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format Check
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build Check
+        run: cargo check --workspace --locked
+
+      - name: Unit Tests
+        run: cargo test --workspace --locked
