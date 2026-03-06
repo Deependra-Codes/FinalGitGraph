@@ -3,8 +3,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use rusqlite::Connection;
 
 use crate::adapters::db::{
-    count_commits, load_commit_shas_by_rowids, load_neighbor_rowids, load_neighbor_rowids_batch,
-    load_pull_neighbor_rowids,
+    count_commits, load_commit_shas_for_rowids, load_neighbor_rowids,
+    load_neighbor_rowids_for_sources, load_pull_neighbor_rowids,
 };
 use crate::domain::models::{
     GraphDirection, GraphNodeVisit, GraphTraversalResponse, GraphTraversalStrategy,
@@ -357,17 +357,14 @@ fn expand_bfs_frontier_push(
         .iter()
         .map(|node_id| nodes.rowid_for_id(*node_id))
         .collect();
-    let neighbors = load_neighbor_rowids_batch(conn, repo_id, &source_rowids, direction)?;
+    let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &source_rowids, direction)?;
 
     let mut next_frontier = Vec::new();
-    for source_id in frontier {
-        let source_rowid = nodes.rowid_for_id(*source_id);
-        if let Some(source_neighbors) = neighbors.get(&source_rowid) {
-            for &neighbor_rowid in source_neighbors {
-                let neighbor_id = nodes.intern(neighbor_rowid);
-                if visited.insert(neighbor_id) {
-                    next_frontier.push(neighbor_id);
-                }
+    for source_neighbors in neighbors {
+        for neighbor_rowid in source_neighbors {
+            let neighbor_id = nodes.intern(neighbor_rowid);
+            if visited.insert(neighbor_id) {
+                next_frontier.push(neighbor_id);
             }
         }
     }
@@ -482,17 +479,14 @@ fn traverse_topological(
         .iter()
         .map(|node_id| nodes.rowid_for_id(*node_id))
         .collect();
-    let neighbors = load_neighbor_rowids_batch(conn, repo_id, &reachable_rowids, direction)?;
+    let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &reachable_rowids, direction)?;
 
-    for source_id in &reachable {
-        let source_rowid = nodes.rowid_for_id(*source_id);
+    for (source_id, source_neighbors) in reachable.iter().zip(neighbors.into_iter()) {
         let mut filtered = Vec::new();
-        if let Some(source_neighbors) = neighbors.get(&source_rowid) {
-            for &neighbor_rowid in source_neighbors {
-                let neighbor_id = nodes.intern(neighbor_rowid);
-                if reachable_set.contains(neighbor_id) {
-                    filtered.push(neighbor_id);
-                }
+        for neighbor_rowid in source_neighbors {
+            let neighbor_id = nodes.intern(neighbor_rowid);
+            if reachable_set.contains(neighbor_id) {
+                filtered.push(neighbor_id);
             }
         }
 
@@ -585,21 +579,21 @@ fn collect_reachable_bfs(
             .iter()
             .map(|(node_id, _)| nodes.rowid_for_id(*node_id))
             .collect();
-        let neighbors = load_neighbor_rowids_batch(conn, repo_id, &source_rowids, direction)?;
+        let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &source_rowids, direction)?;
 
         let level_len = level_nodes.len();
-        for (index, (source_id, depth)) in level_nodes.into_iter().enumerate() {
+        for (index, ((source_id, depth), source_neighbors)) in level_nodes
+            .into_iter()
+            .zip(neighbors.into_iter())
+            .enumerate()
+        {
             order.push(source_id);
-            let source_rowid = nodes.rowid_for_id(source_id);
-
-            if let Some(source_neighbors) = neighbors.get(&source_rowid) {
-                for &neighbor_rowid in source_neighbors {
-                    let neighbor_id = nodes.intern(neighbor_rowid);
-                    if visited.insert(neighbor_id) {
-                        let next_depth = depth.saturating_add(1);
-                        depths.insert(neighbor_id, next_depth);
-                        queue.push_back((neighbor_id, next_depth));
-                    }
+            for neighbor_rowid in source_neighbors {
+                let neighbor_id = nodes.intern(neighbor_rowid);
+                if visited.insert(neighbor_id) {
+                    let next_depth = depth.saturating_add(1);
+                    depths.insert(neighbor_id, next_depth);
+                    queue.push_back((neighbor_id, next_depth));
                 }
             }
 
@@ -662,23 +656,20 @@ fn expand_frontier(
         .iter()
         .map(|node_id| nodes.rowid_for_id(*node_id))
         .collect();
-    let neighbors = load_neighbor_rowids_batch(conn, repo_id, &source_rowids, direction)?;
+    let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &source_rowids, direction)?;
 
-    for source_id in level_nodes {
-        let source_rowid = nodes.rowid_for_id(source_id);
-        if let Some(source_neighbors) = neighbors.get(&source_rowid) {
-            for &neighbor_rowid in source_neighbors {
-                let neighbor_id = nodes.intern(neighbor_rowid);
-                if current_side.visited.insert(neighbor_id) {
-                    ensure_slot(&mut current_side.predecessors, neighbor_id);
-                    current_side.predecessors[neighbor_id] = Some(source_id);
+    for (source_id, source_neighbors) in level_nodes.into_iter().zip(neighbors.into_iter()) {
+        for neighbor_rowid in source_neighbors {
+            let neighbor_id = nodes.intern(neighbor_rowid);
+            if current_side.visited.insert(neighbor_id) {
+                ensure_slot(&mut current_side.predecessors, neighbor_id);
+                current_side.predecessors[neighbor_id] = Some(source_id);
 
-                    if visited_other_side.contains(neighbor_id) {
-                        return Ok(Some(neighbor_id));
-                    }
-
-                    current_side.frontier.push_back(neighbor_id);
+                if visited_other_side.contains(neighbor_id) {
+                    return Ok(Some(neighbor_id));
                 }
+
+                current_side.frontier.push_back(neighbor_id);
             }
         }
     }
@@ -732,20 +723,16 @@ fn visits_to_graph_nodes(
         .iter()
         .map(|(node_id, _depth)| nodes.rowid_for_id(*node_id))
         .collect();
-    let shas = load_commit_shas_by_rowids(conn, repo_id, &rowids)?;
+    let shas = load_commit_shas_for_rowids(conn, repo_id, &rowids)?;
+    if shas.len() != visits.len() {
+        return Err(AppError::Parse(
+            "missing commit sha for visited rowid during graph traversal".to_string(),
+        ));
+    }
 
     let mut result = Vec::with_capacity(visits.len());
-    for (node_id, depth) in visits {
-        let rowid = nodes.rowid_for_id(*node_id);
-        let Some(sha) = shas.get(&rowid) else {
-            return Err(AppError::Parse(
-                "missing commit sha for visited rowid during graph traversal".to_string(),
-            ));
-        };
-        result.push(GraphNodeVisit {
-            sha: sha.clone(),
-            depth: *depth,
-        });
+    for ((_, depth), sha) in visits.iter().zip(shas.into_iter()) {
+        result.push(GraphNodeVisit { sha, depth: *depth });
     }
 
     Ok(result)
@@ -761,20 +748,14 @@ fn node_path_to_sha_path(
         .iter()
         .map(|node_id| nodes.rowid_for_id(*node_id))
         .collect();
-    let shas = load_commit_shas_by_rowids(conn, repo_id, &rowids)?;
-
-    let mut result = Vec::with_capacity(path.len());
-    for node_id in path {
-        let rowid = nodes.rowid_for_id(*node_id);
-        let Some(sha) = shas.get(&rowid) else {
-            return Err(AppError::Parse(
-                "missing commit sha for shortest path rowid".to_string(),
-            ));
-        };
-        result.push(sha.clone());
+    let shas = load_commit_shas_for_rowids(conn, repo_id, &rowids)?;
+    if shas.len() != path.len() {
+        return Err(AppError::Parse(
+            "missing commit sha for shortest path rowid".to_string(),
+        ));
     }
 
-    Ok(result)
+    Ok(shas)
 }
 
 fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize) {

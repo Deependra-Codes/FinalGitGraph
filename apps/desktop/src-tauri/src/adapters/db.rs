@@ -35,6 +35,8 @@ pub fn open_database(db_path: &Path) -> AppResult<Connection> {
         PRAGMA busy_timeout=5000;
     "#,
     )?;
+    // Hot graph query paths prepare many repeated statements.
+    conn.set_prepared_statement_cache_capacity(256);
     Ok(conn)
 }
 
@@ -413,6 +415,55 @@ pub fn load_commit_shas_by_rowids(
     Ok(result)
 }
 
+pub fn load_commit_shas_for_rowids(
+    conn: &Connection,
+    repo_id: i64,
+    rowids: &[i64],
+) -> AppResult<Vec<String>> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowid_order (
+          ord INTEGER PRIMARY KEY,
+          commit_rowid INTEGER NOT NULL
+        );
+        DELETE FROM current_graph_rowid_order;
+    "#,
+    )?;
+
+    {
+        let mut insert_stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO current_graph_rowid_order (ord, commit_rowid)
+            VALUES (?1, ?2)
+        "#,
+        )?;
+        for (ord, rowid) in rowids.iter().enumerate() {
+            insert_stmt.execute(params![ord as i64, rowid])?;
+        }
+    }
+
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT c.sha
+        FROM current_graph_rowid_order o
+        JOIN commits c ON c.rowid = o.commit_rowid
+        WHERE c.repo_id = ?1
+        ORDER BY o.ord ASC
+    "#,
+    )?;
+    let rows = stmt.query_map([repo_id], |row| row.get(0))?;
+
+    let mut result = Vec::with_capacity(rowids.len());
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
 pub fn load_neighbor_shas(
     conn: &Connection,
     repo_id: i64,
@@ -535,41 +586,60 @@ pub fn load_neighbor_rowids_batch(
     rowids: &[i64],
     direction: GraphDirection,
 ) -> AppResult<HashMap<i64, Vec<i64>>> {
+    let ordered_neighbors = load_neighbor_rowids_for_sources(conn, repo_id, rowids, direction)?;
+
+    let mut neighbors = HashMap::with_capacity(rowids.len());
+    for (ord, source_rowid) in rowids.iter().enumerate() {
+        neighbors.insert(
+            *source_rowid,
+            ordered_neighbors.get(ord).cloned().unwrap_or_default(),
+        );
+    }
+
+    Ok(neighbors)
+}
+
+pub fn load_neighbor_rowids_for_sources(
+    conn: &Connection,
+    repo_id: i64,
+    rowids: &[i64],
+    direction: GraphDirection,
+) -> AppResult<Vec<Vec<i64>>> {
     if rowids.is_empty() {
-        return Ok(HashMap::new());
+        return Ok(Vec::new());
     }
 
     conn.execute_batch(
         r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowids (
-          commit_rowid INTEGER PRIMARY KEY
+        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowid_order (
+          ord INTEGER PRIMARY KEY,
+          commit_rowid INTEGER NOT NULL
         );
-        DELETE FROM current_graph_rowids;
+        DELETE FROM current_graph_rowid_order;
     "#,
     )?;
 
     {
-        let mut insert_stmt = conn.prepare(
+        let mut insert_stmt = conn.prepare_cached(
             r#"
-            INSERT INTO current_graph_rowids (commit_rowid)
-            VALUES (?1)
-            ON CONFLICT(commit_rowid) DO NOTHING
+            INSERT INTO current_graph_rowid_order (ord, commit_rowid)
+            VALUES (?1, ?2)
         "#,
         )?;
-        for rowid in rowids {
-            insert_stmt.execute([rowid])?;
+        for (ord, rowid) in rowids.iter().enumerate() {
+            insert_stmt.execute(params![ord as i64, rowid])?;
         }
     }
 
     let mut neighbors = match direction {
-        GraphDirection::Parents => query_neighbor_rowids_for_sources(
+        GraphDirection::Parents => query_neighbor_rowids_for_ordered_sources(
             conn,
             repo_id,
             "child_sha",
             "parent_sha",
             "neighbor.rowid DESC",
         )?,
-        GraphDirection::Children => query_neighbor_rowids_for_sources(
+        GraphDirection::Children => query_neighbor_rowids_for_ordered_sources(
             conn,
             repo_id,
             "parent_sha",
@@ -577,34 +647,42 @@ pub fn load_neighbor_rowids_batch(
             "neighbor.rowid DESC",
         )?,
         GraphDirection::Both => {
-            let mut merged = query_neighbor_rowids_for_sources(
+            let mut merged = query_neighbor_rowids_for_ordered_sources(
                 conn,
                 repo_id,
                 "child_sha",
                 "parent_sha",
                 "neighbor.rowid DESC",
             )?;
-            let children = query_neighbor_rowids_for_sources(
-                conn,
-                repo_id,
-                "parent_sha",
-                "child_sha",
-                "neighbor.rowid DESC",
-            )?;
+            if merged.len() < rowids.len() {
+                merged.resize_with(rowids.len(), Vec::new);
+            }
 
-            for (source_rowid, mut child_neighbors) in children {
-                let entry = merged.entry(source_rowid).or_default();
-                entry.append(&mut child_neighbors);
-                entry.sort();
-                entry.dedup();
-                entry.reverse();
+            let mut children = query_neighbor_rowids_for_ordered_sources(
+                conn,
+                repo_id,
+                "parent_sha",
+                "child_sha",
+                "neighbor.rowid DESC",
+            )?;
+            if children.len() < rowids.len() {
+                children.resize_with(rowids.len(), Vec::new);
+            }
+
+            for (merged_neighbors, mut child_neighbors) in
+                merged.iter_mut().zip(children.into_iter())
+            {
+                merged_neighbors.append(&mut child_neighbors);
+                merged_neighbors.sort_unstable();
+                merged_neighbors.dedup();
+                merged_neighbors.reverse();
             }
             merged
         }
     };
 
-    for rowid in rowids {
-        neighbors.entry(*rowid).or_default();
+    if neighbors.len() < rowids.len() {
+        neighbors.resize_with(rowids.len(), Vec::new);
     }
 
     Ok(neighbors)
@@ -666,7 +744,7 @@ pub fn load_pull_neighbor_rowids(
 }
 
 fn load_parent_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         r#"
         SELECT parent_sha
         FROM commit_edges
@@ -685,7 +763,7 @@ fn load_parent_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec
 }
 
 fn load_child_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         r#"
         SELECT child_sha
         FROM commit_edges
@@ -704,7 +782,7 @@ fn load_child_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec<
 }
 
 fn load_parent_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         r#"
         SELECT parent.rowid
         FROM commit_edges edge
@@ -729,7 +807,7 @@ fn load_parent_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<
 }
 
 fn load_child_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         r#"
         SELECT child.rowid
         FROM commit_edges edge
@@ -770,7 +848,7 @@ fn query_neighbors_for_sources(
     "#
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([repo_id], |row| {
         let source_sha: String = row.get(0)?;
         let neighbor_sha: String = row.get(1)?;
@@ -789,44 +867,48 @@ fn query_neighbors_for_sources(
     Ok(result)
 }
 
-fn query_neighbor_rowids_for_sources(
+fn query_neighbor_rowids_for_ordered_sources(
     conn: &Connection,
     repo_id: i64,
     source_sha_column: &str,
     neighbor_sha_column: &str,
     neighbor_order: &str,
-) -> AppResult<HashMap<i64, Vec<i64>>> {
+) -> AppResult<Vec<Vec<i64>>> {
     let sql = format!(
         r#"
-        SELECT source.rowid AS source_rowid, neighbor.rowid AS neighbor_rowid
-        FROM commit_edges edge
+        SELECT o.ord AS source_ord, neighbor.rowid AS neighbor_rowid
+        FROM current_graph_rowid_order o
         JOIN commits source
-          ON source.repo_id = edge.repo_id
-         AND source.sha = edge.{source_sha_column}
+          ON source.rowid = o.commit_rowid
+         AND source.repo_id = ?1
+        JOIN commit_edges edge
+          ON edge.repo_id = source.repo_id
+         AND edge.{source_sha_column} = source.sha
         JOIN commits neighbor
           ON neighbor.repo_id = edge.repo_id
          AND neighbor.sha = edge.{neighbor_sha_column}
-        JOIN current_graph_rowids r
-          ON r.commit_rowid = source.rowid
-        WHERE edge.repo_id = ?1
-        ORDER BY source.rowid DESC, {neighbor_order}
+        ORDER BY o.ord ASC, {neighbor_order}
     "#
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([repo_id], |row| {
-        let source_rowid: i64 = row.get(0)?;
+        let source_ord: i64 = row.get(0)?;
         let neighbor_rowid: i64 = row.get(1)?;
-        Ok((source_rowid, neighbor_rowid))
+        Ok((source_ord, neighbor_rowid))
     })?;
 
-    let mut result = HashMap::new();
+    let mut result: Vec<Vec<i64>> = Vec::new();
     for row in rows {
-        let (source_rowid, neighbor_rowid) = row?;
-        result
-            .entry(source_rowid)
-            .or_insert_with(Vec::new)
-            .push(neighbor_rowid);
+        let (source_ord, neighbor_rowid) = row?;
+        if source_ord < 0 {
+            continue;
+        }
+        let source_index = source_ord as usize;
+        if source_index >= result.len() {
+            result.resize_with(source_index + 1, Vec::new);
+        }
+        result[source_index].push(neighbor_rowid);
     }
 
     Ok(result)
@@ -855,7 +937,7 @@ fn query_pull_rowids_for_frontier(
     "#
     );
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([repo_id], |row| row.get(0))?;
 
     let mut result = Vec::new();
@@ -881,9 +963,10 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        count_commits, load_commit_shas_by_rowids, load_index_checkpoint,
-        load_neighbor_rowids_batch, load_neighbor_shas_batch, load_pull_neighbor_rowids,
-        run_migrations, upsert_index_checkpoint,
+        count_commits, load_commit_shas_by_rowids, load_commit_shas_for_rowids,
+        load_index_checkpoint, load_neighbor_rowids_batch, load_neighbor_rowids_for_sources,
+        load_neighbor_shas_batch, load_pull_neighbor_rowids, run_migrations,
+        upsert_index_checkpoint,
     };
     use crate::domain::models::{GraphDirection, IndexCheckpoint};
 
@@ -1042,6 +1125,18 @@ mod tests {
         assert_eq!(rowid_parents.get(&c3_rowid), Some(&vec![c2_rowid]));
         assert_eq!(rowid_parents.get(&c2_rowid), Some(&vec![c1_rowid]));
 
+        let ordered_children = load_neighbor_rowids_for_sources(
+            &conn,
+            repo_id,
+            &[c2_rowid, c1_rowid, c3_rowid],
+            GraphDirection::Children,
+        )
+        .expect("load ordered rowid children");
+        assert_eq!(
+            ordered_children,
+            vec![vec![c3_rowid], vec![c2_rowid], Vec::new()]
+        );
+
         let pull_children =
             load_pull_neighbor_rowids(&conn, repo_id, &[c1_rowid], GraphDirection::Children)
                 .expect("pull children");
@@ -1065,6 +1160,14 @@ mod tests {
         assert_eq!(rowid_shas.get(&c1_rowid).map(String::as_str), Some("c1"));
         assert_eq!(rowid_shas.get(&c2_rowid).map(String::as_str), Some("c2"));
         assert_eq!(rowid_shas.get(&c3_rowid).map(String::as_str), Some("c3"));
+
+        let ordered_shas =
+            load_commit_shas_for_rowids(&conn, repo_id, &[c3_rowid, c1_rowid, c2_rowid])
+                .expect("load ordered sha by rowids");
+        assert_eq!(
+            ordered_shas,
+            vec!["c3".to_string(), "c1".to_string(), "c2".to_string()]
+        );
     }
 
     fn primary_key_columns(conn: &Connection, table_name: &str) -> Vec<String> {

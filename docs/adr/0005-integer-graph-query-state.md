@@ -34,12 +34,23 @@ Positive:
 3. clear separation between external identity (`sha`) and internal compute identity (`NodeId`)
 4. adaptive BFS can reduce duplicate neighbor expansion work on wide-frontier levels
 5. CI prevents silent performance drift in hot traversal paths
+6. ordered batched rowid decoding (`Vec<Vec<i64>>`) removes repeated per-source hash lookups in frontier expansion
+7. ordered SHA materialization from rowids removes per-node map lookups/cloning in traversal/shortest-path response assembly
+8. prepared-statement caching lowers repeated SQL parse overhead in graph query hot loops
 
 Tradeoffs:
 
 1. additional adapter/query complexity (rowid conversion + batch tables)
 2. tighter coupling to current SQLite storage semantics in adapter layer
 3. dedicated perf test maintenance cost (fixture tuning, threshold review)
+4. performance budget fallback adds Docker dependency for policy-restricted host environments
+
+## Implementation Notes (2026-03-07)
+
+1. Added `load_commit_shas_for_rowids` for ordered rowid-to-sha conversion used directly by graph traversal/path response mapping.
+2. Added `load_neighbor_rowids_for_sources` returning source-order-aligned neighbor vectors for BFS/topological/shortest-path expansion.
+3. Enabled SQLite prepared statement cache and switched hot graph query paths to `prepare_cached`.
+4. Hardened performance gate script with host-policy detection and Docker retry fallback to keep perf validation deterministic.
 
 ## Alternatives Considered
 

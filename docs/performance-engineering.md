@@ -21,15 +21,18 @@ Keep graph-query code performant by default on medium/large repositories without
 2. Graph queries intern `rowid` values into compact in-memory IDs.
 3. Visited sets use dense bit-like storage instead of `HashSet<String>`.
 4. BFS uses direction-optimizing mode selection (`push` vs `pull`) by frontier/remaining ratio.
-5. BFS/topological and bidirectional shortest-path expansion use batched neighbor queries.
-6. SHA strings are only materialized at API boundaries (request/response).
+5. BFS/topological and bidirectional shortest-path expansion use batched neighbor queries with ordered vector outputs (`Vec<Vec<i64>>`) on hot paths.
+6. SHA strings are only materialized at API boundaries (request/response) via ordered rowid lookups (no per-node `HashMap` lookups in traversal response assembly).
+7. SQLite statement cache is enabled and hot graph queries use cached prepared statements.
 
 ## Why This Strategy
 
 1. Integer node identities reduce hashing and allocation overhead vs repeated string cloning.
 2. Dense frontier/visited state improves CPU-cache behavior compared to sparse string hash tables.
 3. Batched DB neighbor retrieval reduces query round-trips and iterator overhead.
-4. Direction-optimizing BFS lowers duplicate expansion work when frontier becomes large.
+4. Ordered vector batch decoding removes repeated source-node hash lookups during frontier expansion.
+5. Direction-optimizing BFS lowers duplicate expansion work when frontier becomes large.
+6. Reusing prepared statements reduces parse/compile overhead in repeated query loops.
 
 ## Guardrail Enforcement
 
@@ -68,6 +71,8 @@ Keep graph-query code performant by default on medium/large repositories without
 4. Current threshold:
    - adaptive BFS median runtime must be no more than 50% slower than push-only baseline on the fixed overlap-heavy fixture.
    - this is a regression guardrail, not a synthetic peak-throughput claim.
+5. Reliability contract:
+   - when host execution is blocked by endpoint policy (for example Windows application control), `scripts/perf-budget.ps1` retries in Docker and still enforces the same test.
 
 ## Change Checklist for Graph Query Work
 
@@ -84,7 +89,9 @@ Keep graph-query code performant by default on medium/large repositories without
 ## References
 
 1. SQLite rowid tables: https://www.sqlite.org/rowidtable.html
-2. petgraph `NodeIndex` (`index() -> usize`): https://docs.rs/petgraph/latest/petgraph/graph/struct.NodeIndex.html
-3. Boost CSR graph (compact CSR representation): https://www.boost.org/libs/graph/doc/compressed_sparse_row.html
-4. Ligra graph API/docs (integer vertex function signatures): https://jshun.github.io/ligra/docs/graph.html
-5. Cache locality concern in dynamic graph processing context (Aspen/Ligra ecosystem): https://arxiv.org/abs/1904.08380
+2. SQLite prepared statement lifecycle/performance guidance: https://www.sqlite.org/cintro.html
+3. SQLite `SQLITE_PREPARE_PERSISTENT` guidance (reused statements): https://www.sqlite.org/capi3ref.html#prepare_flags
+4. Direction-Optimizing BFS (Beamer et al., SC 2012): https://www.scottbeamer.net/pubs/beamer-sc2012.pdf
+5. Ligra (shared-memory graph processing with sparse/dense push-pull): https://jshun.csail.mit.edu/ligra.pdf
+6. GraphIt push/pull scheduling and frontier representation options: https://graphit-lang.org/getting-started
+7. GAP Benchmark Suite (direction-optimizing BFS in a reference benchmark): https://arxiv.org/abs/1508.03619

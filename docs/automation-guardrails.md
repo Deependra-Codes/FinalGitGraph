@@ -44,6 +44,16 @@ These are class-level checks, not tied to a single historical failure.
 
 This ordering fails fast on automation regressions before expensive lanes.
 
+## Performance Script Resilience Contract
+
+`scripts/perf-budget.ps1` must keep three properties:
+
+1. `-ProbeOnly` mode for zero-cost contract validation in CI.
+2. host execution path for normal fast environments.
+3. resilient fallback path when host policy blocks test binaries (for example Windows Application Control), with the same perf test executed in Docker.
+
+`scripts/enforce-guardrails.ps1` verifies this contract so reliability does not depend on local machine policy details.
+
 ## Non-Goals
 
 1. No requirement to make Windows-only scripts cross-platform.

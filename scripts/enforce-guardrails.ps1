@@ -360,6 +360,19 @@ foreach ($filePath in $requiredPerfFiles) {
     }
 }
 
+$perfBudgetPath = Join-Path $repoRoot "scripts/perf-budget.ps1"
+if (Test-Path $perfBudgetPath) {
+    $hasProbeMode = Select-String -Path $perfBudgetPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
+    $hasDockerFallback = Select-String -Path $perfBudgetPath -Pattern 'function\s+Invoke-PerfBudgetDocker' -Quiet
+    $hasPolicyDetection = Select-String -Path $perfBudgetPath -Pattern 'Application Control policy has blocked this file|os error 4551' -Quiet
+
+    if ($hasProbeMode -and $hasDockerFallback -and $hasPolicyDetection) {
+        Add-Pass "Performance budget script contract present (probe mode + resilient fallback)."
+    } else {
+        Add-Failure "Performance budget script must keep probe mode and resilient fallback contract."
+    }
+}
+
 $workflowPath = Join-Path $repoRoot ".github/workflows/rust-ci.yml"
 if (Test-Path $workflowPath) {
     if (Select-String -Path $workflowPath -Pattern "Performance Budget" -Quiet) {

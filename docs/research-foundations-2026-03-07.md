@@ -18,6 +18,12 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - Decision: keep `Dependency Audit` workflow enabled.
 7. pnpm/Corepack pinning keeps Node package manager behavior deterministic.
    - Decision: keep pinned `packageManager` and scripted developer entrypoints.
+8. Direction-optimizing BFS should switch between sparse (push) and dense (pull) traversal by frontier/work ratios, not fixed mode.
+   - Decision: keep adaptive BFS mode with explicit thresholds and perf-budget verification.
+9. Frontier representations and vertex identity should stay compact/integer-based in hot loops.
+   - Decision: keep integer rowid/NodeId state and dense visited/frontier structures.
+10. Reused prepared statements are a baseline optimization for repeated SQL hot paths.
+   - Decision: enable SQLite prepared-statement caching and favor cached preparation in graph-query adapters.
 
 ## Sources
 
@@ -41,3 +47,15 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - https://nodejs.org/api/corepack.html
 10. pnpm installation/Corepack:
    - https://pnpm.io/installation
+11. Direction-Optimizing BFS (SC 2012):
+   - https://www.scottbeamer.net/pubs/beamer-sc2012.pdf
+12. Ligra (sparse/dense push-pull operators):
+   - https://jshun.csail.mit.edu/ligra.pdf
+13. GraphIt push/pull scheduling docs:
+   - https://graphit-lang.org/getting-started
+14. GAP Benchmark Suite:
+   - https://arxiv.org/abs/1508.03619
+15. SQLite prepared statements intro:
+   - https://www.sqlite.org/cintro.html
+16. SQLite prepare flags (`SQLITE_PREPARE_PERSISTENT`):
+   - https://www.sqlite.org/capi3ref.html#prepare_flags
