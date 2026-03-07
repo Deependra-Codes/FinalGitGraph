@@ -67,7 +67,8 @@ Performance automation must not hide where time is spent. Required properties:
 7. `package.json` must expose `perf:report:25k` for very-large soak profiling.
 8. CI/local operators can distinguish compile regressions from runtime regressions without manual instrumentation.
 9. `scripts/perf-ingestion-budget.ps1` must enforce full-index/incremental-index + peak RSS thresholds for the 25k ingestion lane.
-10. Optional commit-graph preconditioning lane (`perf:report:25k:precondition`) must continue to run through `scripts/perf-report.ps1`.
+10. `scripts/perf-ingestion-budget.ps1` profile mode must support larger parameter sets (for example `-Profile 90k`) with parameter-appropriate default thresholds.
+11. Optional commit-graph preconditioning lane (`perf:report:25k:precondition`) must continue to run through `scripts/perf-report.ps1`.
 
 ## Non-Goals
 

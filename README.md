@@ -111,7 +111,9 @@ pnpm run perf:report:smoke
 pnpm run perf:report:large
 pnpm run perf:report:25k
 pnpm run perf:report:25k:precondition
+pnpm run perf:report:90k
 pnpm run perf:ingestion:25k
+pnpm run perf:ingestion:90k
 ```
 
 Layered throttling matrix (section-wise test lanes + RAM-aware perf smoke metrics):

@@ -131,17 +131,22 @@ Keep graph-query code performant by default on medium/large repositories without
    - `pnpm run perf:report:large`
 5. Very large soak lane (~25k commits):
    - `pnpm run perf:report:25k`
-6. Balanced default report lane:
+6. Massive soak lane (~90k commits, preconditioned):
+   - `pnpm run perf:report:90k`
+7. Balanced default report lane:
    - `pnpm run perf:report`
-7. Optional preconditioned soak lane:
+8. Optional preconditioned soak lane:
    - `pnpm run perf:report:25k:precondition`
-8. Interpretation rule:
+9. Interpretation rule:
    - inspect `phase_timing_ms` first; if fixture generation dominates, optimize fixture strategy before changing traversal algorithms.
-9. In-memory comparison rule:
+10. In-memory comparison rule:
    - inspect `in_memory_adjacency_query_latency_ms` and `in_memory_vs_sqlite_median_speedup` to separate persistence costs from pure graph compute.
-10. Ingestion diagnosis rule:
+11. Ingestion diagnosis rule:
    - inspect `ingestion_phase_timing_ms` and aggregate ingestion contract keys before changing batch sizes.
-11. Layered throttling isolation lane:
+12. Ingestion budget profile lanes:
+   - `pnpm run perf:ingestion:25k`
+   - `pnpm run perf:ingestion:90k`
+13. Layered throttling isolation lane:
    - `pnpm run test:layers` (runs section-wise test lanes + perf smoke phase metrics including RSS).
 
 ## Change Checklist for Graph Query Work

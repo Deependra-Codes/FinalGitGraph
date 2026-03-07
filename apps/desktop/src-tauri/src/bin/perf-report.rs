@@ -1301,6 +1301,7 @@ fn format_report(input: &ReportInput<'_>) -> String {
         input.query.shortest_both.median_ms,
         input.in_memory_query.shortest_both.median_ms,
     );
+    let workload_profile_hint = detect_workload_profile_hint(input.config);
 
     let attributed_core = input.phase_timing.fixture_generation.as_secs_f64()
         + input.phase_timing.fixture_summary.as_secs_f64()
@@ -1325,6 +1326,7 @@ config:
   query_runs: {}
   window_limit: {}
   traversal_max_nodes: {}
+  workload_profile_hint: {}
 
 workload_shape:
   estimated_git_process_spawns: {}
@@ -1429,6 +1431,7 @@ in_memory_vs_sqlite_median_speedup:
         input.config.query_runs,
         input.config.window_limit,
         input.config.max_nodes,
+        workload_profile_hint,
         input.estimated_git_process_spawns,
         duration_ms(input.phase_timing.fixture_generation),
         duration_ms(input.phase_timing.fixture_summary),
@@ -1575,6 +1578,16 @@ fn estimate_git_process_spawns(config: &Config) -> usize {
         .saturating_add(fixture_summary)
         .saturating_add(preconditioning)
         .saturating_add(incremental_refresh)
+}
+
+fn detect_workload_profile_hint(config: &Config) -> &'static str {
+    if config.cycles >= 9000 && config.incremental_commits >= 9000 && config.max_nodes >= 90000 {
+        return "90k";
+    }
+    if config.cycles >= 2500 && config.incremental_commits >= 2500 && config.max_nodes >= 25000 {
+        return "25k";
+    }
+    "custom"
 }
 
 fn log_phase_start(phase: &str) {

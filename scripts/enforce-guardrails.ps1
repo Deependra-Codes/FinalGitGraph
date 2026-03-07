@@ -606,6 +606,8 @@ if (Test-Path $perfReportScriptPath) {
 $perfIngestionBudgetPath = Join-Path $repoRoot "scripts/perf-ingestion-budget.ps1"
 if (Test-Path $perfIngestionBudgetPath) {
     $hasProbeMode = Select-String -Path $perfIngestionBudgetPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
+    $hasProfileParam = Select-String -Path $perfIngestionBudgetPath -Pattern '\$Profile' -Quiet
+    $has90kProfile = Select-String -Path $perfIngestionBudgetPath -Pattern '"90k"' -Quiet
     $hasPerfReportInvocation = Select-String -Path $perfIngestionBudgetPath -Pattern 'perf-report\.ps1' -Quiet
     $hasFullIndexThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxFullIndexMs' -Quiet
     $hasIncrementalThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxIncrementalIndexMs' -Quiet
@@ -614,15 +616,17 @@ if (Test-Path $perfIngestionBudgetPath) {
 
     if (
         $hasProbeMode -and
+        $hasProfileParam -and
+        $has90kProfile -and
         $hasPerfReportInvocation -and
         $hasFullIndexThreshold -and
         $hasIncrementalThreshold -and
         $hasPeakRssThreshold -and
         $hasPeakRssField
     ) {
-        Add-Pass "Ingestion budget script contract present (probe mode + thresholds + memory budget check)."
+        Add-Pass "Ingestion budget script contract present (profile mode + probe mode + thresholds + memory budget check)."
     } else {
-        Add-Failure "Ingestion budget script must keep probe mode and enforce full/incremental/ms + peak RSS thresholds."
+        Add-Failure "Ingestion budget script must keep profile/probe modes and enforce full/incremental/ms + peak RSS thresholds."
     }
 }
 
@@ -694,12 +698,14 @@ if (Test-Path $packageJsonPath) {
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:large"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:25k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:25k:precondition"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report:90k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:25k"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:90k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"test:layers"' -Quiet)
     ) {
-        Add-Pass "package.json exposes perf report tiers, ingestion budget lane, and layered test matrix command."
+        Add-Pass "package.json exposes perf report tiers (including 90k), ingestion budget lanes, and layered test matrix command."
     } else {
-        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, perf:report:25k:precondition, perf:ingestion:25k, and test:layers scripts."
+        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, perf:report:25k:precondition, perf:report:90k, perf:ingestion:25k, perf:ingestion:90k, and test:layers scripts."
     }
 }
 

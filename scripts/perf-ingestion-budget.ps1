@@ -1,7 +1,9 @@
 # platform: any
 param(
     [string]$CargoTargetRoot = "",
-    [string]$OutputPath = "tmp/perf-report-ingestion-budget.txt",
+    [ValidateSet("25k", "90k")]
+    [string]$Profile = "25k",
+    [string]$OutputPath = "",
     [double]$MaxFullIndexMs = 45000,
     [double]$MaxIncrementalIndexMs = 15000,
     [UInt64]$MaxPeakRssBytes = 60000000,
@@ -43,22 +45,70 @@ function Parse-DoubleOrThrow {
 }
 
 if ($ProbeOnly) {
+    $global:LASTEXITCODE = 0
     & "$PSScriptRoot\perf-report.ps1" -ProbeOnly -CargoTargetRoot $CargoTargetRoot
-    if ($LASTEXITCODE -ne 0) {
+    if (-not $?) {
         throw "Ingestion budget probe failed."
     }
     Write-Host "Ingestion budget probe passed."
     return
 }
 
+if ($Profile -eq "90k") {
+    $defaultOutputPath = "tmp/perf-report-ingestion-budget-90k.txt"
+    $cycles = 9000
+    $featureCommits = 6
+    $incrementalCommits = 9000
+    $queryRuns = 20
+    $windowLimit = 1000
+    $maxNodes = 90000
+    $defaultMaxFullIndexMs = 180000
+    $defaultMaxIncrementalIndexMs = 90000
+    $defaultMaxPeakRssBytes = [UInt64]200000000
+} else {
+    $defaultOutputPath = "tmp/perf-report-ingestion-budget.txt"
+    $cycles = 2500
+    $featureCommits = 6
+    $incrementalCommits = 2500
+    $queryRuns = 20
+    $windowLimit = 500
+    $maxNodes = 25000
+    $defaultMaxFullIndexMs = 45000
+    $defaultMaxIncrementalIndexMs = 15000
+    $defaultMaxPeakRssBytes = [UInt64]60000000
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = $defaultOutputPath
+}
+if (-not $PSBoundParameters.ContainsKey("MaxFullIndexMs")) {
+    $MaxFullIndexMs = $defaultMaxFullIndexMs
+}
+if (-not $PSBoundParameters.ContainsKey("MaxIncrementalIndexMs")) {
+    $MaxIncrementalIndexMs = $defaultMaxIncrementalIndexMs
+}
+if (-not $PSBoundParameters.ContainsKey("MaxPeakRssBytes")) {
+    $MaxPeakRssBytes = $defaultMaxPeakRssBytes
+}
+
+Write-Host ("Ingestion budget profile: {0}" -f $Profile)
+Write-Host (
+    "Workload: cycles={0} feature_commits={1} incremental_commits={2} query_runs={3} window_limit={4} max_nodes={5}" `
+        -f $cycles, $featureCommits, $incrementalCommits, $queryRuns, $windowLimit, $maxNodes
+)
+Write-Host (
+    "Thresholds: max_full_index_ms={0} max_incremental_index_ms={1} max_peak_rss_bytes={2}" `
+        -f $MaxFullIndexMs, $MaxIncrementalIndexMs, $MaxPeakRssBytes
+)
+
 & "$PSScriptRoot\perf-report.ps1" `
     -CargoTargetRoot $CargoTargetRoot `
-    -Cycles 2500 `
-    -FeatureCommits 6 `
-    -IncrementalCommits 2500 `
-    -QueryRuns 20 `
-    -WindowLimit 500 `
-    -MaxNodes 25000 `
+    -Cycles $cycles `
+    -FeatureCommits $featureCommits `
+    -IncrementalCommits $incrementalCommits `
+    -QueryRuns $queryRuns `
+    -WindowLimit $windowLimit `
+    -MaxNodes $maxNodes `
     -PreconditionCommitGraph:$PreconditionCommitGraph `
     -OutputPath $OutputPath
 if ($LASTEXITCODE -ne 0) {
