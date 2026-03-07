@@ -1,8 +1,8 @@
 use std::env;
 
 use gitgraph_lab_core::application::commands::{
-    get_commit_window, get_graph_traversal, get_shortest_path, index_commits_with_mode,
-    scan_repository,
+    enrich_pending_file_change_stats, get_commit_window, get_graph_traversal, get_shortest_path,
+    index_commits_with_mode, scan_repository,
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 
@@ -10,7 +10,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- window <repo_path> [limit] [db_path]\n  cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]\n  cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
+            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- enrich <repo_path> [max_items] [db_path]\n  cargo run -- window <repo_path> [limit] [db_path]\n  cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]\n  cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
         );
         std::process::exit(1);
     }
@@ -21,12 +21,13 @@ fn main() {
     match action.as_str() {
         "scan" => run_scan(repo_path, args.get(3).map(String::as_str)),
         "index" => run_index(repo_path, &args[3..]),
+        "enrich" => run_enrich(repo_path, &args[3..]),
         "window" => run_window(repo_path, &args[3..]),
         "traverse" => run_traverse(repo_path, &args[3..]),
         "path" => run_path(repo_path, &args[3..]),
         _ => {
             eprintln!(
-                "Unknown command: {action}. Use 'scan', 'index', 'window', 'traverse', or 'path'."
+                "Unknown command: {action}. Use 'scan', 'index', 'enrich', 'window', 'traverse', or 'path'."
             );
             std::process::exit(1);
         }
@@ -84,6 +85,37 @@ fn run_index(repo_path: &str, tail_args: &[String]) {
     }
 }
 
+fn run_enrich(repo_path: &str, tail_args: &[String]) {
+    let mut max_items: Option<usize> = None;
+    let mut db_path = None;
+
+    if let Some(arg1) = tail_args.first() {
+        if let Ok(parsed_max) = arg1.parse::<usize>() {
+            max_items = Some(parsed_max);
+            db_path = tail_args.get(1).map(String::as_str);
+        } else {
+            db_path = Some(arg1.as_str());
+            if let Some(arg2) = tail_args.get(1) {
+                match arg2.parse::<usize>() {
+                    Ok(parsed_max) => max_items = Some(parsed_max),
+                    Err(_) => {
+                        eprintln!("invalid max_items '{arg2}'. Use a positive integer.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    match enrich_pending_file_change_stats(repo_path, db_path, max_items) {
+        Ok(updated) => println!("Enriched file-change stats rows={updated}"),
+        Err(error) => {
+            eprintln!("enrich failed: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_window(repo_path: &str, tail_args: &[String]) {
     let mut limit = 100usize;
     let mut db_path = None;
@@ -134,7 +166,7 @@ fn run_traverse(repo_path: &str, tail_args: &[String]) {
     let start_sha = tail_args[0].as_str();
     let mut strategy = GraphTraversalStrategy::Bfs;
     let mut direction = GraphDirection::Parents;
-    let mut max_nodes = 200usize;
+    let mut max_nodes = 2_000usize;
 
     if let Some(strategy_raw) = tail_args.get(1) {
         match GraphTraversalStrategy::parse(strategy_raw) {

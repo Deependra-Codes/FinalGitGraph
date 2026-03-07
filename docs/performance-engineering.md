@@ -20,6 +20,8 @@ Keep graph-query code performant by default on medium/large repositories without
 10. Performance automation must report RSS memory signals, including peak observed RSS, for repository-scale runs.
 11. Repository-scale perf harness must include an explicit in-memory adjacency graph hydrated from SQLite persistence and report its setup/query costs.
 12. Ingestion hot path must keep bounded rename detection and set-based incremental cleanup (no row-by-row delete loop).
+13. Ingestion hot path must stay metadata-only for file changes; eager line-stats extraction is prohibited in core indexing flow.
+14. File-change line stats must use explicit state (`pending|ready|failed`) and queue-backed enrichment/JIT path.
 
 ## Current Strategy in This Repository
 
@@ -38,6 +40,9 @@ Keep graph-query code performant by default on medium/large repositories without
 13. Performance report output includes phase-level timing (fixture generation, scan, full index, incremental prep/index, query benchmark) so setup cost is never mistaken for algorithm cost.
 14. Performance report now includes an in-memory adjacency graph hydration phase sourced from SQLite plus comparative in-memory query latencies (BFS + shortest path).
 15. Indexing stats now carry ingestion phase telemetry (`commit_walk`, `commit_upsert`, `edge_materialize`, `file_diff_extract`, `file_change_delete`, `file_change_upsert`, `tx_commit`).
+16. File-change ingestion now persists metadata first and defers expensive line stats through `file_change_enrichment_queue` + `stats_state`.
+17. Query-time JIT line-stats enrichment is available via commit-scoped enrichment APIs (`ensure_file_change_stats_for_commits`).
+18. Perf report supports fixture reuse (`--fixture-root` + `--reuse-fixture`) so warm lanes avoid fixture-generation cost.
 
 ## Why This Strategy
 
@@ -84,6 +89,10 @@ Keep graph-query code performant by default on medium/large repositories without
 21. `adapters/git.rs` must enforce bounded rename detection settings (`rename_limit`, `rename_threshold`, `exact_match_only`).
 22. `adapters/db.rs` must use set-based temp-table delete for incremental file-change cleanup.
 23. `package.json` must expose `perf:ingestion:25k` and `quality:perf:ingestion`.
+24. `adapters/git.rs` hot path must use metadata-only extraction mode and keep selective line-stats path separate.
+25. `apps/desktop/src-tauri/migrations/0005_file_change_enrichment_queue.sql` must define `stats_state` + enrichment queue contracts.
+26. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit `file_change_stats_state_counts` and `jit_file_change_enrichment` phase metrics.
+27. `scripts/perf-ingestion-budget.ps1` must support warm/cold lanes and enforce diff-share regression threshold (`ingest_file_diff_extract_ms / core_end_to_end`).
 
 ## Ingestion Performance Policy
 
@@ -148,6 +157,9 @@ Keep graph-query code performant by default on medium/large repositories without
    - `pnpm run perf:ingestion:90k`
 13. Layered throttling isolation lane:
    - `pnpm run test:layers` (runs section-wise test lanes + perf smoke phase metrics including RSS).
+14. Warm ingestion budget lanes:
+   - `pnpm run perf:ingestion:25k:warm`
+   - `pnpm run perf:ingestion:90k:warm`
 
 ## Change Checklist for Graph Query Work
 

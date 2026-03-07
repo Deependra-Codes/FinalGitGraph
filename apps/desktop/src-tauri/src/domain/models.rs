@@ -138,6 +138,40 @@ pub struct IndexingStats {
     pub ingestion_phase_timing_ms: IngestionPhaseTimingMs,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeStatsState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl FileChangeStatsState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse_db(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileChangeStatsStateCounts {
+    pub pending: usize,
+    pub ready: usize,
+    pub failed: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct IngestionPhaseTimingMs {
     pub commit_walk: f64,
@@ -220,7 +254,23 @@ pub struct ParsedRef {
 pub struct ParsedFileChange {
     pub commit_sha: String,
     pub file_path: String,
+    pub additions: Option<i64>,
+    pub deletions: Option<i64>,
+    pub change_type: String,
+    pub stats_state: FileChangeStatsState,
+    pub requires_line_stats: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingFileChangeEnrichment {
+    pub commit_sha: String,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileChangeLineStatsUpdate {
+    pub commit_sha: String,
+    pub file_path: String,
     pub additions: i64,
     pub deletions: i64,
-    pub change_type: String,
 }

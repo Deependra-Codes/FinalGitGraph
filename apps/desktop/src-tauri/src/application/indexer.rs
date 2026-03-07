@@ -4,28 +4,31 @@ use std::time::{Duration, Instant};
 use rusqlite::{params, Transaction};
 
 use crate::adapters::db::{
-    clear_repository_index_data, delete_file_changes_for_commits, load_commit_rowid,
-    load_commit_window, load_index_checkpoint, open_database, run_migrations,
-    set_repository_indexed_at, synchronize_refs, upsert_file_changes, upsert_index_checkpoint,
-    upsert_repository,
+    apply_file_change_line_stats_updates, clear_repository_index_data,
+    delete_file_changes_for_commits, enqueue_file_changes_for_enrichment, load_commit_rowid,
+    load_commit_window, load_index_checkpoint, load_pending_file_change_enrichment,
+    load_pending_file_change_enrichment_for_commits, mark_file_change_enrichment_failed,
+    open_database, run_migrations, set_repository_indexed_at, synchronize_refs,
+    upsert_file_changes, upsert_index_checkpoint, upsert_repository,
 };
 use crate::adapters::git::{
-    load_refs, stream_commits, stream_file_changes_for_commits, validate_repository,
-    FILE_CHANGE_COMMIT_BATCH_SIZE,
+    load_file_change_line_stats_for_targets, load_refs, stream_commits, stream_commits_with_hide,
+    stream_file_changes_for_commits, validate_repository, FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
 use crate::application::graph_queries;
 use crate::domain::models::{
     CommitWindowCursor, CommitWindowResponse, GraphDirection, GraphTraversalResponse,
     GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, IngestionPhaseTimingMs,
-    ParsedFileChange, RepositorySummary, ShortestPathResponse,
+    ParsedFileChange, PendingFileChangeEnrichment, RepositorySummary, ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
 
 const DEFAULT_WINDOW_LIMIT: usize = 100;
-const MAX_WINDOW_LIMIT: usize = 500;
+const MAX_WINDOW_LIMIT: usize = 5_000;
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
+const FILE_CHANGE_JIT_ENRICH_BATCH_SIZE: usize = 1_024;
 
 #[derive(Default)]
 struct IngestionPhaseTiming {
@@ -173,52 +176,112 @@ impl Indexer {
 
             let commit_walk_started = Instant::now();
             let mut commit_callback_elapsed = Duration::default();
-            stream_commits(&canonical_repo.root, since_epoch, |commit| {
-                let callback_started = Instant::now();
-                let commit_upsert_started = Instant::now();
-                commit_stmt.execute(params![
-                    commit.sha.as_str(),
-                    repo_id,
-                    commit.author_name.as_str(),
-                    commit.author_email.as_str(),
-                    commit.author_time,
-                    commit.committer_time,
-                    commit.subject.as_str(),
-                    commit.tree_sha.as_str()
-                ])?;
-                commits_inserted += 1;
+            let hide_ancestor_sha = checkpoint
+                .as_ref()
+                .filter(|_| effective_mode == IndexingMode::Incremental)
+                .map(|checkpoint| checkpoint.last_commit_sha.as_str());
+            let stream_result = if hide_ancestor_sha.is_some() {
+                stream_commits_with_hide(
+                    &canonical_repo.root,
+                    since_epoch,
+                    hide_ancestor_sha,
+                    |commit| {
+                        let callback_started = Instant::now();
+                        let commit_upsert_started = Instant::now();
+                        commit_stmt.execute(params![
+                            commit.sha.as_str(),
+                            repo_id,
+                            commit.author_name.as_str(),
+                            commit.author_email.as_str(),
+                            commit.author_time,
+                            commit.committer_time,
+                            commit.subject.as_str(),
+                            commit.tree_sha.as_str()
+                        ])?;
+                        commits_inserted += 1;
 
-                for parent in &commit.parents {
-                    pending_edge_stmt.execute(params![commit.sha.as_str(), parent.as_str()])?;
-                    edges_inserted += 1;
-                }
-                ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
+                        for parent in &commit.parents {
+                            pending_edge_stmt
+                                .execute(params![commit.sha.as_str(), parent.as_str()])?;
+                            edges_inserted += 1;
+                        }
+                        ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
 
-                if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
-                    let flush_stats = flush_pending_commit_file_changes(
-                        &tx,
-                        &canonical_repo.root,
+                        if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
+                            let flush_stats = flush_pending_commit_file_changes(
+                                &tx,
+                                &canonical_repo.root,
+                                repo_id,
+                                effective_mode,
+                                &mut pending_commit_shas,
+                                &mut pending_file_changes,
+                            )?;
+                            file_changes_indexed = file_changes_indexed
+                                .saturating_add(flush_stats.file_changes_indexed);
+                            ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
+                            ingestion_timing.file_change_delete += flush_stats.file_change_delete;
+                            ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
+                        }
+                        pending_commit_shas.push(commit.sha.clone());
+                        update_checkpoint_candidate(
+                            &mut checkpoint_candidate,
+                            commit.committer_time,
+                            &commit.sha,
+                        );
+                        commit_callback_elapsed += callback_started.elapsed();
+
+                        Ok(())
+                    },
+                )
+            } else {
+                stream_commits(&canonical_repo.root, since_epoch, |commit| {
+                    let callback_started = Instant::now();
+                    let commit_upsert_started = Instant::now();
+                    commit_stmt.execute(params![
+                        commit.sha.as_str(),
                         repo_id,
-                        effective_mode,
-                        &mut pending_commit_shas,
-                        &mut pending_file_changes,
-                    )?;
-                    file_changes_indexed =
-                        file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
-                    ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
-                    ingestion_timing.file_change_delete += flush_stats.file_change_delete;
-                    ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
-                }
-                pending_commit_shas.push(commit.sha.clone());
-                update_checkpoint_candidate(
-                    &mut checkpoint_candidate,
-                    commit.committer_time,
-                    &commit.sha,
-                );
-                commit_callback_elapsed += callback_started.elapsed();
+                        commit.author_name.as_str(),
+                        commit.author_email.as_str(),
+                        commit.author_time,
+                        commit.committer_time,
+                        commit.subject.as_str(),
+                        commit.tree_sha.as_str()
+                    ])?;
+                    commits_inserted += 1;
 
-                Ok(())
-            })?;
+                    for parent in &commit.parents {
+                        pending_edge_stmt.execute(params![commit.sha.as_str(), parent.as_str()])?;
+                        edges_inserted += 1;
+                    }
+                    ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
+
+                    if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
+                        let flush_stats = flush_pending_commit_file_changes(
+                            &tx,
+                            &canonical_repo.root,
+                            repo_id,
+                            effective_mode,
+                            &mut pending_commit_shas,
+                            &mut pending_file_changes,
+                        )?;
+                        file_changes_indexed =
+                            file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
+                        ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
+                        ingestion_timing.file_change_delete += flush_stats.file_change_delete;
+                        ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
+                    }
+                    pending_commit_shas.push(commit.sha.clone());
+                    update_checkpoint_candidate(
+                        &mut checkpoint_candidate,
+                        commit.committer_time,
+                        &commit.sha,
+                    );
+                    commit_callback_elapsed += callback_started.elapsed();
+
+                    Ok(())
+                })
+            };
+            stream_result?;
             ingestion_timing.commit_walk += commit_walk_started
                 .elapsed()
                 .saturating_sub(commit_callback_elapsed);
@@ -265,6 +328,7 @@ impl Indexer {
                 repo_id,
                 &pending_file_changes,
             )?);
+            enqueue_file_changes_for_enrichment(&tx, repo_id, &pending_file_changes)?;
             ingestion_timing.file_change_upsert += file_change_upsert_started.elapsed();
             pending_file_changes.clear();
         }
@@ -290,6 +354,60 @@ impl Indexer {
             indexed_at_epoch,
             ingestion_phase_timing_ms: ingestion_timing.into_ms(),
         })
+    }
+
+    pub fn enrich_pending_file_change_stats(
+        &self,
+        path: &Path,
+        max_items: Option<usize>,
+    ) -> AppResult<usize> {
+        let canonical_repo = validate_repository(path)?;
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+
+        let repo_id = upsert_repository(
+            &conn,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
+        )?;
+        let batch_size = max_items
+            .unwrap_or(FILE_CHANGE_JIT_ENRICH_BATCH_SIZE)
+            .max(1);
+        let pending = load_pending_file_change_enrichment(&conn, repo_id, batch_size)?;
+        enrich_file_change_stats_batch(&canonical_repo.root, &mut conn, repo_id, &pending)
+    }
+
+    pub fn ensure_file_change_stats_for_commits(
+        &self,
+        path: &Path,
+        commit_shas: &[String],
+        max_items: Option<usize>,
+    ) -> AppResult<usize> {
+        if commit_shas.is_empty() {
+            return Ok(0);
+        }
+
+        let canonical_repo = validate_repository(path)?;
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+
+        let repo_id = upsert_repository(
+            &conn,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
+        )?;
+        let batch_size = max_items
+            .unwrap_or(FILE_CHANGE_JIT_ENRICH_BATCH_SIZE)
+            .max(1);
+        let pending = load_pending_file_change_enrichment_for_commits(
+            &conn,
+            repo_id,
+            commit_shas,
+            batch_size,
+        )?;
+        enrich_file_change_stats_batch(&canonical_repo.root, &mut conn, repo_id, &pending)
     }
 
     pub fn get_commit_window(
@@ -426,6 +544,7 @@ fn flush_pending_commit_file_changes(
             stats.file_changes_indexed = stats
                 .file_changes_indexed
                 .saturating_add(upsert_file_changes(tx, repo_id, pending_file_changes)?);
+            enqueue_file_changes_for_enrichment(tx, repo_id, pending_file_changes)?;
             upsert_duration += upsert_started.elapsed();
             pending_file_changes.clear();
         }
@@ -437,6 +556,32 @@ fn flush_pending_commit_file_changes(
 
     pending_commit_shas.clear();
     Ok(stats)
+}
+
+fn enrich_file_change_stats_batch(
+    repo_root: &Path,
+    conn: &mut rusqlite::Connection,
+    repo_id: i64,
+    pending: &[PendingFileChangeEnrichment],
+) -> AppResult<usize> {
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let updates = match load_file_change_line_stats_for_targets(repo_root, pending) {
+        Ok(updates) => updates,
+        Err(error) => {
+            let tx = conn.transaction()?;
+            mark_file_change_enrichment_failed(&tx, repo_id, pending, error.to_string().as_str())?;
+            tx.commit()?;
+            return Err(error);
+        }
+    };
+
+    let tx = conn.transaction()?;
+    let applied = apply_file_change_line_stats_updates(&tx, repo_id, &updates)?;
+    tx.commit()?;
+    Ok(applied)
 }
 
 fn update_checkpoint_candidate(

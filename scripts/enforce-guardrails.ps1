@@ -357,6 +357,16 @@ if (-not (Test-Path $srcRoot)) {
         } else {
             Add-Failure "Git adapter must keep two-stage selective line-count extraction (`diff_requires_line_stats` + `Patch::from_diff`)."
         }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'FileChangeExtractionMode::MetadataOnly' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'FileChangeExtractionMode::SelectiveLineStats' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'load_file_change_line_stats_for_targets' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps hot ingestion metadata-only and routes line stats to selective JIT enrichment path."
+        } else {
+            Add-Failure "Git adapter must enforce metadata-only hot ingestion and selective JIT line-stats enrichment path."
+        }
     }
 
     $indexerPath = Join-Path $srcRoot "application/indexer.rs"
@@ -414,6 +424,15 @@ if (-not (Test-Path $srcRoot)) {
         } else {
             Add-Failure "DB adapter must use set-based pending SHA delete table for incremental file-change cleanup."
         }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'stats_state' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'file_change_enrichment_queue' -Quiet)
+        ) {
+            Add-Pass "DB adapter enforces file-change stats_state contract and enrichment queue persistence."
+        } else {
+            Add-Failure "DB adapter must enforce file-change stats_state contract and enrichment queue persistence."
+        }
     }
 }
 
@@ -432,6 +451,20 @@ if (Test-Path $integerEdgeMigrationPath) {
     Add-Failure "Missing integer-edge migration file: apps/desktop/src-tauri/migrations/0004_integer_commit_edges.sql"
 }
 
+$fileChangeEnrichmentMigrationPath = Join-Path $repoRoot "apps/desktop/src-tauri/migrations/0005_file_change_enrichment_queue.sql"
+if (Test-Path $fileChangeEnrichmentMigrationPath) {
+    if (
+        (Select-String -Path $fileChangeEnrichmentMigrationPath -Pattern 'stats_state' -Quiet) -and
+        (Select-String -Path $fileChangeEnrichmentMigrationPath -Pattern 'file_change_enrichment_queue' -Quiet)
+    ) {
+        Add-Pass "File-change enrichment migration contract present."
+    } else {
+        Add-Failure "File-change enrichment migration must define stats_state and queue table contract."
+    }
+} else {
+    Add-Failure "Missing file-change enrichment migration file: apps/desktop/src-tauri/migrations/0005_file_change_enrichment_queue.sql"
+}
+
 $requiredDocs = @(
     "docs/engineering-system.md",
     "docs/from-scratch-system.md",
@@ -441,6 +474,7 @@ $requiredDocs = @(
     "docs/adr/0008-integer-edge-schema-for-graph-hot-path.md",
     "docs/adr/0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md",
     "docs/adr/0010-bounded-rename-detection-and-ingestion-phase-telemetry.md",
+    "docs/adr/0011-core-file-change-ingestion-and-jit-enrichment.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )
@@ -607,26 +641,36 @@ $perfIngestionBudgetPath = Join-Path $repoRoot "scripts/perf-ingestion-budget.ps
 if (Test-Path $perfIngestionBudgetPath) {
     $hasProbeMode = Select-String -Path $perfIngestionBudgetPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
     $hasProfileParam = Select-String -Path $perfIngestionBudgetPath -Pattern '\$Profile' -Quiet
+    $hasLaneParam = Select-String -Path $perfIngestionBudgetPath -Pattern '\$Lane' -Quiet
     $has90kProfile = Select-String -Path $perfIngestionBudgetPath -Pattern '"90k"' -Quiet
     $hasPerfReportInvocation = Select-String -Path $perfIngestionBudgetPath -Pattern 'perf-report\.ps1' -Quiet
     $hasFullIndexThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxFullIndexMs' -Quiet
     $hasIncrementalThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxIncrementalIndexMs' -Quiet
     $hasPeakRssThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxPeakRssBytes' -Quiet
+    $hasDiffShareThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxDiffShareRatio' -Quiet
     $hasPeakRssField = Select-String -Path $perfIngestionBudgetPath -Pattern 'peak_observed_rss' -Quiet
+    $hasCoreEndToEndField = Select-String -Path $perfIngestionBudgetPath -Pattern 'core_end_to_end' -Quiet
+    $hasWarmFixtureField = Select-String -Path $perfIngestionBudgetPath -Pattern 'fixture_generation' -Quiet
+    $hasWarmFixtureMode = Select-String -Path $perfIngestionBudgetPath -Pattern 'WarmFixture' -Quiet
 
     if (
         $hasProbeMode -and
         $hasProfileParam -and
+        $hasLaneParam -and
         $has90kProfile -and
         $hasPerfReportInvocation -and
         $hasFullIndexThreshold -and
         $hasIncrementalThreshold -and
         $hasPeakRssThreshold -and
-        $hasPeakRssField
+        $hasDiffShareThreshold -and
+        $hasPeakRssField -and
+        $hasCoreEndToEndField -and
+        $hasWarmFixtureField -and
+        $hasWarmFixtureMode
     ) {
-        Add-Pass "Ingestion budget script contract present (profile mode + probe mode + thresholds + memory budget check)."
+        Add-Pass "Ingestion budget script contract present (profile/lane modes + warm/cold checks + thresholds + memory/diff-share budgets)."
     } else {
-        Add-Failure "Ingestion budget script must keep profile/probe modes and enforce full/incremental/ms + peak RSS thresholds."
+        Add-Failure "Ingestion budget script must keep profile/lane/probe modes and enforce full/incremental/ms + peak RSS + diff-share + warm fixture thresholds."
     }
 }
 
@@ -639,6 +683,8 @@ if (Test-Path $perfReportBinaryPath) {
     $hasPeakRssField = Select-String -Path $perfReportBinaryPath -Pattern 'peak_observed_rss' -Quiet
     $hasInMemoryHydrationField = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_graph_hydration' -Quiet
     $hasInMemoryQuerySection = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_adjacency_query_latency_ms' -Quiet
+    $hasJitFileChangeEnrichmentField = Select-String -Path $perfReportBinaryPath -Pattern 'jit_file_change_enrichment' -Quiet
+    $hasFileChangeStatsStateCountsSection = Select-String -Path $perfReportBinaryPath -Pattern 'file_change_stats_state_counts' -Quiet
     $hasIngestCommitWalkField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_commit_walk_ms' -Quiet
     $hasIngestDiffExtractField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_diff_extract_ms' -Quiet
     $hasIngestUpsertField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_change_upsert_ms' -Quiet
@@ -652,14 +698,16 @@ if (Test-Path $perfReportBinaryPath) {
         $hasPeakRssField -and
         $hasInMemoryHydrationField -and
         $hasInMemoryQuerySection -and
+        $hasJitFileChangeEnrichmentField -and
+        $hasFileChangeStatsStateCountsSection -and
         $hasIngestCommitWalkField -and
         $hasIngestDiffExtractField -and
         $hasIngestUpsertField -and
         $hasIngestTxCommitField
     ) {
-        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency + ingestion-phase visibility contract."
+        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency + JIT/stats-state + ingestion-phase visibility contract."
     } else {
-        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency and ingestion-phase fields."
+        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency, JIT/stats-state, and ingestion-phase fields."
     }
 }
 
@@ -701,11 +749,13 @@ if (Test-Path $packageJsonPath) {
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:90k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:25k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:90k"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:25k:warm"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:90k:warm"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"test:layers"' -Quiet)
     ) {
-        Add-Pass "package.json exposes perf report tiers (including 90k), ingestion budget lanes, and layered test matrix command."
+        Add-Pass "package.json exposes perf report tiers, cold/warm ingestion budget lanes, and layered test matrix command."
     } else {
-        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, perf:report:25k:precondition, perf:report:90k, perf:ingestion:25k, perf:ingestion:90k, and test:layers scripts."
+        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, perf:report:25k:precondition, perf:report:90k, perf:ingestion:25k, perf:ingestion:90k, perf:ingestion:25k:warm, perf:ingestion:90k:warm, and test:layers scripts."
     }
 }
 

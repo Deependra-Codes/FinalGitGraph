@@ -52,6 +52,29 @@ pub fn index_repository_with_request(
         .map_err(|error| error.into_command_error())
 }
 
+pub fn enrich_pending_file_change_stats(
+    path: &str,
+    db_path: Option<&str>,
+    max_items: Option<usize>,
+) -> Result<usize, CommandError> {
+    let indexer = build_indexer(db_path);
+    indexer
+        .enrich_pending_file_change_stats(Path::new(path), max_items)
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn ensure_file_change_stats_for_commits(
+    path: &str,
+    db_path: Option<&str>,
+    commit_shas: &[String],
+    max_items: Option<usize>,
+) -> Result<usize, CommandError> {
+    let indexer = build_indexer(db_path);
+    indexer
+        .ensure_file_change_stats_for_commits(Path::new(path), commit_shas, max_items)
+        .map_err(|error| error.into_command_error())
+}
+
 pub fn get_commit_window(
     path: &str,
     db_path: Option<&str>,
@@ -93,7 +116,7 @@ pub fn get_graph_traversal(
         start_sha: start_sha.to_string(),
         strategy,
         direction,
-        max_nodes: max_nodes.unwrap_or(200),
+        max_nodes: max_nodes.unwrap_or(2_000),
     })
 }
 

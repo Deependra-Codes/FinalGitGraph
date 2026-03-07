@@ -5,8 +5,9 @@ use std::path::Path;
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowItem, GraphDirection, IndexCheckpoint, ParsedFileChange,
-    ParsedRef,
+    CommitWindowCursor, CommitWindowItem, FileChangeLineStatsUpdate, FileChangeStatsState,
+    FileChangeStatsStateCounts, GraphDirection, IndexCheckpoint, ParsedFileChange, ParsedRef,
+    PendingFileChangeEnrichment,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::AppResult;
@@ -15,15 +16,18 @@ const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_repo_scoped_commit_keys.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_indexing_checkpoints.sql");
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_integer_commit_edges.sql");
+const MIGRATION_0005: &str = include_str!("../../migrations/0005_file_change_enrichment_queue.sql");
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_0001),
     (2, MIGRATION_0002),
     (3, MIGRATION_0003),
     (4, MIGRATION_0004),
+    (5, MIGRATION_0005),
 ];
 
-const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 400;
-const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 800;
+const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 1_024;
+const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 2_048;
+const MAX_COMMIT_WINDOW_LIMIT: usize = 5_000;
 
 pub fn open_database(db_path: &Path) -> AppResult<Connection> {
     if let Some(parent) = db_path.parent() {
@@ -156,6 +160,17 @@ pub fn delete_file_changes_for_commits(
     "#,
         [repo_id],
     )?;
+    conn.execute(
+        r#"
+        DELETE FROM file_change_enrichment_queue
+        WHERE repo_id = ?1
+          AND commit_sha IN (
+            SELECT sha
+            FROM current_pending_file_change_delete_shas
+          )
+    "#,
+        [repo_id],
+    )?;
 
     Ok(())
 }
@@ -173,12 +188,13 @@ pub fn upsert_file_changes(
     let mut stmt = conn.prepare(
         r#"
         INSERT INTO file_changes (
-          repo_id, commit_sha, file_path, additions, deletions, change_type
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          repo_id, commit_sha, file_path, additions, deletions, change_type, stats_state
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
           additions = excluded.additions,
           deletions = excluded.deletions,
-          change_type = excluded.change_type
+          change_type = excluded.change_type,
+          stats_state = excluded.stats_state
     "#,
     )?;
 
@@ -190,11 +206,283 @@ pub fn upsert_file_changes(
             change.additions,
             change.deletions,
             change.change_type.as_str(),
+            change.stats_state.as_str(),
         ])?;
         inserted += 1;
     }
 
     Ok(inserted)
+}
+
+pub fn enqueue_file_changes_for_enrichment(
+    conn: &Connection,
+    repo_id: i64,
+    file_changes: &[ParsedFileChange],
+) -> AppResult<usize> {
+    if file_changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut enqueued = 0usize;
+    let mut stmt = conn.prepare_cached(
+        r#"
+        INSERT INTO file_change_enrichment_queue (
+          repo_id, commit_sha, file_path, enqueued_at_epoch, attempts, last_error
+        ) VALUES (?1, ?2, ?3, ?4, 0, NULL)
+        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
+          enqueued_at_epoch = excluded.enqueued_at_epoch,
+          last_error = NULL
+    "#,
+    )?;
+    let now_epoch = now_epoch_seconds();
+
+    for change in file_changes {
+        if change.stats_state != FileChangeStatsState::Pending || !change.requires_line_stats {
+            continue;
+        }
+        stmt.execute(params![
+            repo_id,
+            change.commit_sha.as_str(),
+            change.file_path.as_str(),
+            now_epoch
+        ])?;
+        enqueued = enqueued.saturating_add(1);
+    }
+
+    Ok(enqueued)
+}
+
+pub fn load_pending_file_change_enrichment(
+    conn: &Connection,
+    repo_id: i64,
+    limit: usize,
+) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+    let bounded_limit = limit.max(1);
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT q.commit_sha, q.file_path
+        FROM file_change_enrichment_queue q
+        JOIN file_changes f
+          ON f.repo_id = q.repo_id
+         AND f.commit_sha = q.commit_sha
+         AND f.file_path = q.file_path
+        WHERE q.repo_id = ?1
+          AND f.stats_state = 'pending'
+        ORDER BY q.enqueued_at_epoch ASC, q.commit_sha ASC, q.file_path ASC
+        LIMIT ?2
+    "#,
+    )?;
+    let rows = stmt.query_map(params![repo_id, bounded_limit as i64], |row| {
+        Ok(PendingFileChangeEnrichment {
+            commit_sha: row.get(0)?,
+            file_path: row.get(1)?,
+        })
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn load_pending_file_change_enrichment_for_commits(
+    conn: &Connection,
+    repo_id: i64,
+    commit_shas: &[String],
+    limit: usize,
+) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+    if commit_shas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS current_pending_file_change_enrichment_commits (
+          sha TEXT PRIMARY KEY
+        );
+        DELETE FROM current_pending_file_change_enrichment_commits;
+    "#,
+    )?;
+
+    {
+        let mut insert_stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO current_pending_file_change_enrichment_commits (sha)
+            VALUES (?1)
+            ON CONFLICT(sha) DO NOTHING
+        "#,
+        )?;
+        for sha in commit_shas {
+            insert_stmt.execute([sha.as_str()])?;
+        }
+    }
+
+    let bounded_limit = limit.max(1);
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT q.commit_sha, q.file_path
+        FROM file_change_enrichment_queue q
+        JOIN current_pending_file_change_enrichment_commits c
+          ON c.sha = q.commit_sha
+        JOIN file_changes f
+          ON f.repo_id = q.repo_id
+         AND f.commit_sha = q.commit_sha
+         AND f.file_path = q.file_path
+        WHERE q.repo_id = ?1
+          AND f.stats_state = 'pending'
+        ORDER BY q.enqueued_at_epoch ASC, q.commit_sha ASC, q.file_path ASC
+        LIMIT ?2
+    "#,
+    )?;
+    let rows = stmt.query_map(params![repo_id, bounded_limit as i64], |row| {
+        Ok(PendingFileChangeEnrichment {
+            commit_sha: row.get(0)?,
+            file_path: row.get(1)?,
+        })
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn apply_file_change_line_stats_updates(
+    conn: &Connection,
+    repo_id: i64,
+    updates: &[FileChangeLineStatsUpdate],
+) -> AppResult<usize> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+
+    let mut applied = 0usize;
+    let mut update_stmt = conn.prepare_cached(
+        r#"
+        UPDATE file_changes
+        SET
+          additions = ?4,
+          deletions = ?5,
+          stats_state = 'ready'
+        WHERE repo_id = ?1
+          AND commit_sha = ?2
+          AND file_path = ?3
+    "#,
+    )?;
+    let mut clear_queue_stmt = conn.prepare_cached(
+        r#"
+        DELETE FROM file_change_enrichment_queue
+        WHERE repo_id = ?1
+          AND commit_sha = ?2
+          AND file_path = ?3
+    "#,
+    )?;
+
+    for update in updates {
+        let changed = update_stmt.execute(params![
+            repo_id,
+            update.commit_sha.as_str(),
+            update.file_path.as_str(),
+            update.additions,
+            update.deletions
+        ])?;
+        if changed > 0 {
+            applied = applied.saturating_add(changed);
+            clear_queue_stmt.execute(params![
+                repo_id,
+                update.commit_sha.as_str(),
+                update.file_path.as_str()
+            ])?;
+        }
+    }
+
+    Ok(applied)
+}
+
+pub fn mark_file_change_enrichment_failed(
+    conn: &Connection,
+    repo_id: i64,
+    failed_items: &[PendingFileChangeEnrichment],
+    error_message: &str,
+) -> AppResult<()> {
+    if failed_items.is_empty() {
+        return Ok(());
+    }
+
+    let mut mark_stmt = conn.prepare_cached(
+        r#"
+        UPDATE file_changes
+        SET stats_state = 'failed'
+        WHERE repo_id = ?1
+          AND commit_sha = ?2
+          AND file_path = ?3
+    "#,
+    )?;
+    let mut queue_stmt = conn.prepare_cached(
+        r#"
+        UPDATE file_change_enrichment_queue
+        SET
+          attempts = attempts + 1,
+          last_error = ?4,
+          enqueued_at_epoch = ?5
+        WHERE repo_id = ?1
+          AND commit_sha = ?2
+          AND file_path = ?3
+    "#,
+    )?;
+    let now_epoch = now_epoch_seconds();
+
+    for failed in failed_items {
+        mark_stmt.execute(params![
+            repo_id,
+            failed.commit_sha.as_str(),
+            failed.file_path.as_str()
+        ])?;
+        queue_stmt.execute(params![
+            repo_id,
+            failed.commit_sha.as_str(),
+            failed.file_path.as_str(),
+            error_message,
+            now_epoch
+        ])?;
+    }
+
+    Ok(())
+}
+
+pub fn load_file_change_stats_state_counts(
+    conn: &Connection,
+    repo_id: i64,
+) -> AppResult<FileChangeStatsStateCounts> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT stats_state, COUNT(1)
+        FROM file_changes
+        WHERE repo_id = ?1
+        GROUP BY stats_state
+    "#,
+    )?;
+    let rows = stmt.query_map([repo_id], |row| {
+        let state: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        Ok((state, count))
+    })?;
+
+    let mut counts = FileChangeStatsStateCounts::default();
+    for row in rows {
+        let (state, count) = row?;
+        let normalized_count = count.max(0) as usize;
+        match FileChangeStatsState::parse_db(state.as_str()) {
+            Some(FileChangeStatsState::Pending) => counts.pending = normalized_count,
+            Some(FileChangeStatsState::Ready) => counts.ready = normalized_count,
+            Some(FileChangeStatsState::Failed) => counts.failed = normalized_count,
+            None => {}
+        }
+    }
+
+    Ok(counts)
 }
 
 pub fn synchronize_refs(conn: &Connection, repo_id: i64, refs: &[ParsedRef]) -> AppResult<usize> {
@@ -315,7 +603,7 @@ pub fn load_commit_window(
     limit: usize,
     cursor: Option<&CommitWindowCursor>,
 ) -> AppResult<Vec<CommitWindowItem>> {
-    let limit = limit.min(500);
+    let limit = limit.min(MAX_COMMIT_WINDOW_LIMIT);
 
     let mut commits = Vec::new();
     if let Some(cursor) = cursor {
@@ -944,7 +1232,9 @@ mod tests {
         run_migrations, upsert_file_changes, upsert_index_checkpoint,
         FRONTIER_PULL_QUERY_CHUNK_SIZE, ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE,
     };
-    use crate::domain::models::{GraphDirection, IndexCheckpoint, ParsedFileChange};
+    use crate::domain::models::{
+        FileChangeStatsState, GraphDirection, IndexCheckpoint, ParsedFileChange,
+    };
 
     #[test]
     fn migrations_are_idempotent() {
@@ -1028,23 +1318,29 @@ mod tests {
             ParsedFileChange {
                 commit_sha: "c1".to_string(),
                 file_path: "a.txt".to_string(),
-                additions: 1,
-                deletions: 0,
+                additions: Some(1),
+                deletions: Some(0),
                 change_type: "add".to_string(),
+                stats_state: FileChangeStatsState::Ready,
+                requires_line_stats: false,
             },
             ParsedFileChange {
                 commit_sha: "c2".to_string(),
                 file_path: "b.txt".to_string(),
-                additions: 2,
-                deletions: 1,
+                additions: Some(2),
+                deletions: Some(1),
                 change_type: "modify".to_string(),
+                stats_state: FileChangeStatsState::Ready,
+                requires_line_stats: false,
             },
             ParsedFileChange {
                 commit_sha: "c3".to_string(),
                 file_path: "c.txt".to_string(),
-                additions: 0,
-                deletions: 4,
+                additions: Some(0),
+                deletions: Some(4),
                 change_type: "delete".to_string(),
+                stats_state: FileChangeStatsState::Ready,
+                requires_line_stats: false,
             },
         ];
         upsert_file_changes(&conn, repo_id, &file_changes).expect("insert file changes");

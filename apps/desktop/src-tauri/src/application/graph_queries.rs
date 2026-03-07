@@ -12,8 +12,8 @@ use crate::domain::models::{
 };
 use crate::support::error::{AppError, AppResult};
 
-const DEFAULT_GRAPH_MAX_NODES: usize = 200;
-const MAX_GRAPH_MAX_NODES: usize = 10_000;
+const DEFAULT_GRAPH_MAX_NODES: usize = 2_000;
+const MAX_GRAPH_MAX_NODES: usize = 2_000_000;
 const BFS_PULL_MIN_FRONTIER: usize = 256;
 const BFS_PULL_MIN_REMAINING: usize = 1_024;
 const BFS_PULL_FRONTIER_TO_REMAINING_RATIO: usize = 8;

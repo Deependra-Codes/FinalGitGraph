@@ -3,8 +3,8 @@ use std::path::Path;
 use std::process::Command;
 
 use gitgraph_lab_core::application::commands::{
-    get_commit_window, get_graph_traversal, get_shortest_path, index_commits,
-    index_commits_with_mode, scan_repository,
+    ensure_file_change_stats_for_commits, get_commit_window, get_graph_traversal,
+    get_shortest_path, index_commits, index_commits_with_mode, scan_repository,
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 use rusqlite::Connection;
@@ -75,6 +75,10 @@ fn incremental_indexing_and_commit_window_work() {
             .unwrap_or_else(|error| panic!("incremental index: {error}"));
     assert_eq!(incremental_stats.mode, IndexingMode::Incremental);
     assert!(incremental_stats.commits_indexed >= 1);
+    assert!(
+        incremental_stats.commits_indexed <= 2,
+        "incremental checkpoint hide boundary should avoid broad replay"
+    );
     assert!(incremental_stats.file_changes_indexed >= 1);
 
     let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
@@ -138,6 +142,203 @@ fn indexing_large_history_keeps_file_change_ingestion_correct() {
         .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
         .unwrap_or_else(|error| panic!("query file_changes count: {error}"));
     assert!(db_file_change_count >= commit_count as i64);
+}
+
+#[test]
+fn file_change_stats_are_deferred_and_jit_enrichable() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+
+    write_file(repo_dir.join("README.md"), "v2\nline-2\n");
+    git_commit(&repo_dir, "v2");
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    index_commits(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("index: {error}"));
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let pending_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE stats_state = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query pending file_changes before jit: {error}"));
+    assert!(pending_before >= 1);
+    let pending_with_eager_stats: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE stats_state = 'pending' AND (additions IS NOT NULL OR deletions IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query pending rows with eager line stats: {error}"));
+    assert_eq!(pending_with_eager_stats, 0);
+    drop(conn);
+
+    let window = get_commit_window(&repo_str, Some(&db_str), Some(1), None)
+        .unwrap_or_else(|error| panic!("window: {error}"));
+    let head_sha = window
+        .commits
+        .first()
+        .map(|commit| commit.sha.clone())
+        .unwrap_or_else(|| panic!("expected at least one commit in window"));
+
+    let enriched = ensure_file_change_stats_for_commits(
+        &repo_str,
+        Some(&db_str),
+        std::slice::from_ref(&head_sha),
+        Some(64),
+    )
+    .unwrap_or_else(|error| panic!("jit enrich: {error}"));
+    assert!(enriched >= 1);
+
+    let conn = Connection::open(db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let ready_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE commit_sha = ?1 AND stats_state = 'ready' AND additions IS NOT NULL AND deletions IS NOT NULL",
+            [head_sha.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query ready file_changes after jit: {error}"));
+    assert!(ready_after >= 1);
+}
+
+#[test]
+fn jit_enrichment_is_commit_scoped() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+
+    write_file(repo_dir.join("README.md"), "v2\nline-2\n");
+    git_commit(&repo_dir, "v2");
+
+    write_file(repo_dir.join("README.md"), "v3\nline-2\nline-3\n");
+    git_commit(&repo_dir, "v3");
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    index_commits(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("index: {error}"));
+
+    let window = get_commit_window(&repo_str, Some(&db_str), Some(3), None)
+        .unwrap_or_else(|error| panic!("window: {error}"));
+    assert!(
+        window.commits.len() >= 2,
+        "expected at least two commits for scoped JIT assertion"
+    );
+    let head_sha = window.commits[0].sha.clone();
+    let previous_sha = window.commits[1].sha.clone();
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let previous_pending_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE commit_sha = ?1 AND stats_state = 'pending'",
+            [previous_sha.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query previous commit pending before jit: {error}"));
+    assert!(previous_pending_before >= 1);
+    drop(conn);
+
+    let enriched = ensure_file_change_stats_for_commits(
+        &repo_str,
+        Some(&db_str),
+        std::slice::from_ref(&head_sha),
+        Some(64),
+    )
+    .unwrap_or_else(|error| panic!("jit enrich: {error}"));
+    assert!(enriched >= 1);
+
+    let conn = Connection::open(db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let head_ready_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE commit_sha = ?1 AND stats_state = 'ready' AND additions IS NOT NULL AND deletions IS NOT NULL",
+            [head_sha.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query head commit ready after jit: {error}"));
+    assert!(head_ready_after >= 1);
+
+    let previous_pending_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE commit_sha = ?1 AND stats_state = 'pending'",
+            [previous_sha.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("query previous commit pending after jit: {error}"));
+    assert!(previous_pending_after >= 1);
+}
+
+#[test]
+fn rename_commit_is_recorded_as_rename_change() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+
+    write_file(repo_dir.join("alpha.txt"), "alpha\n");
+    git_commit(&repo_dir, "add alpha");
+
+    run_git(&repo_dir, &["mv", "alpha.txt", "beta.txt"]);
+    git_commit(&repo_dir, "rename alpha to beta");
+    let rename_sha = current_head_sha(&repo_dir);
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    index_commits(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("index: {error}"));
+
+    let conn = Connection::open(db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT file_path, change_type
+            FROM file_changes
+            WHERE commit_sha = ?1
+        "#,
+        )
+        .unwrap_or_else(|error| panic!("prepare file-change rename query: {error}"));
+    let rows = stmt
+        .query_map([rename_sha.as_str()], |row| {
+            let file_path: String = row.get(0)?;
+            let change_type: String = row.get(1)?;
+            Ok((file_path, change_type))
+        })
+        .unwrap_or_else(|error| panic!("query rename file changes: {error}"));
+
+    let mut rename_entry_found = false;
+    for row in rows {
+        let (file_path, change_type) =
+            row.unwrap_or_else(|error| panic!("read rename file-change row: {error}"));
+        if change_type == "rename"
+            && file_path.contains("alpha.txt")
+            && file_path.contains("beta.txt")
+        {
+            rename_entry_found = true;
+            break;
+        }
+    }
+
+    assert!(
+        rename_entry_found,
+        "expected rename commit to persist rename change_type and path mapping"
+    );
 }
 
 #[test]

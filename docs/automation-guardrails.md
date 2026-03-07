@@ -69,6 +69,9 @@ Performance automation must not hide where time is spent. Required properties:
 9. `scripts/perf-ingestion-budget.ps1` must enforce full-index/incremental-index + peak RSS thresholds for the 25k ingestion lane.
 10. `scripts/perf-ingestion-budget.ps1` profile mode must support larger parameter sets (for example `-Profile 90k`) with parameter-appropriate default thresholds.
 11. Optional commit-graph preconditioning lane (`perf:report:25k:precondition`) must continue to run through `scripts/perf-report.ps1`.
+12. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit file-change stats-state counts (`pending|ready|failed`) and JIT enrichment timing phase.
+13. `scripts/perf-ingestion-budget.ps1` must support warm/cold lanes and enforce diff-share regression checks (`ingest_file_diff_extract_ms / core_end_to_end`).
+14. Warm ingestion lanes must be exposed in `package.json` (`perf:ingestion:25k:warm`, `perf:ingestion:90k:warm`).
 
 ## Non-Goals
 
@@ -100,6 +103,8 @@ Repository-scale indexing guardrails now also enforce:
 11. ingestion phase telemetry contract in perf report (`ingest_commit_walk_ms`, `ingest_file_diff_extract_ms`, `ingest_file_change_upsert_ms`, `ingest_tx_commit_ms`)
 12. lazy two-stage diff extraction in `adapters/git.rs` (`diff_requires_line_stats` + selective `Patch::from_diff` line stats)
 13. adaptive-but-bounded Rayon planning in `adapters/git.rs` for chunk/channel sizing (`parallel_file_change_plan`)
+14. metadata-only file-change hot ingestion mode in `adapters/git.rs` with selective JIT line-stats enrichment path
+15. file-change stats-state + queue persistence contract in DB/migrations (`stats_state`, `file_change_enrichment_queue`)
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
 

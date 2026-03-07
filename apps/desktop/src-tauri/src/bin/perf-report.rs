@@ -7,14 +7,18 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gitgraph_lab_core::application::commands::{
-    get_commit_window, get_graph_traversal, get_shortest_path, index_commits_with_mode,
-    scan_repository,
+    ensure_file_change_stats_for_commits, get_commit_window, get_graph_traversal,
+    get_shortest_path, index_commits_with_mode, scan_repository,
 };
-use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
+use gitgraph_lab_core::domain::models::{
+    FileChangeStatsStateCounts, GraphDirection, GraphTraversalStrategy, IndexingMode,
+};
 use memory_stats::memory_stats;
 use rusqlite::{params, Connection};
 
 type PerfResult<T> = Result<T, String>;
+const FIXTURE_BASELINE_HEAD_FILENAME: &str = ".gitgraph-lab-baseline-head";
+const PERF_JIT_WINDOW_LIMIT_MAX: usize = 5_000;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -27,6 +31,8 @@ struct Config {
     output_path: Option<PathBuf>,
     keep_fixture: bool,
     precondition_commit_graph: bool,
+    fixture_root: Option<PathBuf>,
+    reuse_fixture: bool,
 }
 
 impl Default for Config {
@@ -41,6 +47,8 @@ impl Default for Config {
             output_path: None,
             keep_fixture: false,
             precondition_commit_graph: false,
+            fixture_root: None,
+            reuse_fixture: false,
         }
     }
 }
@@ -73,6 +81,7 @@ struct PhaseTimingSummary {
     incremental_fixture_append: Duration,
     incremental_index: Duration,
     query_benchmark: Duration,
+    jit_file_change_enrichment: Duration,
     in_memory_graph_hydration: Duration,
     in_memory_query_benchmark: Duration,
     core_end_to_end: Duration,
@@ -88,6 +97,7 @@ struct PhaseMemorySummary {
     incremental_fixture_append_rss_bytes: Option<u64>,
     incremental_index_rss_bytes: Option<u64>,
     query_benchmark_rss_bytes: Option<u64>,
+    jit_file_change_enrichment_rss_bytes: Option<u64>,
     in_memory_graph_hydration_rss_bytes: Option<u64>,
     in_memory_query_benchmark_rss_bytes: Option<u64>,
     final_rss_bytes: Option<u64>,
@@ -149,6 +159,7 @@ struct ReportInput<'a> {
     config: &'a Config,
     fixture_root: &'a Path,
     counts: (i64, i64, i64),
+    file_change_stats_state_counts: &'a FileChangeStatsStateCounts,
     full_stats: &'a gitgraph_lab_core::domain::models::IndexingStats,
     incremental_stats: &'a gitgraph_lab_core::domain::models::IndexingStats,
     query: QueryLatencySet<'a>,
@@ -400,12 +411,18 @@ fn main() {
 
 fn run() -> PerfResult<()> {
     let config = parse_config()?;
-    let fixture_root = create_fixture_root()?;
+    let fixture_root = if let Some(root) = &config.fixture_root {
+        fs::create_dir_all(root)
+            .map_err(|error| format!("create fixture root {}: {error}", root.display()))?;
+        root.clone()
+    } else {
+        create_fixture_root()?
+    };
     let repo_dir = fixture_root.join("repo");
     let db_path = fixture_root.join("gitgraph-lab-perf.db");
 
     let result = run_with_fixture(&config, &fixture_root, &repo_dir, &db_path);
-    if !config.keep_fixture {
+    if !config.keep_fixture && config.fixture_root.is_none() {
         let _ = fs::remove_dir_all(&fixture_root);
     }
     result
@@ -421,10 +438,17 @@ fn run_with_fixture(
     let mut memory_tracker = MemoryTracker::default();
     let _ = memory_tracker.sample_rss();
 
+    remove_database_files(db_path)?;
+
     log_phase_start("fixture_generation");
-    let fixture_generation_started = Instant::now();
-    generate_branching_fixture(repo_dir, config.cycles, config.feature_commits)?;
-    let fixture_generation = fixture_generation_started.elapsed();
+    let fixture_generation = if config.reuse_fixture {
+        reset_fixture_to_baseline(repo_dir)?;
+        Duration::default()
+    } else {
+        let fixture_generation_started = Instant::now();
+        generate_branching_fixture(repo_dir, config.cycles, config.feature_commits)?;
+        fixture_generation_started.elapsed()
+    };
     log_phase_done("fixture_generation", fixture_generation);
     let fixture_generation_rss_bytes = memory_tracker.sample_rss();
 
@@ -434,6 +458,9 @@ fn run_with_fixture(
     let fixture_summary = fixture_summary_started.elapsed();
     log_phase_done("fixture_summary", fixture_summary);
     let fixture_summary_rss_bytes = memory_tracker.sample_rss();
+    if !config.reuse_fixture {
+        persist_fixture_baseline(repo_dir, fixture.head_sha.as_str())?;
+    }
 
     let mut repository_preconditioning = Duration::default();
     let mut repository_preconditioning_rss_bytes = memory_tracker.sample_rss();
@@ -484,8 +511,6 @@ fn run_with_fixture(
     let incremental_index = incremental_started.elapsed();
     log_phase_done("incremental_index", incremental_index);
     let incremental_index_rss_bytes = memory_tracker.sample_rss();
-
-    let counts = load_repo_counts(db_path)?;
 
     log_phase_start("query_benchmark");
     let query_started = Instant::now();
@@ -584,6 +609,35 @@ fn run_with_fixture(
     log_phase_done("query_benchmark", query_benchmark);
     let query_benchmark_rss_bytes = memory_tracker.sample_rss();
 
+    log_phase_start("jit_file_change_enrichment");
+    let jit_file_change_enrichment_started = Instant::now();
+    let jit_commit_window = get_commit_window(
+        repo_str.as_str(),
+        Some(db_str.as_str()),
+        Some(config.window_limit.clamp(1, PERF_JIT_WINDOW_LIMIT_MAX)),
+        None,
+    )
+    .map_err(|error| error.to_string())?;
+    let jit_commit_shas: Vec<String> = jit_commit_window
+        .commits
+        .into_iter()
+        .map(|commit| commit.sha)
+        .collect();
+    if !jit_commit_shas.is_empty() {
+        let _ = ensure_file_change_stats_for_commits(
+            repo_str.as_str(),
+            Some(db_str.as_str()),
+            &jit_commit_shas,
+            Some(jit_commit_shas.len().max(1)),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let jit_file_change_enrichment = jit_file_change_enrichment_started.elapsed();
+    log_phase_done("jit_file_change_enrichment", jit_file_change_enrichment);
+    let jit_file_change_enrichment_rss_bytes = memory_tracker.sample_rss();
+
+    let (counts, file_change_stats_state_counts) = load_repo_counts(db_path)?;
+
     log_phase_start("in_memory_graph_hydration");
     let in_memory_graph_hydration_started = Instant::now();
     let in_memory_context = load_in_memory_graph_context(db_path, &fixture)?;
@@ -646,6 +700,7 @@ fn run_with_fixture(
         incremental_fixture_append,
         incremental_index,
         query_benchmark,
+        jit_file_change_enrichment,
         in_memory_graph_hydration,
         in_memory_query_benchmark,
         core_end_to_end: overall_started.elapsed(),
@@ -659,6 +714,7 @@ fn run_with_fixture(
         incremental_fixture_append_rss_bytes,
         incremental_index_rss_bytes,
         query_benchmark_rss_bytes,
+        jit_file_change_enrichment_rss_bytes,
         in_memory_graph_hydration_rss_bytes,
         in_memory_query_benchmark_rss_bytes,
         final_rss_bytes: memory_tracker.sample_rss(),
@@ -669,6 +725,7 @@ fn run_with_fixture(
         config,
         fixture_root,
         counts,
+        file_change_stats_state_counts: &file_change_stats_state_counts,
         full_stats: &full_stats,
         incremental_stats: &incremental_stats,
         query: QueryLatencySet {
@@ -747,6 +804,16 @@ fn parse_config() -> PerfResult<Config> {
             "--precondition-commit-graph" => {
                 config.precondition_commit_graph = true;
             }
+            "--fixture-root" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--fixture-root requires a path value".to_string())?;
+                config.fixture_root = Some(PathBuf::from(value));
+            }
+            "--reuse-fixture" => {
+                config.reuse_fixture = true;
+                config.keep_fixture = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -772,6 +839,9 @@ fn parse_config() -> PerfResult<Config> {
     if config.max_nodes == 0 {
         return Err("--max-nodes must be greater than 0".to_string());
     }
+    if config.reuse_fixture && config.fixture_root.is_none() {
+        return Err("--reuse-fixture requires --fixture-root <path>".to_string());
+    }
 
     Ok(config)
 }
@@ -787,7 +857,9 @@ fn print_help() {
   --max-nodes <n>            Traversal max_nodes parameter (default: 2000)
   --output <path>            Write report text to file
   --keep-fixture             Keep generated fixture directory for inspection
-  --precondition-commit-graph  Write commit-graph before scan/index phases"
+  --precondition-commit-graph  Write commit-graph before scan/index phases
+  --fixture-root <path>      Persist fixture state at a specific path
+  --reuse-fixture            Reuse fixture-root repository and skip generation (warm lane)"
     );
 }
 
@@ -1136,7 +1208,73 @@ fn current_branch_name(repo_dir: &Path) -> PerfResult<String> {
     run_git_capture(repo_dir, &["symbolic-ref", "--short", "HEAD"])
 }
 
-fn load_repo_counts(db_path: &Path) -> PerfResult<(i64, i64, i64)> {
+fn fixture_baseline_head_path(repo_dir: &Path) -> PathBuf {
+    repo_dir.join(FIXTURE_BASELINE_HEAD_FILENAME)
+}
+
+fn persist_fixture_baseline(repo_dir: &Path, baseline_head: &str) -> PerfResult<()> {
+    let baseline_path = fixture_baseline_head_path(repo_dir);
+    fs::write(&baseline_path, format!("{baseline_head}\n")).map_err(|error| {
+        format!(
+            "write fixture baseline {}: {error}",
+            baseline_path.display()
+        )
+    })
+}
+
+fn load_fixture_baseline(repo_dir: &Path) -> PerfResult<String> {
+    let baseline_path = fixture_baseline_head_path(repo_dir);
+    if baseline_path.exists() {
+        let raw = fs::read_to_string(&baseline_path).map_err(|error| {
+            format!("read fixture baseline {}: {error}", baseline_path.display())
+        })?;
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    let current_head = current_head_sha(repo_dir)?;
+    persist_fixture_baseline(repo_dir, current_head.as_str())?;
+    Ok(current_head)
+}
+
+fn reset_fixture_to_baseline(repo_dir: &Path) -> PerfResult<()> {
+    if !repo_dir.exists() {
+        return Err(format!(
+            "reuse fixture requested but repository directory is missing: {}",
+            repo_dir.display()
+        ));
+    }
+
+    let default_branch = current_branch_name(repo_dir)?;
+    run_git(repo_dir, &["checkout", "-f", default_branch.as_str()])?;
+    let baseline_head = load_fixture_baseline(repo_dir)?;
+    run_git(repo_dir, &["reset", "--hard", baseline_head.as_str()])?;
+    run_git(repo_dir, &["clean", "-fd"])?;
+    Ok(())
+}
+
+fn remove_database_files(db_path: &Path) -> PerfResult<()> {
+    let mut candidates = vec![db_path.to_path_buf()];
+    if let Some(file_name) = db_path.file_name() {
+        let wal = db_path.with_file_name(format!("{}-wal", file_name.to_string_lossy()));
+        let shm = db_path.with_file_name(format!("{}-shm", file_name.to_string_lossy()));
+        candidates.push(wal);
+        candidates.push(shm);
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            fs::remove_file(&candidate).map_err(|error| {
+                format!("remove database artifact {}: {error}", candidate.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn load_repo_counts(db_path: &Path) -> PerfResult<((i64, i64, i64), FileChangeStatsStateCounts)> {
     let conn = Connection::open(db_path)
         .map_err(|error| format!("open database {}: {error}", db_path.to_string_lossy()))?;
     let commits = conn
@@ -1148,7 +1286,38 @@ fn load_repo_counts(db_path: &Path) -> PerfResult<(i64, i64, i64)> {
     let file_changes = conn
         .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
         .map_err(|error| format!("count file_changes: {error}"))?;
-    Ok((commits, edges, file_changes))
+
+    let mut stats_state_counts = FileChangeStatsStateCounts::default();
+    let mut stats_stmt = conn
+        .prepare_cached(
+            r#"
+            SELECT stats_state, COUNT(1)
+            FROM file_changes
+            GROUP BY stats_state
+        "#,
+        )
+        .map_err(|error| format!("prepare file-change stats_state counts: {error}"))?;
+    let stats_rows = stats_stmt
+        .query_map([], |row| {
+            let state: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((state, count))
+        })
+        .map_err(|error| format!("query file-change stats_state counts: {error}"))?;
+
+    for state_row in stats_rows {
+        let (state, count) =
+            state_row.map_err(|error| format!("read file-change stats_state count: {error}"))?;
+        let normalized_count = count.max(0) as usize;
+        match state.as_str() {
+            "pending" => stats_state_counts.pending = normalized_count,
+            "ready" => stats_state_counts.ready = normalized_count,
+            "failed" => stats_state_counts.failed = normalized_count,
+            _ => {}
+        }
+    }
+
+    Ok(((commits, edges, file_changes), stats_state_counts))
 }
 
 fn load_in_memory_graph_context(
@@ -1311,6 +1480,7 @@ fn format_report(input: &ReportInput<'_>) -> String {
         + input.phase_timing.incremental_fixture_append.as_secs_f64()
         + input.phase_timing.incremental_index.as_secs_f64()
         + input.phase_timing.query_benchmark.as_secs_f64()
+        + input.phase_timing.jit_file_change_enrichment.as_secs_f64()
         + input.phase_timing.in_memory_graph_hydration.as_secs_f64()
         + input.phase_timing.in_memory_query_benchmark.as_secs_f64();
     let unattributed_core =
@@ -1340,6 +1510,7 @@ phase_timing_ms:
   incremental_fixture_append: {:.3}
   incremental_index: {:.3}
   query_benchmark: {:.3}
+  jit_file_change_enrichment: {:.3}
   in_memory_graph_hydration: {:.3}
   in_memory_query_benchmark: {:.3}
   core_end_to_end: {:.3}
@@ -1354,6 +1525,7 @@ phase_memory_bytes:
   incremental_fixture_append_rss: {}
   incremental_index_rss: {}
   query_benchmark_rss: {}
+  jit_file_change_enrichment_rss: {}
   in_memory_graph_hydration_rss: {}
   in_memory_query_benchmark_rss: {}
   final_rss: {}
@@ -1363,6 +1535,11 @@ dataset_counts:
   commits_in_db: {}
   edges_in_db: {}
   file_changes_in_db: {}
+
+file_change_stats_state_counts:
+  pending: {}
+  ready: {}
+  failed: {}
 
 full_index:
   duration_ms: {:.3}
@@ -1441,6 +1618,7 @@ in_memory_vs_sqlite_median_speedup:
         duration_ms(input.phase_timing.incremental_fixture_append),
         duration_ms(input.phase_timing.incremental_index),
         duration_ms(input.phase_timing.query_benchmark),
+        duration_ms(input.phase_timing.jit_file_change_enrichment),
         duration_ms(input.phase_timing.in_memory_graph_hydration),
         duration_ms(input.phase_timing.in_memory_query_benchmark),
         duration_ms(input.phase_timing.core_end_to_end),
@@ -1453,6 +1631,7 @@ in_memory_vs_sqlite_median_speedup:
         optional_u64_display(input.phase_memory.incremental_fixture_append_rss_bytes),
         optional_u64_display(input.phase_memory.incremental_index_rss_bytes),
         optional_u64_display(input.phase_memory.query_benchmark_rss_bytes),
+        optional_u64_display(input.phase_memory.jit_file_change_enrichment_rss_bytes),
         optional_u64_display(input.phase_memory.in_memory_graph_hydration_rss_bytes),
         optional_u64_display(input.phase_memory.in_memory_query_benchmark_rss_bytes),
         optional_u64_display(input.phase_memory.final_rss_bytes),
@@ -1460,6 +1639,9 @@ in_memory_vs_sqlite_median_speedup:
         input.counts.0,
         input.counts.1,
         input.counts.2,
+        input.file_change_stats_state_counts.pending,
+        input.file_change_stats_state_counts.ready,
+        input.file_change_stats_state_counts.failed,
         duration_ms(input.phase_timing.full_index),
         input.full_stats.commits_indexed,
         input.full_stats.edges_indexed,
@@ -1562,7 +1744,7 @@ fn current_rss_bytes() -> Option<u64> {
 }
 
 fn estimate_git_process_spawns(config: &Config) -> usize {
-    let fixture_generation = 6usize;
+    let fixture_generation: usize = if config.reuse_fixture { 3 } else { 6 };
     let fixture_summary = 3usize;
     let incremental_refresh = if config.incremental_commits == 0 {
         1
@@ -1581,6 +1763,18 @@ fn estimate_git_process_spawns(config: &Config) -> usize {
 }
 
 fn detect_workload_profile_hint(config: &Config) -> &'static str {
+    if config.cycles >= 100_000
+        && config.incremental_commits >= 100_000
+        && config.max_nodes >= 1_000_000
+    {
+        return "1m";
+    }
+    if config.cycles >= 50_000
+        && config.incremental_commits >= 50_000
+        && config.max_nodes >= 500_000
+    {
+        return "500k";
+    }
     if config.cycles >= 9000 && config.incremental_commits >= 9000 && config.max_nodes >= 90000 {
         return "90k";
     }

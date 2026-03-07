@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
@@ -6,7 +6,10 @@ use std::sync::mpsc::sync_channel;
 use git2::{Commit, Delta, DiffDelta, DiffFindOptions, Error, ErrorCode, Patch, Repository, Sort};
 use rayon::prelude::*;
 
-use crate::domain::models::{ParsedCommit, ParsedFileChange, ParsedRef};
+use crate::domain::models::{
+    FileChangeLineStatsUpdate, FileChangeStatsState, ParsedCommit, ParsedFileChange, ParsedRef,
+    PendingFileChangeEnrichment,
+};
 use crate::support::error::{AppError, AppResult};
 
 pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 200;
@@ -18,8 +21,19 @@ const FILE_CHANGE_PARSE_CHANNEL_CAPACITY: usize = 8;
 const FILE_CHANGE_PARSE_CHANNEL_CAPACITY_PER_WORKER: usize = 2;
 const FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX: usize = 64;
 const FILE_CHANGE_RENAME_LIMIT: usize = 400;
-const FILE_CHANGE_RENAME_THRESHOLD: u16 = 60;
+const FILE_CHANGE_RENAME_THRESHOLD_SMALL: u16 = 60;
+const FILE_CHANGE_RENAME_THRESHOLD_MEDIUM: u16 = 65;
+const FILE_CHANGE_RENAME_THRESHOLD_LARGE: u16 = 70;
+const FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES: u64 = 64 * 1024;
+const FILE_CHANGE_RENAME_LARGE_FILE_BYTES: u64 = 256 * 1024;
 const FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS: usize = 512;
+const FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES: u64 = 1_024 * 1_024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileChangeExtractionMode {
+    MetadataOnly,
+    SelectiveLineStats,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RenameDetectionPolicy {
@@ -38,6 +52,12 @@ struct ParallelFileChangePlan {
 struct DiffLineStatTarget {
     diff_index: usize,
     path: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DiffRenameScanStats {
+    has_add_delete_pair: bool,
+    max_file_size_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,11 +104,23 @@ pub fn load_commits_since(repo_root: &Path, since_epoch: i64) -> AppResult<Vec<P
 pub fn stream_commits(
     repo_root: &Path,
     since_epoch: Option<i64>,
+    on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<()> {
+    stream_commits_with_hide(repo_root, since_epoch, None, on_commit)
+}
+
+pub fn stream_commits_with_hide(
+    repo_root: &Path,
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
     mut on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
 ) -> AppResult<()> {
-    walk_commits(repo_root, since_epoch, |_repo, commit| {
-        on_commit(build_parsed_commit(commit))
-    })
+    walk_commits(
+        repo_root,
+        since_epoch,
+        hide_ancestor_sha,
+        |_repo, commit| on_commit(build_parsed_commit(commit)),
+    )
 }
 
 fn collect_commits(repo_root: &Path, since_epoch: Option<i64>) -> AppResult<Vec<ParsedCommit>> {
@@ -103,6 +135,7 @@ fn collect_commits(repo_root: &Path, since_epoch: Option<i64>) -> AppResult<Vec<
 fn walk_commits(
     repo_root: &Path,
     since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
     mut on_commit: impl FnMut(&Repository, &Commit<'_>) -> AppResult<()>,
 ) -> AppResult<()> {
     let repo = open_repository(repo_root)?;
@@ -125,6 +158,19 @@ fn walk_commits(
             return Err(map_git_error("seed revision walk from refs/*", error));
         }
         return Ok(());
+    }
+
+    if let Some(hide_sha) = hide_ancestor_sha {
+        let hide_oid = git2::Oid::from_str(hide_sha)
+            .map_err(|error| map_git_error("parse revwalk hide commit sha", error))?;
+        if let Err(error) = revwalk.hide(hide_oid) {
+            if !is_not_found_error(&error) {
+                return Err(map_git_error(
+                    "configure revision walk hide boundary",
+                    error,
+                ));
+            }
+        }
     }
 
     for oid_result in revwalk {
@@ -261,17 +307,31 @@ pub fn stream_file_changes_for_commits(
     if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
         let repo = open_repository(repo_root)?;
         for commit_sha in commit_shas {
-            append_file_changes_for_commit(&repo, commit_sha, &mut on_change)?;
+            append_file_changes_for_commit(
+                &repo,
+                commit_sha,
+                FileChangeExtractionMode::MetadataOnly,
+                None,
+                &mut on_change,
+            )?;
         }
         return Ok(());
     }
 
-    stream_file_changes_parallel_buffered(repo_root, commit_shas, on_change)
+    stream_file_changes_parallel_buffered(
+        repo_root,
+        commit_shas,
+        FileChangeExtractionMode::MetadataOnly,
+        None,
+        on_change,
+    )
 }
 
 fn stream_file_changes_parallel_buffered(
     repo_root: &Path,
     commit_shas: &[String],
+    extraction_mode: FileChangeExtractionMode,
+    line_stat_targets_by_commit: Option<&HashMap<String, HashSet<String>>>,
     mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<()> {
     let parallel_plan = parallel_file_change_plan(commit_shas.len());
@@ -295,14 +355,31 @@ fn stream_file_changes_parallel_buffered(
     let (sender, receiver) =
         sync_channel::<(usize, AppResult<Vec<ParsedFileChange>>)>(parallel_plan.channel_capacity);
     std::thread::scope(|scope| -> AppResult<()> {
-        scope.spawn(|| {
-            commit_chunks.into_par_iter().enumerate().for_each_with(
-                sender,
-                |tx, (chunk_index, chunk)| {
-                    let chunk_result = collect_file_changes_for_chunk(repo_root, chunk);
+        let line_stat_targets_by_commit = line_stat_targets_by_commit.cloned();
+        scope.spawn(move || {
+            commit_chunks
+                .into_par_iter()
+                .enumerate()
+                .map_init(
+                    || open_repository(repo_root),
+                    |repo_state, (chunk_index, chunk)| {
+                        let chunk_result = match repo_state {
+                            Ok(repo) => collect_file_changes_for_chunk_with_repo(
+                                repo,
+                                chunk,
+                                extraction_mode,
+                                line_stat_targets_by_commit.as_ref(),
+                            ),
+                            Err(error) => Err(AppError::GitCommand(format!(
+                                "initialize parallel file-change extraction worker repository handle: {error}"
+                            ))),
+                        };
+                        (chunk_index, chunk_result)
+                    },
+                )
+                .for_each_with(sender, |tx, (chunk_index, chunk_result)| {
                     let _ = tx.send((chunk_index, chunk_result));
-                },
-            );
+                });
         });
 
         let mut next_chunk_index = 0usize;
@@ -330,31 +407,154 @@ fn stream_file_changes_parallel_buffered(
     Ok(())
 }
 
-fn collect_file_changes_for_chunk(
-    repo_root: &Path,
+fn collect_file_changes_for_chunk_with_repo(
+    repo: &Repository,
     commit_shas: &[String],
+    extraction_mode: FileChangeExtractionMode,
+    line_stat_targets_by_commit: Option<&HashMap<String, HashSet<String>>>,
 ) -> AppResult<Vec<ParsedFileChange>> {
-    let repo = open_repository(repo_root)?;
     let mut chunk_changes = Vec::new();
     for commit_sha in commit_shas {
-        append_file_changes_for_commit(&repo, commit_sha, &mut |change| {
-            chunk_changes.push(change);
-            Ok(())
-        })?;
+        let line_stat_targets = line_stat_targets_by_commit
+            .and_then(|targets_by_commit| targets_by_commit.get(commit_sha));
+        append_file_changes_for_commit(
+            repo,
+            commit_sha,
+            extraction_mode,
+            line_stat_targets,
+            &mut |change| {
+                chunk_changes.push(change);
+                Ok(())
+            },
+        )?;
     }
     Ok(chunk_changes)
 }
 
-fn rename_detection_policy(delta_count: usize) -> Option<RenameDetectionPolicy> {
+pub fn load_file_change_line_stats_for_targets(
+    repo_root: &Path,
+    targets: &[PendingFileChangeEnrichment],
+) -> AppResult<Vec<FileChangeLineStatsUpdate>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut line_stat_targets_by_commit: HashMap<String, HashSet<String>> = HashMap::new();
+    for target in targets {
+        line_stat_targets_by_commit
+            .entry(target.commit_sha.clone())
+            .or_default()
+            .insert(target.file_path.clone());
+    }
+
+    let mut commit_shas: Vec<String> = line_stat_targets_by_commit.keys().cloned().collect();
+    commit_shas.sort_unstable();
+    let parsed = if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
+        let repo = open_repository(repo_root)?;
+        let mut changes = Vec::new();
+        for commit_sha in &commit_shas {
+            let line_stat_targets = line_stat_targets_by_commit.get(commit_sha);
+            append_file_changes_for_commit(
+                &repo,
+                commit_sha,
+                FileChangeExtractionMode::SelectiveLineStats,
+                line_stat_targets,
+                &mut |change| {
+                    changes.push(change);
+                    Ok(())
+                },
+            )?;
+        }
+        changes
+    } else {
+        let mut changes = Vec::new();
+        stream_file_changes_parallel_buffered(
+            repo_root,
+            &commit_shas,
+            FileChangeExtractionMode::SelectiveLineStats,
+            Some(&line_stat_targets_by_commit),
+            |change| {
+                changes.push(change);
+                Ok(())
+            },
+        )?;
+        changes
+    };
+
+    let mut by_commit: HashMap<String, HashMap<String, (i64, i64)>> = HashMap::new();
+    for change in parsed {
+        let additions = change.additions.unwrap_or_default();
+        let deletions = change.deletions.unwrap_or_default();
+        by_commit
+            .entry(change.commit_sha)
+            .or_default()
+            .insert(change.file_path, (additions, deletions));
+    }
+
+    let mut updates = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (additions, deletions) = by_commit
+            .get(&target.commit_sha)
+            .and_then(|files| files.get(&target.file_path))
+            .copied()
+            .unwrap_or_default();
+        updates.push(FileChangeLineStatsUpdate {
+            commit_sha: target.commit_sha.clone(),
+            file_path: target.file_path.clone(),
+            additions,
+            deletions,
+        });
+    }
+
+    Ok(updates)
+}
+
+fn rename_detection_policy(
+    delta_count: usize,
+    max_file_size_bytes: u64,
+) -> Option<RenameDetectionPolicy> {
     if delta_count == 0 {
         return None;
     }
 
+    let rename_threshold = rename_threshold_for_bins(delta_count, max_file_size_bytes);
     Some(RenameDetectionPolicy {
         rename_limit: delta_count.clamp(1, FILE_CHANGE_RENAME_LIMIT),
-        rename_threshold: FILE_CHANGE_RENAME_THRESHOLD,
-        exact_match_only: delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
+        rename_threshold,
+        exact_match_only: delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
+            || max_file_size_bytes >= FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES,
     })
+}
+
+fn rename_threshold_for_bins(delta_count: usize, max_file_size_bytes: u64) -> u16 {
+    if delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
+        || max_file_size_bytes >= FILE_CHANGE_RENAME_LARGE_FILE_BYTES
+    {
+        return FILE_CHANGE_RENAME_THRESHOLD_LARGE;
+    }
+
+    if delta_count >= 128 || max_file_size_bytes >= FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES {
+        return FILE_CHANGE_RENAME_THRESHOLD_MEDIUM;
+    }
+
+    FILE_CHANGE_RENAME_THRESHOLD_SMALL
+}
+
+fn should_run_rename_detection(
+    extraction_mode: FileChangeExtractionMode,
+    delta_count: usize,
+    has_add_delete_pair: bool,
+) -> bool {
+    if delta_count < 2 {
+        return false;
+    }
+
+    match extraction_mode {
+        FileChangeExtractionMode::MetadataOnly => has_add_delete_pair,
+        FileChangeExtractionMode::SelectiveLineStats => {
+            has_add_delete_pair || delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
+        }
+    }
 }
 
 fn parallel_file_change_plan(total_commits: usize) -> ParallelFileChangePlan {
@@ -395,6 +595,26 @@ fn diff_requires_line_stats(delta: &DiffDelta<'_>) -> bool {
     }
 }
 
+fn diff_rename_scan_stats(diff: &git2::Diff<'_>) -> DiffRenameScanStats {
+    let mut has_added = false;
+    let mut has_deleted = false;
+    let mut max_file_size_bytes = 0u64;
+    for delta in diff.deltas() {
+        max_file_size_bytes = max_file_size_bytes.max(delta.old_file().size());
+        max_file_size_bytes = max_file_size_bytes.max(delta.new_file().size());
+        match delta.status() {
+            Delta::Added => has_added = true,
+            Delta::Deleted => has_deleted = true,
+            _ => {}
+        }
+    }
+
+    DiffRenameScanStats {
+        has_add_delete_pair: has_added && has_deleted,
+        max_file_size_bytes,
+    }
+}
+
 fn collect_patch_line_stats(
     diff: &git2::Diff<'_>,
     diff_index: usize,
@@ -417,6 +637,8 @@ fn collect_patch_line_stats(
 fn append_file_changes_for_commit(
     repo: &Repository,
     commit_sha: &str,
+    extraction_mode: FileChangeExtractionMode,
+    line_stat_targets: Option<&HashSet<String>>,
     on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<()> {
     let oid = git2::Oid::from_str(commit_sha)
@@ -449,20 +671,29 @@ fn append_file_changes_for_commit(
         .map_err(|error| map_git_error("compute tree diff for commit", error))?;
 
     let delta_count = diff.deltas().len();
-    if let Some(rename_policy) = rename_detection_policy(delta_count) {
-        let mut find_options = DiffFindOptions::new();
-        find_options
-            .renames(true)
-            .rename_threshold(rename_policy.rename_threshold)
-            .rename_limit(rename_policy.rename_limit)
-            .exact_match_only(rename_policy.exact_match_only);
-        diff.find_similar(Some(&mut find_options))
-            .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+    let rename_scan_stats = diff_rename_scan_stats(&diff);
+    if should_run_rename_detection(
+        extraction_mode,
+        delta_count,
+        rename_scan_stats.has_add_delete_pair,
+    ) {
+        if let Some(rename_policy) =
+            rename_detection_policy(delta_count, rename_scan_stats.max_file_size_bytes)
+        {
+            let mut find_options = DiffFindOptions::new();
+            find_options
+                .renames(true)
+                .rename_threshold(rename_policy.rename_threshold)
+                .rename_limit(rename_policy.rename_limit)
+                .exact_match_only(rename_policy.exact_match_only);
+            diff.find_similar(Some(&mut find_options))
+                .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+        }
     }
 
     let mut by_path: HashMap<String, FileChangeAccumulator> = HashMap::new();
     let mut ordered_paths: Vec<String> = Vec::new();
-    let mut line_stat_targets: Vec<DiffLineStatTarget> = Vec::new();
+    let mut selected_line_stat_targets: Vec<DiffLineStatTarget> = Vec::new();
 
     for (diff_index, delta) in diff.deltas().enumerate() {
         let path = delta_display_path(&delta);
@@ -470,19 +701,27 @@ fn append_file_changes_for_commit(
             continue;
         }
 
-        if !by_path.contains_key(&path) {
-            ordered_paths.push(path.clone());
-            by_path.insert(path.clone(), FileChangeAccumulator::from_delta(&delta));
-        } else if let Some(accumulator) = by_path.get_mut(&path) {
-            accumulator.apply_delta(&delta);
+        match by_path.entry(path.clone()) {
+            Entry::Vacant(entry) => {
+                ordered_paths.push(path.clone());
+                entry.insert(FileChangeAccumulator::from_delta(&delta));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().apply_delta(&delta);
+            }
         }
 
-        if diff_requires_line_stats(&delta) {
-            line_stat_targets.push(DiffLineStatTarget { diff_index, path });
+        if extraction_mode == FileChangeExtractionMode::SelectiveLineStats
+            && diff_requires_line_stats(&delta)
+            && line_stat_targets
+                .map(|targets| targets.contains(path.as_str()))
+                .unwrap_or(false)
+        {
+            selected_line_stat_targets.push(DiffLineStatTarget { diff_index, path });
         }
     }
 
-    for target in line_stat_targets {
+    for target in selected_line_stat_targets {
         let Some((additions, deletions)) = collect_patch_line_stats(&diff, target.diff_index)?
         else {
             continue;
@@ -492,16 +731,36 @@ fn append_file_changes_for_commit(
         }
     }
 
+    let filter_paths = line_stat_targets;
+    let emit_selected_paths_only = extraction_mode == FileChangeExtractionMode::SelectiveLineStats;
+    if emit_selected_paths_only && filter_paths.is_none() {
+        return Ok(());
+    }
+
     for path in ordered_paths {
+        if emit_selected_paths_only
+            && !filter_paths
+                .map(|targets| targets.contains(path.as_str()))
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
         let Some(accumulator) = by_path.remove(&path) else {
             continue;
         };
+        let (additions, deletions, stats_state, requires_line_stats) = match extraction_mode {
+            FileChangeExtractionMode::MetadataOnly => accumulator.metadata_view(),
+            FileChangeExtractionMode::SelectiveLineStats => accumulator.line_stats_view(),
+        };
         on_change(ParsedFileChange {
             commit_sha: commit_sha.to_string(),
-            file_path: path.clone(),
-            additions: accumulator.additions,
-            deletions: accumulator.deletions,
-            change_type: accumulator.finalize_change_type(&path),
+            file_path: path,
+            additions,
+            deletions,
+            change_type: accumulator.change_type,
+            stats_state,
+            requires_line_stats,
         })?;
     }
 
@@ -570,21 +829,31 @@ struct FileChangeAccumulator {
     deletions: i64,
     change_type: String,
     binary: bool,
+    requires_line_stats: bool,
 }
 
 impl FileChangeAccumulator {
     fn from_delta(delta: &DiffDelta<'_>) -> Self {
+        let binary = delta.old_file().is_binary() || delta.new_file().is_binary();
         Self {
             additions: 0,
             deletions: 0,
-            change_type: delta_change_type(delta),
-            binary: delta.old_file().is_binary() || delta.new_file().is_binary(),
+            change_type: if binary {
+                "binary".to_string()
+            } else {
+                delta_change_type(delta)
+            },
+            binary,
+            requires_line_stats: diff_requires_line_stats(delta),
         }
     }
 
     fn apply_delta(&mut self, delta: &DiffDelta<'_>) {
+        self.requires_line_stats = self.requires_line_stats || diff_requires_line_stats(delta);
         self.binary = self.binary || delta.old_file().is_binary() || delta.new_file().is_binary();
-        if self.change_type == "modify" {
+        if self.binary {
+            self.change_type = "binary".to_string();
+        } else if self.change_type == "modify" {
             self.change_type = delta_change_type(delta);
         }
     }
@@ -594,41 +863,40 @@ impl FileChangeAccumulator {
         self.deletions = self.deletions.saturating_add(deletions);
     }
 
-    fn finalize_change_type(&self, file_path: &str) -> String {
-        if self.binary {
-            return "binary".to_string();
+    fn metadata_view(&self) -> (Option<i64>, Option<i64>, FileChangeStatsState, bool) {
+        if self.requires_line_stats {
+            return (None, None, FileChangeStatsState::Pending, true);
         }
-        if self.change_type != "modify" {
-            return self.change_type.clone();
-        }
-        classify_change_type(file_path, self.additions, self.deletions, false)
-    }
-}
 
-fn classify_change_type(file_path: &str, additions: i64, deletions: i64, binary: bool) -> String {
-    if binary {
-        return "binary".to_string();
+        (
+            Some(self.additions),
+            Some(self.deletions),
+            FileChangeStatsState::Ready,
+            false,
+        )
     }
-    if file_path.contains("=>") {
-        return "rename".to_string();
+
+    fn line_stats_view(&self) -> (Option<i64>, Option<i64>, FileChangeStatsState, bool) {
+        (
+            Some(self.additions),
+            Some(self.deletions),
+            FileChangeStatsState::Ready,
+            false,
+        )
     }
-    if additions > 0 && deletions == 0 {
-        return "add".to_string();
-    }
-    if additions == 0 && deletions > 0 {
-        return "delete".to_string();
-    }
-    "modify".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_change_type, parallel_file_change_plan, rename_detection_policy,
-        validate_repository, FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
-        FILE_CHANGE_PARSE_CHANNEL_CAPACITY, FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
-        FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE, FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
-        FILE_CHANGE_RENAME_LIMIT, FILE_CHANGE_RENAME_THRESHOLD,
+        parallel_file_change_plan, rename_detection_policy, rename_threshold_for_bins,
+        should_run_rename_detection, validate_repository, FileChangeExtractionMode,
+        FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS, FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
+        FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX, FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE,
+        FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE, FILE_CHANGE_RENAME_LARGE_FILE_BYTES,
+        FILE_CHANGE_RENAME_LIMIT, FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES,
+        FILE_CHANGE_RENAME_THRESHOLD_LARGE, FILE_CHANGE_RENAME_THRESHOLD_MEDIUM,
+        FILE_CHANGE_RENAME_THRESHOLD_SMALL,
     };
     use std::path::Path;
 
@@ -639,34 +907,76 @@ mod tests {
     }
 
     #[test]
-    fn classifies_numstat_style_change_types() {
-        assert_eq!(classify_change_type("src/lib.rs", 10, 0, false), "add");
-        assert_eq!(classify_change_type("src/lib.rs", 0, 10, false), "delete");
+    fn rename_threshold_is_adaptive_by_delta_count_and_file_size() {
         assert_eq!(
-            classify_change_type("old/path.rs => new/path.rs", 1, 1, false),
-            "rename"
+            rename_threshold_for_bins(8, 1024),
+            FILE_CHANGE_RENAME_THRESHOLD_SMALL
         );
         assert_eq!(
-            classify_change_type("assets/logo.png", 0, 0, true),
-            "binary"
+            rename_threshold_for_bins(128, 1024),
+            FILE_CHANGE_RENAME_THRESHOLD_MEDIUM
         );
-        assert_eq!(classify_change_type("src/lib.rs", 3, 2, false), "modify");
+        assert_eq!(
+            rename_threshold_for_bins(8, FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES),
+            FILE_CHANGE_RENAME_THRESHOLD_MEDIUM
+        );
+        assert_eq!(
+            rename_threshold_for_bins(8, FILE_CHANGE_RENAME_LARGE_FILE_BYTES),
+            FILE_CHANGE_RENAME_THRESHOLD_LARGE
+        );
     }
 
     #[test]
     fn rename_detection_bounds_are_configured() {
-        assert!(rename_detection_policy(0).is_none());
+        assert!(rename_detection_policy(0, 0).is_none());
 
-        let bounded_small = rename_detection_policy(32).expect("policy for non-zero deltas");
+        let bounded_small = rename_detection_policy(32, 1024).expect("policy for non-zero deltas");
         assert_eq!(bounded_small.rename_limit, 32);
-        assert_eq!(bounded_small.rename_threshold, FILE_CHANGE_RENAME_THRESHOLD);
+        assert_eq!(
+            bounded_small.rename_threshold,
+            FILE_CHANGE_RENAME_THRESHOLD_SMALL
+        );
         assert!(!bounded_small.exact_match_only);
 
-        let bounded_large = rename_detection_policy(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS + 1)
-            .expect("policy for large delta set");
+        let bounded_large =
+            rename_detection_policy(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS + 1, 1024)
+                .expect("policy for large delta set");
         assert_eq!(bounded_large.rename_limit, FILE_CHANGE_RENAME_LIMIT);
-        assert_eq!(bounded_large.rename_threshold, FILE_CHANGE_RENAME_THRESHOLD);
+        assert_eq!(
+            bounded_large.rename_threshold,
+            FILE_CHANGE_RENAME_THRESHOLD_LARGE
+        );
         assert!(bounded_large.exact_match_only);
+    }
+
+    #[test]
+    fn rename_detection_runs_only_when_diff_shape_requires_it() {
+        assert!(!should_run_rename_detection(
+            FileChangeExtractionMode::MetadataOnly,
+            1,
+            true
+        ));
+        assert!(!should_run_rename_detection(
+            FileChangeExtractionMode::MetadataOnly,
+            16,
+            false
+        ));
+        assert!(should_run_rename_detection(
+            FileChangeExtractionMode::MetadataOnly,
+            16,
+            true
+        ));
+
+        assert!(!should_run_rename_detection(
+            FileChangeExtractionMode::SelectiveLineStats,
+            16,
+            false
+        ));
+        assert!(should_run_rename_detection(
+            FileChangeExtractionMode::SelectiveLineStats,
+            FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
+            false
+        ));
     }
 
     #[test]

@@ -8,6 +8,8 @@ param(
     [int]$WindowLimit = 200,
     [int]$MaxNodes = 2000,
     [string]$OutputPath = "tmp/perf-report-latest.txt",
+    [string]$FixtureRoot = "",
+    [switch]$WarmFixture,
     [switch]$PreconditionCommitGraph,
     [switch]$KeepFixture,
     [switch]$ProbeOnly
@@ -148,6 +150,11 @@ function Invoke-DockerPhase {
 }
 
 function Get-ReportArgs {
+    $resolvedFixtureRoot = $FixtureRoot
+    if ($WarmFixture -and [string]::IsNullOrWhiteSpace($resolvedFixtureRoot)) {
+        $resolvedFixtureRoot = Join-Path $repoRootPath ("tmp/perf-fixtures/c{0}-f{1}-i{2}-n{3}" -f $Cycles, $FeatureCommits, $IncrementalCommits, $MaxNodes)
+    }
+
     $args = @(
         "--cycles", "$Cycles",
         "--feature-commits", "$FeatureCommits",
@@ -159,6 +166,12 @@ function Get-ReportArgs {
 
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $args += @("--output", "$OutputPath")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($resolvedFixtureRoot)) {
+        $args += @("--fixture-root", "$resolvedFixtureRoot")
+    }
+    if ($WarmFixture) {
+        $args += "--reuse-fixture"
     }
     if ($PreconditionCommitGraph) {
         $args += "--precondition-commit-graph"
