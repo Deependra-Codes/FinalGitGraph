@@ -16,6 +16,9 @@ Keep graph-query code performant by default on medium/large repositories without
 6. Keep indexing database writes single-writer and transaction-bounded.
 7. If Rayon is used in ingestion, keep parallelism bounded/chunked and deterministic.
 8. Do not modify docs/guardrails alone to satisfy quality gates; policy edits must be paired with implementation changes.
+9. Performance automation must report build time and execution time as separate phases.
+10. Performance automation must report RSS memory signals, including peak observed RSS, for repository-scale runs.
+11. Repository-scale perf harness must include an explicit in-memory adjacency graph hydrated from SQLite persistence and report its setup/query costs.
 
 ## Current Strategy in This Repository
 
@@ -30,6 +33,8 @@ Keep graph-query code performant by default on medium/large repositories without
 9. Indexer memory is bounded by explicit commit/file-change batch sizes rather than repository-total history size.
 10. File-change extraction uses bounded Rayon chunk parallelism in `adapters/git.rs`, while DB writes stay in the indexer's single transaction.
 11. Graph hot-path edge storage uses integer commit IDs (`child_commit_id`/`parent_commit_id`) instead of SHA edge columns.
+12. Performance report output includes phase-level timing (fixture generation, scan, full index, incremental prep/index, query benchmark) so setup cost is never mistaken for algorithm cost.
+13. Performance report now includes an in-memory adjacency graph hydration phase sourced from SQLite plus comparative in-memory query latencies (BFS + shortest path).
 
 ## Why This Strategy
 
@@ -64,6 +69,12 @@ Keep graph-query code performant by default on medium/large repositories without
 9. Git adapter must remain DB-free (`rusqlite` must not be imported in `adapters/git.rs`).
 10. Indexer must keep explicit single-writer transaction boundary for ingestion writes.
 11. DB adapter graph hot-path queries must use integer edge columns (no SHA edge columns).
+12. `scripts/perf-budget.ps1` must print separate build/execute phase durations.
+13. `scripts/perf-report.ps1` must print separate build/execute phase durations.
+14. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase timing in report output.
+15. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase memory output (`phase_memory_bytes`, `peak_observed_rss`).
+16. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit in-memory adjacency hydration/query sections.
+17. `package.json` must include `perf:report:25k` for large-soak repository-scale benchmarking.
 
 ## Ingestion Performance Policy
 
@@ -96,6 +107,27 @@ Keep graph-query code performant by default on medium/large repositories without
    - this is a regression guardrail, not a synthetic peak-throughput claim.
 5. Reliability contract:
    - when host execution is blocked by endpoint policy (for example Windows application control), `scripts/perf-budget.ps1` retries in Docker and still enforces the same test.
+6. Visibility contract:
+   - build and execute durations must be printed separately for each run.
+
+## Tiered Perf Testing Pattern
+
+1. Fast local lane:
+   - `pnpm run perf:report:smoke`
+2. Regression gate lane:
+   - `pnpm run quality:perf`
+3. Large soak lane:
+   - `pnpm run perf:report:large`
+4. Very large soak lane (~25k commits):
+   - `pnpm run perf:report:25k`
+5. Balanced default report lane:
+   - `pnpm run perf:report`
+6. Interpretation rule:
+   - inspect `phase_timing_ms` first; if fixture generation dominates, optimize fixture strategy before changing traversal algorithms.
+7. In-memory comparison rule:
+   - inspect `in_memory_adjacency_query_latency_ms` and `in_memory_vs_sqlite_median_speedup` to separate persistence costs from pure graph compute.
+8. Layered throttling isolation lane:
+   - `pnpm run test:layers` (runs section-wise test lanes + perf smoke phase metrics including RSS).
 
 ## Change Checklist for Graph Query Work
 
@@ -109,6 +141,9 @@ Keep graph-query code performant by default on medium/large repositories without
    - `pnpm run dev:gate:fast`
    - `pnpm run dev:gate`
    - `pnpm run quality:perf`
+   - `pnpm run perf:report:smoke`
+   - `pnpm run perf:report:25k` (for repository-scale bottleneck validation)
+   - `pnpm run test:layers`
 
 ## References
 

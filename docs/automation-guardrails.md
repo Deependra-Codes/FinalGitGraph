@@ -54,11 +54,31 @@ This ordering fails fast on automation regressions before expensive lanes.
 
 `scripts/enforce-guardrails.ps1` verifies this contract so reliability does not depend on local machine policy details.
 
+## Performance Timing Transparency Contract
+
+Performance automation must not hide where time is spent. Required properties:
+
+1. `scripts/perf-budget.ps1` prints separate build-phase and execute-phase durations.
+2. `scripts/perf-report.ps1` prints separate build-phase and execute-phase durations.
+3. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits phase-level timing in report output (`phase_timing_ms`), including fixture generation and indexing/query phases.
+4. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits phase memory output (`phase_memory_bytes`) including peak observed RSS.
+5. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits in-memory adjacency hydration and query sections sourced from SQLite persistence.
+6. `scripts/layer-test-matrix.ps1` must exist and remain runnable through `pnpm run test:layers`.
+7. `package.json` must expose `perf:report:25k` for very-large soak profiling.
+8. CI/local operators can distinguish compile regressions from runtime regressions without manual instrumentation.
+
 ## Non-Goals
 
 1. No requirement to make Windows-only scripts cross-platform.
 2. No slowdown of traversal/runtime algorithm paths due to automation checks.
 3. No policy that blocks performance-oriented refactors by default.
+
+## Code Hygiene Guardrails
+
+To block AI/human duct-tape regressions, `scripts/enforce-guardrails.ps1` rejects:
+
+1. Rust comment markers that indicate temporary shortcuts (`// HACK`, `// WIP`, `// WORKAROUND`, `// TEMP`, `// QUICKFIX`, `// DUCKTAPE`).
+2. Rust lint-suppression shortcuts in source (`#[allow(clippy::...)]`, `#[allow(dead_code)]`, `#[allow(unused_...)]`) that bypass normal quality gates.
 
 ## Ingestion Guardrails
 

@@ -102,6 +102,21 @@ Graph traversal performance budget gate:
 pnpm run quality:perf
 ```
 
+Repository-scale performance report (build/execute split + phase timing + RAM + in-memory adjacency benchmark):
+
+```powershell
+pnpm run perf:report
+pnpm run perf:report:smoke
+pnpm run perf:report:large
+pnpm run perf:report:25k
+```
+
+Layered throttling matrix (section-wise test lanes + RAM-aware perf smoke metrics):
+
+```powershell
+pnpm run test:layers
+```
+
 Host fallback variants:
 
 ```powershell

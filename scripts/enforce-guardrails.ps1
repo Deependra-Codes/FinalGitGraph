@@ -217,6 +217,39 @@ if (-not (Test-Path $srcRoot)) {
         Add-Failure "Forbidden markers found in Rust source tree at: $($formatted -join ", ")"
     }
 
+    $ductTapePattern = '^\s*//\s*(HACK|WIP|WORKAROUND|TEMP(?:ORARY)?|QUICKFIX|DUCKTAPE|DUCTTAPE)\b'
+    $ductTapeMatches = @()
+    foreach ($file in $scanFiles) {
+        $hits = Select-String -Path $file.FullName -Pattern $ductTapePattern
+        if ($hits) {
+            $ductTapeMatches += $hits
+        }
+    }
+
+    if ($ductTapeMatches.Count -eq 0) {
+        Add-Pass "No duct-tape quality markers found in Rust source tree."
+    } else {
+        $sample = $ductTapeMatches | Select-Object -First 10
+        $formatted = $sample | ForEach-Object { "$($_.Path):$($_.LineNumber)" }
+        Add-Failure "Duct-tape quality markers are blocked in Rust source tree: $($formatted -join ", ")"
+    }
+
+    $allowLintMatches = @()
+    foreach ($file in $scanFiles) {
+        $hits = Select-String -Path $file.FullName -Pattern '#\s*\[\s*allow\s*\(\s*(clippy::|dead_code|unused_)'
+        if ($hits) {
+            $allowLintMatches += $hits
+        }
+    }
+
+    if ($allowLintMatches.Count -eq 0) {
+        Add-Pass "No lint-suppression duct-tape attributes found in Rust source tree."
+    } else {
+        $sample = $allowLintMatches | Select-Object -First 10
+        $formatted = $sample | ForEach-Object { "$($_.Path):$($_.LineNumber)" }
+        Add-Failure "Lint-suppression duct-tape attributes are blocked in Rust source tree: $($formatted -join ", ")"
+    }
+
     $graphQueriesPath = Join-Path $srcRoot "application/graph_queries.rs"
     if (Test-Path $graphQueriesPath) {
         $stringHeavyPatterns = @(
@@ -349,6 +382,7 @@ $requiredDocs = @(
     "docs/adr/0006-streaming-libgit2-ingestion.md",
     "docs/adr/0007-bounded-rayon-ingestion-compute-single-writer-db.md",
     "docs/adr/0008-integer-edge-schema-for-graph-hot-path.md",
+    "docs/adr/0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )
@@ -452,6 +486,9 @@ if ($changedFiles.Count -eq 0) {
 
 $requiredPerfFiles = @(
     "scripts/perf-budget.ps1",
+    "scripts/perf-report.ps1",
+    "scripts/layer-test-matrix.ps1",
+    "apps/desktop/src-tauri/src/bin/perf-report.rs",
     ".github/workflows/rust-ci.yml"
 )
 foreach ($filePath in $requiredPerfFiles) {
@@ -468,11 +505,67 @@ if (Test-Path $perfBudgetPath) {
     $hasProbeMode = Select-String -Path $perfBudgetPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
     $hasDockerFallback = Select-String -Path $perfBudgetPath -Pattern 'function\s+Invoke-PerfBudgetDocker' -Quiet
     $hasPolicyDetection = Select-String -Path $perfBudgetPath -Pattern 'Application Control policy has blocked this file|os error 4551' -Quiet
+    $hasBuildPhaseTiming = Select-String -Path $perfBudgetPath -Pattern 'Host build phase duration \(s\):' -Quiet
+    $hasExecutePhaseTiming = Select-String -Path $perfBudgetPath -Pattern 'Host execute phase duration \(s\):' -Quiet
+    $hasNoRunBuildPhase = Select-String -Path $perfBudgetPath -Pattern '--no-run' -Quiet
 
-    if ($hasProbeMode -and $hasDockerFallback -and $hasPolicyDetection) {
-        Add-Pass "Performance budget script contract present (probe mode + resilient fallback)."
+    if (
+        $hasProbeMode -and
+        $hasDockerFallback -and
+        $hasPolicyDetection -and
+        $hasBuildPhaseTiming -and
+        $hasExecutePhaseTiming -and
+        $hasNoRunBuildPhase
+    ) {
+        Add-Pass "Performance budget script contract present (probe mode + resilient fallback + build/execute timing transparency)."
     } else {
-        Add-Failure "Performance budget script must keep probe mode and resilient fallback contract."
+        Add-Failure "Performance budget script must keep probe mode, resilient fallback, and build/execute timing transparency contract."
+    }
+}
+
+$perfReportScriptPath = Join-Path $repoRoot "scripts/perf-report.ps1"
+if (Test-Path $perfReportScriptPath) {
+    $hasProbeMode = Select-String -Path $perfReportScriptPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
+    $hasDockerFallback = Select-String -Path $perfReportScriptPath -Pattern 'function\s+Invoke-PerfReportDocker' -Quiet
+    $hasPolicyDetection = Select-String -Path $perfReportScriptPath -Pattern 'Application Control policy has blocked this file|os error 4551' -Quiet
+    $hasBuildPhaseTiming = Select-String -Path $perfReportScriptPath -Pattern 'Host build phase duration \(s\):' -Quiet
+    $hasExecutePhaseTiming = Select-String -Path $perfReportScriptPath -Pattern 'Host execute phase duration \(s\):' -Quiet
+
+    if (
+        $hasProbeMode -and
+        $hasDockerFallback -and
+        $hasPolicyDetection -and
+        $hasBuildPhaseTiming -and
+        $hasExecutePhaseTiming
+    ) {
+        Add-Pass "Performance report script contract present (probe mode + resilient fallback + build/execute timing transparency)."
+    } else {
+        Add-Failure "Performance report script must keep probe mode, resilient fallback, and build/execute timing transparency contract."
+    }
+}
+
+$perfReportBinaryPath = Join-Path $repoRoot "apps/desktop/src-tauri/src/bin/perf-report.rs"
+if (Test-Path $perfReportBinaryPath) {
+    $hasPhaseTimingSection = Select-String -Path $perfReportBinaryPath -Pattern 'phase_timing_ms' -Quiet
+    $hasPhaseMemorySection = Select-String -Path $perfReportBinaryPath -Pattern 'phase_memory_bytes' -Quiet
+    $hasFixtureTimingField = Select-String -Path $perfReportBinaryPath -Pattern 'fixture_generation' -Quiet
+    $hasCoreTimingField = Select-String -Path $perfReportBinaryPath -Pattern 'core_end_to_end' -Quiet
+    $hasPeakRssField = Select-String -Path $perfReportBinaryPath -Pattern 'peak_observed_rss' -Quiet
+    $hasInMemoryHydrationField = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_graph_hydration' -Quiet
+    $hasInMemoryQuerySection = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_adjacency_query_latency_ms' -Quiet
+
+    if (
+        $hasPhaseTimingSection -and
+        $hasPhaseMemorySection -and
+        $hasFixtureTimingField -and
+        $hasCoreTimingField -and
+        $hasPeakRssField -and
+        $hasInMemoryHydrationField -and
+        $hasInMemoryQuerySection
+    ) {
+        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency benchmark visibility contract."
+    } else {
+        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency hydration/query sections."
     }
 }
 
@@ -497,6 +590,18 @@ if (Test-Path $packageJsonPath) {
         Add-Pass "package.json exposes quality:perf script."
     } else {
         Add-Failure "package.json must include a quality:perf script."
+    }
+
+    if (
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report:smoke"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report:large"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report:25k"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"test:layers"' -Quiet)
+    ) {
+        Add-Pass "package.json exposes perf report tier scripts (including 25k) and layered test matrix command."
+    } else {
+        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, and test:layers scripts."
     }
 }
 
