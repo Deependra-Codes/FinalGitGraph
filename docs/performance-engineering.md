@@ -19,6 +19,7 @@ Keep graph-query code performant by default on medium/large repositories without
 9. Performance automation must report build time and execution time as separate phases.
 10. Performance automation must report RSS memory signals, including peak observed RSS, for repository-scale runs.
 11. Repository-scale perf harness must include an explicit in-memory adjacency graph hydrated from SQLite persistence and report its setup/query costs.
+12. Ingestion hot path must keep bounded rename detection and set-based incremental cleanup (no row-by-row delete loop).
 
 ## Current Strategy in This Repository
 
@@ -31,10 +32,12 @@ Keep graph-query code performant by default on medium/large repositories without
 7. SQLite statement cache is enabled and hot graph queries use cached prepared statements.
 8. Repository indexing uses libgit2 streaming adapters (`revwalk` + in-process diff callbacks), not full-buffer Git CLI log/show parsing.
 9. Indexer memory is bounded by explicit commit/file-change batch sizes rather than repository-total history size.
-10. File-change extraction uses bounded Rayon chunk parallelism in `adapters/git.rs`, while DB writes stay in the indexer's single transaction.
-11. Graph hot-path edge storage uses integer commit IDs (`child_commit_id`/`parent_commit_id`) instead of SHA edge columns.
-12. Performance report output includes phase-level timing (fixture generation, scan, full index, incremental prep/index, query benchmark) so setup cost is never mistaken for algorithm cost.
-13. Performance report now includes an in-memory adjacency graph hydration phase sourced from SQLite plus comparative in-memory query latencies (BFS + shortest path).
+10. File-change extraction uses lazy two-stage diff processing in `adapters/git.rs` (delta metadata first, selective `Patch::line_stats` only where required), while DB writes stay in the indexer's single transaction.
+11. Git adapter keeps adaptive-but-bounded Rayon planning for chunk size and channel capacity to improve utilization without unbounded fan-out.
+12. Graph hot-path edge storage uses integer commit IDs (`child_commit_id`/`parent_commit_id`) instead of SHA edge columns.
+13. Performance report output includes phase-level timing (fixture generation, scan, full index, incremental prep/index, query benchmark) so setup cost is never mistaken for algorithm cost.
+14. Performance report now includes an in-memory adjacency graph hydration phase sourced from SQLite plus comparative in-memory query latencies (BFS + shortest path).
+15. Indexing stats now carry ingestion phase telemetry (`commit_walk`, `commit_upsert`, `edge_materialize`, `file_diff_extract`, `file_change_delete`, `file_change_upsert`, `tx_commit`).
 
 ## Why This Strategy
 
@@ -66,15 +69,21 @@ Keep graph-query code performant by default on medium/large repositories without
 6. Git adapter indexing hot path must avoid process-spawned Git CLI and expose streaming APIs.
 7. Indexer must use streaming commit ingestion with bounded file-change batch buffers.
 8. Git adapter must keep bounded Rayon chunk parallelism for file-change compute.
-9. Git adapter must remain DB-free (`rusqlite` must not be imported in `adapters/git.rs`).
-10. Indexer must keep explicit single-writer transaction boundary for ingestion writes.
-11. DB adapter graph hot-path queries must use integer edge columns (no SHA edge columns).
-12. `scripts/perf-budget.ps1` must print separate build/execute phase durations.
-13. `scripts/perf-report.ps1` must print separate build/execute phase durations.
-14. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase timing in report output.
-15. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase memory output (`phase_memory_bytes`, `peak_observed_rss`).
-16. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit in-memory adjacency hydration/query sections.
-17. `package.json` must include `perf:report:25k` for large-soak repository-scale benchmarking.
+9. Git adapter must keep adaptive-but-bounded Rayon chunk/channel planning for file-change extraction.
+10. Git adapter must remain DB-free (`rusqlite` must not be imported in `adapters/git.rs`).
+11. Git adapter must keep two-stage selective line-count extraction (`diff_requires_line_stats` + `Patch::from_diff` path).
+12. Indexer must keep explicit single-writer transaction boundary for ingestion writes.
+13. DB adapter graph hot-path queries must use integer edge columns (no SHA edge columns).
+14. `scripts/perf-budget.ps1` must print separate build/execute phase durations.
+15. `scripts/perf-report.ps1` must print separate build/execute phase durations.
+16. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase timing in report output.
+17. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit phase memory output (`phase_memory_bytes`, `peak_observed_rss`).
+18. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit in-memory adjacency hydration/query sections.
+19. `package.json` must include `perf:report:25k` for large-soak repository-scale benchmarking.
+20. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit ingestion contract fields (`ingest_commit_walk_ms`, `ingest_file_diff_extract_ms`, `ingest_file_change_upsert_ms`, `ingest_tx_commit_ms`).
+21. `adapters/git.rs` must enforce bounded rename detection settings (`rename_limit`, `rename_threshold`, `exact_match_only`).
+22. `adapters/db.rs` must use set-based temp-table delete for incremental file-change cleanup.
+23. `package.json` must expose `perf:ingestion:25k` and `quality:perf:ingestion`.
 
 ## Ingestion Performance Policy
 
@@ -116,17 +125,23 @@ Keep graph-query code performant by default on medium/large repositories without
    - `pnpm run perf:report:smoke`
 2. Regression gate lane:
    - `pnpm run quality:perf`
-3. Large soak lane:
+3. Ingestion regression gate lane:
+   - `pnpm run quality:perf:ingestion`
+4. Large soak lane:
    - `pnpm run perf:report:large`
-4. Very large soak lane (~25k commits):
+5. Very large soak lane (~25k commits):
    - `pnpm run perf:report:25k`
-5. Balanced default report lane:
+6. Balanced default report lane:
    - `pnpm run perf:report`
-6. Interpretation rule:
+7. Optional preconditioned soak lane:
+   - `pnpm run perf:report:25k:precondition`
+8. Interpretation rule:
    - inspect `phase_timing_ms` first; if fixture generation dominates, optimize fixture strategy before changing traversal algorithms.
-7. In-memory comparison rule:
+9. In-memory comparison rule:
    - inspect `in_memory_adjacency_query_latency_ms` and `in_memory_vs_sqlite_median_speedup` to separate persistence costs from pure graph compute.
-8. Layered throttling isolation lane:
+10. Ingestion diagnosis rule:
+   - inspect `ingestion_phase_timing_ms` and aggregate ingestion contract keys before changing batch sizes.
+11. Layered throttling isolation lane:
    - `pnpm run test:layers` (runs section-wise test lanes + perf smoke phase metrics including RSS).
 
 ## Change Checklist for Graph Query Work
@@ -141,6 +156,7 @@ Keep graph-query code performant by default on medium/large repositories without
    - `pnpm run dev:gate:fast`
    - `pnpm run dev:gate`
    - `pnpm run quality:perf`
+   - `pnpm run quality:perf:ingestion`
    - `pnpm run perf:report:smoke`
    - `pnpm run perf:report:25k` (for repository-scale bottleneck validation)
    - `pnpm run test:layers`
@@ -161,3 +177,7 @@ Keep graph-query code performant by default on medium/large repositories without
 12. Git maintenance tasks (`commit-graph`): https://git-scm.com/docs/git-maintenance
 13. Rayon parallel iterator guide: https://docs.rs/rayon/latest/rayon/iter/index.html
 14. Git commit-graph format: https://git-scm.com/docs/gitformat-commit-graph
+15. Git diff rename detection and limits: https://git-scm.com/docs/git-diff/2.37.2.html
+16. git2 diff find options: https://docs.rs/git2/latest/git2/struct.DiffFindOptions.html
+17. SQLite FAQ (batching inserts/transactions): https://sqlite.org/faq.html
+18. SQLite WAL: https://sqlite.org/wal.html

@@ -26,6 +26,7 @@ struct Config {
     max_nodes: usize,
     output_path: Option<PathBuf>,
     keep_fixture: bool,
+    precondition_commit_graph: bool,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             max_nodes: 2_000,
             output_path: None,
             keep_fixture: false,
+            precondition_commit_graph: false,
         }
     }
 }
@@ -65,6 +67,7 @@ struct LatencySummary {
 struct PhaseTimingSummary {
     fixture_generation: Duration,
     fixture_summary: Duration,
+    repository_preconditioning: Duration,
     repository_scan: Duration,
     full_index: Duration,
     incremental_fixture_append: Duration,
@@ -79,6 +82,7 @@ struct PhaseTimingSummary {
 struct PhaseMemorySummary {
     fixture_generation_rss_bytes: Option<u64>,
     fixture_summary_rss_bytes: Option<u64>,
+    repository_preconditioning_rss_bytes: Option<u64>,
     repository_scan_rss_bytes: Option<u64>,
     full_index_rss_bytes: Option<u64>,
     incremental_fixture_append_rss_bytes: Option<u64>,
@@ -431,6 +435,17 @@ fn run_with_fixture(
     log_phase_done("fixture_summary", fixture_summary);
     let fixture_summary_rss_bytes = memory_tracker.sample_rss();
 
+    let mut repository_preconditioning = Duration::default();
+    let mut repository_preconditioning_rss_bytes = memory_tracker.sample_rss();
+    if config.precondition_commit_graph {
+        log_phase_start("repository_preconditioning");
+        let repository_preconditioning_started = Instant::now();
+        run_repository_preconditioning(repo_dir)?;
+        repository_preconditioning = repository_preconditioning_started.elapsed();
+        log_phase_done("repository_preconditioning", repository_preconditioning);
+        repository_preconditioning_rss_bytes = memory_tracker.sample_rss();
+    }
+
     let repo_str = path_to_string(repo_dir);
     let db_str = path_to_string(db_path);
 
@@ -625,6 +640,7 @@ fn run_with_fixture(
     let phase_timing = PhaseTimingSummary {
         fixture_generation,
         fixture_summary,
+        repository_preconditioning,
         repository_scan,
         full_index,
         incremental_fixture_append,
@@ -637,6 +653,7 @@ fn run_with_fixture(
     let phase_memory = PhaseMemorySummary {
         fixture_generation_rss_bytes,
         fixture_summary_rss_bytes,
+        repository_preconditioning_rss_bytes,
         repository_scan_rss_bytes,
         full_index_rss_bytes,
         incremental_fixture_append_rss_bytes,
@@ -727,6 +744,9 @@ fn parse_config() -> PerfResult<Config> {
             "--keep-fixture" => {
                 config.keep_fixture = true;
             }
+            "--precondition-commit-graph" => {
+                config.precondition_commit_graph = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -766,7 +786,8 @@ fn print_help() {
   --window-limit <n>         Commit window size for query metric (default: 200)
   --max-nodes <n>            Traversal max_nodes parameter (default: 2000)
   --output <path>            Write report text to file
-  --keep-fixture             Keep generated fixture directory for inspection"
+  --keep-fixture             Keep generated fixture directory for inspection
+  --precondition-commit-graph  Write commit-graph before scan/index phases"
     );
 }
 
@@ -1031,6 +1052,19 @@ fn commit_fast_import_block_raw_parent(
     block
 }
 
+fn run_repository_preconditioning(repo_dir: &Path) -> PerfResult<()> {
+    if run_git(
+        repo_dir,
+        &["commit-graph", "write", "--reachable", "--changed-paths"],
+    )
+    .is_ok()
+    {
+        return Ok(());
+    }
+
+    run_git(repo_dir, &["commit-graph", "write", "--reachable"])
+}
+
 fn run_git_with_input(repo_dir: &Path, args: &[&str], input: &str) -> PerfResult<()> {
     let mut child = Command::new("git")
         .arg("-C")
@@ -1229,6 +1263,14 @@ fn summarize(samples: Vec<Duration>) -> LatencySummary {
 }
 
 fn format_report(input: &ReportInput<'_>) -> String {
+    let full_ingestion = &input.full_stats.ingestion_phase_timing_ms;
+    let incremental_ingestion = &input.incremental_stats.ingestion_phase_timing_ms;
+    let ingest_commit_walk_ms = full_ingestion.commit_walk + incremental_ingestion.commit_walk;
+    let ingest_file_diff_extract_ms =
+        full_ingestion.file_diff_extract + incremental_ingestion.file_diff_extract;
+    let ingest_file_change_upsert_ms =
+        full_ingestion.file_change_upsert + incremental_ingestion.file_change_upsert;
+    let ingest_tx_commit_ms = full_ingestion.tx_commit + incremental_ingestion.tx_commit;
     let full_seconds = input.phase_timing.full_index.as_secs_f64();
     let incremental_seconds = input.phase_timing.incremental_index.as_secs_f64();
     let full_commit_rate = safe_rate(input.full_stats.commits_indexed as f64, full_seconds);
@@ -1262,6 +1304,7 @@ fn format_report(input: &ReportInput<'_>) -> String {
 
     let attributed_core = input.phase_timing.fixture_generation.as_secs_f64()
         + input.phase_timing.fixture_summary.as_secs_f64()
+        + input.phase_timing.repository_preconditioning.as_secs_f64()
         + input.phase_timing.repository_scan.as_secs_f64()
         + input.phase_timing.full_index.as_secs_f64()
         + input.phase_timing.incremental_fixture_append.as_secs_f64()
@@ -1289,6 +1332,7 @@ workload_shape:
 phase_timing_ms:
   fixture_generation: {:.3}
   fixture_summary: {:.3}
+  repository_preconditioning: {:.3}
   repository_scan: {:.3}
   full_index: {:.3}
   incremental_fixture_append: {:.3}
@@ -1302,6 +1346,7 @@ phase_timing_ms:
 phase_memory_bytes:
   fixture_generation_rss: {}
   fixture_summary_rss: {}
+  repository_preconditioning_rss: {}
   repository_scan_rss: {}
   full_index_rss: {}
   incremental_fixture_append_rss: {}
@@ -1335,6 +1380,26 @@ incremental_index:
   edge_throughput_per_sec: {:.3}
   file_change_throughput_per_sec: {:.3}
 
+ingestion_phase_timing_ms:
+  full_commit_walk: {:.3}
+  full_commit_upsert: {:.3}
+  full_edge_materialize: {:.3}
+  full_file_diff_extract: {:.3}
+  full_file_change_delete: {:.3}
+  full_file_change_upsert: {:.3}
+  full_tx_commit: {:.3}
+  incremental_commit_walk: {:.3}
+  incremental_commit_upsert: {:.3}
+  incremental_edge_materialize: {:.3}
+  incremental_file_diff_extract: {:.3}
+  incremental_file_change_delete: {:.3}
+  incremental_file_change_upsert: {:.3}
+  incremental_tx_commit: {:.3}
+  ingest_commit_walk_ms: {:.3}
+  ingest_file_diff_extract_ms: {:.3}
+  ingest_file_change_upsert_ms: {:.3}
+  ingest_tx_commit_ms: {:.3}
+
 query_latency_ms:
   commit_window: {}
   bfs_parents: {}
@@ -1367,6 +1432,7 @@ in_memory_vs_sqlite_median_speedup:
         input.estimated_git_process_spawns,
         duration_ms(input.phase_timing.fixture_generation),
         duration_ms(input.phase_timing.fixture_summary),
+        duration_ms(input.phase_timing.repository_preconditioning),
         duration_ms(input.phase_timing.repository_scan),
         duration_ms(input.phase_timing.full_index),
         duration_ms(input.phase_timing.incremental_fixture_append),
@@ -1378,6 +1444,7 @@ in_memory_vs_sqlite_median_speedup:
         unattributed_core * 1_000.0,
         optional_u64_display(input.phase_memory.fixture_generation_rss_bytes),
         optional_u64_display(input.phase_memory.fixture_summary_rss_bytes),
+        optional_u64_display(input.phase_memory.repository_preconditioning_rss_bytes),
         optional_u64_display(input.phase_memory.repository_scan_rss_bytes),
         optional_u64_display(input.phase_memory.full_index_rss_bytes),
         optional_u64_display(input.phase_memory.incremental_fixture_append_rss_bytes),
@@ -1404,6 +1471,24 @@ in_memory_vs_sqlite_median_speedup:
         incremental_commit_rate,
         incremental_edge_rate,
         incremental_file_change_rate,
+        full_ingestion.commit_walk,
+        full_ingestion.commit_upsert,
+        full_ingestion.edge_materialize,
+        full_ingestion.file_diff_extract,
+        full_ingestion.file_change_delete,
+        full_ingestion.file_change_upsert,
+        full_ingestion.tx_commit,
+        incremental_ingestion.commit_walk,
+        incremental_ingestion.commit_upsert,
+        incremental_ingestion.edge_materialize,
+        incremental_ingestion.file_diff_extract,
+        incremental_ingestion.file_change_delete,
+        incremental_ingestion.file_change_upsert,
+        incremental_ingestion.tx_commit,
+        ingest_commit_walk_ms,
+        ingest_file_diff_extract_ms,
+        ingest_file_change_upsert_ms,
+        ingest_tx_commit_ms,
         format_latency(input.query.commit_window),
         format_latency(input.query.bfs),
         format_latency(input.query.dfs),
@@ -1481,8 +1566,14 @@ fn estimate_git_process_spawns(config: &Config) -> usize {
     } else {
         5
     };
+    let preconditioning = if config.precondition_commit_graph {
+        2
+    } else {
+        0
+    };
     fixture_generation
         .saturating_add(fixture_summary)
+        .saturating_add(preconditioning)
         .saturating_add(incremental_refresh)
 }
 

@@ -300,7 +300,13 @@ if (-not (Test-Path $srcRoot)) {
         if (
             (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS' -Quiet) -and
             (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE' -Quiet) -and
-            (Select-String -Path $gitAdapterPath -Pattern '\.par_chunks\(' -Quiet)
+            (
+                (Select-String -Path $gitAdapterPath -Pattern '\.par_chunks\(' -Quiet) -or
+                (
+                    (Select-String -Path $gitAdapterPath -Pattern '\.chunks\(FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE\)' -Quiet) -and
+                    (Select-String -Path $gitAdapterPath -Pattern 'into_par_iter\(' -Quiet)
+                )
+            )
         ) {
             Add-Pass "Git adapter keeps bounded Rayon parallel file-change compute path."
         } else {
@@ -311,6 +317,45 @@ if (-not (Test-Path $srcRoot)) {
             Add-Failure "Git adapter must remain DB-free (no rusqlite dependency in adapters/git.rs)."
         } else {
             Add-Pass "Git adapter remains DB-free (single-writer DB contract stays in indexer/db adapters)."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'rename_limit' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'rename_threshold' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'exact_match_only' -Quiet)
+        ) {
+            Add-Pass "Git adapter enforces bounded rename detection options."
+        } else {
+            Add-Failure "Git adapter must enforce bounded rename detection (`rename_limit`, `rename_threshold`, `exact_match_only`)."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'sync_channel' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_CHANNEL_CAPACITY' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps bounded producer/consumer channel for parallel file-change extraction."
+        } else {
+            Add-Failure "Git adapter must keep bounded producer/consumer channel for parallel file-change extraction."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'parallel_file_change_plan' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_PARALLEL_TARGET_CHUNKS_PER_WORKER' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_CHANNEL_CAPACITY_PER_WORKER' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps adaptive-but-bounded Rayon planning for chunk and channel sizing."
+        } else {
+            Add-Failure "Git adapter must keep adaptive-but-bounded Rayon planning (`parallel_file_change_plan` + bounded chunk/channel controls)."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'diff_requires_line_stats' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'Patch::from_diff' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'collect_patch_line_stats' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps two-stage selective line-count extraction for file diffs."
+        } else {
+            Add-Failure "Git adapter must keep two-stage selective line-count extraction (`diff_requires_line_stats` + `Patch::from_diff`)."
         }
     }
 
@@ -357,6 +402,18 @@ if (-not (Test-Path $srcRoot)) {
         } else {
             Add-Pass "DB adapter avoids SHA edge columns in graph hot-path queries."
         }
+
+        if (Select-String -Path $dbAdapterPath -Pattern 'DELETE FROM file_changes WHERE repo_id = \?1 AND commit_sha = \?2' -Quiet) {
+            Add-Failure "DB adapter must not use row-by-row file-change delete loop in hot incremental path."
+        } else {
+            Add-Pass "DB adapter avoids row-by-row file-change delete loop in hot incremental path."
+        }
+
+        if (Select-String -Path $dbAdapterPath -Pattern 'current_pending_file_change_delete_shas' -Quiet) {
+            Add-Pass "DB adapter uses set-based pending SHA delete table for incremental file-change cleanup."
+        } else {
+            Add-Failure "DB adapter must use set-based pending SHA delete table for incremental file-change cleanup."
+        }
     }
 }
 
@@ -383,6 +440,7 @@ $requiredDocs = @(
     "docs/adr/0007-bounded-rayon-ingestion-compute-single-writer-db.md",
     "docs/adr/0008-integer-edge-schema-for-graph-hot-path.md",
     "docs/adr/0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md",
+    "docs/adr/0010-bounded-rename-detection-and-ingestion-phase-telemetry.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )
@@ -487,6 +545,7 @@ if ($changedFiles.Count -eq 0) {
 $requiredPerfFiles = @(
     "scripts/perf-budget.ps1",
     "scripts/perf-report.ps1",
+    "scripts/perf-ingestion-budget.ps1",
     "scripts/layer-test-matrix.ps1",
     "apps/desktop/src-tauri/src/bin/perf-report.rs",
     ".github/workflows/rust-ci.yml"
@@ -544,6 +603,29 @@ if (Test-Path $perfReportScriptPath) {
     }
 }
 
+$perfIngestionBudgetPath = Join-Path $repoRoot "scripts/perf-ingestion-budget.ps1"
+if (Test-Path $perfIngestionBudgetPath) {
+    $hasProbeMode = Select-String -Path $perfIngestionBudgetPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
+    $hasPerfReportInvocation = Select-String -Path $perfIngestionBudgetPath -Pattern 'perf-report\.ps1' -Quiet
+    $hasFullIndexThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxFullIndexMs' -Quiet
+    $hasIncrementalThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxIncrementalIndexMs' -Quiet
+    $hasPeakRssThreshold = Select-String -Path $perfIngestionBudgetPath -Pattern 'MaxPeakRssBytes' -Quiet
+    $hasPeakRssField = Select-String -Path $perfIngestionBudgetPath -Pattern 'peak_observed_rss' -Quiet
+
+    if (
+        $hasProbeMode -and
+        $hasPerfReportInvocation -and
+        $hasFullIndexThreshold -and
+        $hasIncrementalThreshold -and
+        $hasPeakRssThreshold -and
+        $hasPeakRssField
+    ) {
+        Add-Pass "Ingestion budget script contract present (probe mode + thresholds + memory budget check)."
+    } else {
+        Add-Failure "Ingestion budget script must keep probe mode and enforce full/incremental/ms + peak RSS thresholds."
+    }
+}
+
 $perfReportBinaryPath = Join-Path $repoRoot "apps/desktop/src-tauri/src/bin/perf-report.rs"
 if (Test-Path $perfReportBinaryPath) {
     $hasPhaseTimingSection = Select-String -Path $perfReportBinaryPath -Pattern 'phase_timing_ms' -Quiet
@@ -553,6 +635,10 @@ if (Test-Path $perfReportBinaryPath) {
     $hasPeakRssField = Select-String -Path $perfReportBinaryPath -Pattern 'peak_observed_rss' -Quiet
     $hasInMemoryHydrationField = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_graph_hydration' -Quiet
     $hasInMemoryQuerySection = Select-String -Path $perfReportBinaryPath -Pattern 'in_memory_adjacency_query_latency_ms' -Quiet
+    $hasIngestCommitWalkField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_commit_walk_ms' -Quiet
+    $hasIngestDiffExtractField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_diff_extract_ms' -Quiet
+    $hasIngestUpsertField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_change_upsert_ms' -Quiet
+    $hasIngestTxCommitField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_tx_commit_ms' -Quiet
 
     if (
         $hasPhaseTimingSection -and
@@ -561,11 +647,15 @@ if (Test-Path $perfReportBinaryPath) {
         $hasCoreTimingField -and
         $hasPeakRssField -and
         $hasInMemoryHydrationField -and
-        $hasInMemoryQuerySection
+        $hasInMemoryQuerySection -and
+        $hasIngestCommitWalkField -and
+        $hasIngestDiffExtractField -and
+        $hasIngestUpsertField -and
+        $hasIngestTxCommitField
     ) {
-        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency benchmark visibility contract."
+        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency + ingestion-phase visibility contract."
     } else {
-        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency hydration/query sections."
+        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency and ingestion-phase fields."
     }
 }
 
@@ -592,16 +682,24 @@ if (Test-Path $packageJsonPath) {
         Add-Failure "package.json must include a quality:perf script."
     }
 
+    if (Select-String -Path $packageJsonPath -Pattern '"quality:perf:ingestion"' -Quiet) {
+        Add-Pass "package.json exposes quality:perf:ingestion script."
+    } else {
+        Add-Failure "package.json must include a quality:perf:ingestion script."
+    }
+
     if (
         (Select-String -Path $packageJsonPath -Pattern '"perf:report"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:smoke"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:large"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"perf:report:25k"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:report:25k:precondition"' -Quiet) -and
+        (Select-String -Path $packageJsonPath -Pattern '"perf:ingestion:25k"' -Quiet) -and
         (Select-String -Path $packageJsonPath -Pattern '"test:layers"' -Quiet)
     ) {
-        Add-Pass "package.json exposes perf report tier scripts (including 25k) and layered test matrix command."
+        Add-Pass "package.json exposes perf report tiers, ingestion budget lane, and layered test matrix command."
     } else {
-        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, and test:layers scripts."
+        Add-Failure "package.json must include perf:report, perf:report:smoke, perf:report:large, perf:report:25k, perf:report:25k:precondition, perf:ingestion:25k, and test:layers scripts."
     }
 }
 

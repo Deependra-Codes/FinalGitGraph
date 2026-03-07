@@ -66,6 +66,8 @@ Performance automation must not hide where time is spent. Required properties:
 6. `scripts/layer-test-matrix.ps1` must exist and remain runnable through `pnpm run test:layers`.
 7. `package.json` must expose `perf:report:25k` for very-large soak profiling.
 8. CI/local operators can distinguish compile regressions from runtime regressions without manual instrumentation.
+9. `scripts/perf-ingestion-budget.ps1` must enforce full-index/incremental-index + peak RSS thresholds for the 25k ingestion lane.
+10. Optional commit-graph preconditioning lane (`perf:report:25k:precondition`) must continue to run through `scripts/perf-report.ps1`.
 
 ## Non-Goals
 
@@ -92,6 +94,11 @@ Repository-scale indexing guardrails now also enforce:
 6. explicit single transaction boundary in `application/indexer.rs` for ingestion writes
 7. integer edge schema for graph hot paths (`child_commit_id`/`parent_commit_id`) in DB adapter and migrations
 8. no SHA edge hot-path queries in `adapters/db.rs`
+9. bounded rename detection in `adapters/git.rs` (`rename_limit`, `rename_threshold`, `exact_match_only`)
+10. set-based temp-table incremental file-change cleanup in `adapters/db.rs` (no row-by-row delete loop)
+11. ingestion phase telemetry contract in perf report (`ingest_commit_walk_ms`, `ingest_file_diff_extract_ms`, `ingest_file_change_upsert_ms`, `ingest_tx_commit_ms`)
+12. lazy two-stage diff extraction in `adapters/git.rs` (`diff_requires_line_stats` + selective `Patch::from_diff` line stats)
+13. adaptive-but-bounded Rayon planning in `adapters/git.rs` for chunk/channel sizing (`parallel_file_change_plan`)
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
 

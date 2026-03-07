@@ -135,6 +135,18 @@ pub struct IndexingStats {
     pub file_changes_indexed: usize,
     pub refs_indexed: usize,
     pub indexed_at_epoch: i64,
+    pub ingestion_phase_timing_ms: IngestionPhaseTimingMs,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IngestionPhaseTimingMs {
+    pub commit_walk: f64,
+    pub commit_upsert: f64,
+    pub edge_materialize: f64,
+    pub file_diff_extract: f64,
+    pub file_change_delete: f64,
+    pub file_change_upsert: f64,
+    pub tx_commit: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]

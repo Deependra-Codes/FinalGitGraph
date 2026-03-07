@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Transaction};
 
@@ -15,8 +16,8 @@ use crate::adapters::git::{
 use crate::application::graph_queries;
 use crate::domain::models::{
     CommitWindowCursor, CommitWindowResponse, GraphDirection, GraphTraversalResponse,
-    GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, ParsedFileChange,
-    RepositorySummary, ShortestPathResponse,
+    GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, IngestionPhaseTimingMs,
+    ParsedFileChange, RepositorySummary, ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
@@ -25,6 +26,39 @@ const DEFAULT_WINDOW_LIMIT: usize = 100;
 const MAX_WINDOW_LIMIT: usize = 500;
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
+
+#[derive(Default)]
+struct IngestionPhaseTiming {
+    commit_walk: Duration,
+    commit_upsert: Duration,
+    edge_materialize: Duration,
+    file_diff_extract: Duration,
+    file_change_delete: Duration,
+    file_change_upsert: Duration,
+    tx_commit: Duration,
+}
+
+impl IngestionPhaseTiming {
+    fn into_ms(self) -> IngestionPhaseTimingMs {
+        IngestionPhaseTimingMs {
+            commit_walk: duration_ms(self.commit_walk),
+            commit_upsert: duration_ms(self.commit_upsert),
+            edge_materialize: duration_ms(self.edge_materialize),
+            file_diff_extract: duration_ms(self.file_diff_extract),
+            file_change_delete: duration_ms(self.file_change_delete),
+            file_change_upsert: duration_ms(self.file_change_upsert),
+            tx_commit: duration_ms(self.tx_commit),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FileChangeFlushStats {
+    file_changes_indexed: usize,
+    file_diff_extract: Duration,
+    file_change_delete: Duration,
+    file_change_upsert: Duration,
+}
 
 pub struct Indexer {
     db_path: PathBuf,
@@ -99,6 +133,7 @@ impl Indexer {
         let mut commits_inserted = 0usize;
         let mut edges_inserted = 0usize;
         let mut file_changes_indexed = 0usize;
+        let mut ingestion_timing = IngestionPhaseTiming::default();
         let mut checkpoint_candidate: Option<(i64, String)> = None;
         let mut pending_commit_shas = Vec::with_capacity(FILE_CHANGE_COMMIT_BATCH_SIZE);
         let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
@@ -136,7 +171,11 @@ impl Indexer {
             "#,
             )?;
 
+            let commit_walk_started = Instant::now();
+            let mut commit_callback_elapsed = Duration::default();
             stream_commits(&canonical_repo.root, since_epoch, |commit| {
+                let callback_started = Instant::now();
+                let commit_upsert_started = Instant::now();
                 commit_stmt.execute(params![
                     commit.sha.as_str(),
                     repo_id,
@@ -153,17 +192,22 @@ impl Indexer {
                     pending_edge_stmt.execute(params![commit.sha.as_str(), parent.as_str()])?;
                     edges_inserted += 1;
                 }
+                ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
 
                 if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
-                    flush_pending_commit_file_changes(
+                    let flush_stats = flush_pending_commit_file_changes(
                         &tx,
                         &canonical_repo.root,
                         repo_id,
                         effective_mode,
                         &mut pending_commit_shas,
                         &mut pending_file_changes,
-                        &mut file_changes_indexed,
                     )?;
+                    file_changes_indexed =
+                        file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
+                    ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
+                    ingestion_timing.file_change_delete += flush_stats.file_change_delete;
+                    ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
                 }
                 pending_commit_shas.push(commit.sha.clone());
                 update_checkpoint_candidate(
@@ -171,10 +215,15 @@ impl Indexer {
                     commit.committer_time,
                     &commit.sha,
                 );
+                commit_callback_elapsed += callback_started.elapsed();
 
                 Ok(())
             })?;
+            ingestion_timing.commit_walk += commit_walk_started
+                .elapsed()
+                .saturating_sub(commit_callback_elapsed);
 
+            let edge_materialize_started = Instant::now();
             tx.execute(
                 r#"
                 INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
@@ -193,23 +242,30 @@ impl Indexer {
             "#,
                 params![repo_id],
             )?;
+            ingestion_timing.edge_materialize += edge_materialize_started.elapsed();
         }
 
-        flush_pending_commit_file_changes(
+        let flush_stats = flush_pending_commit_file_changes(
             &tx,
             &canonical_repo.root,
             repo_id,
             effective_mode,
             &mut pending_commit_shas,
             &mut pending_file_changes,
-            &mut file_changes_indexed,
         )?;
+        file_changes_indexed =
+            file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
+        ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
+        ingestion_timing.file_change_delete += flush_stats.file_change_delete;
+        ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
         if !pending_file_changes.is_empty() {
+            let file_change_upsert_started = Instant::now();
             file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
                 &tx,
                 repo_id,
                 &pending_file_changes,
             )?);
+            ingestion_timing.file_change_upsert += file_change_upsert_started.elapsed();
             pending_file_changes.clear();
         }
 
@@ -220,7 +276,9 @@ impl Indexer {
             upsert_index_checkpoint(&tx, repo_id, &checkpoint)?;
         }
 
+        let tx_commit_started = Instant::now();
         tx.commit()?;
+        ingestion_timing.tx_commit += tx_commit_started.elapsed();
 
         Ok(IndexingStats {
             repo_id,
@@ -230,6 +288,7 @@ impl Indexer {
             file_changes_indexed,
             refs_indexed,
             indexed_at_epoch,
+            ingestion_phase_timing_ms: ingestion_timing.into_ms(),
         })
     }
 
@@ -346,31 +405,38 @@ fn flush_pending_commit_file_changes(
     mode: IndexingMode,
     pending_commit_shas: &mut Vec<String>,
     pending_file_changes: &mut Vec<ParsedFileChange>,
-    file_changes_indexed: &mut usize,
-) -> AppResult<()> {
+) -> AppResult<FileChangeFlushStats> {
+    let mut stats = FileChangeFlushStats::default();
     if pending_commit_shas.is_empty() {
-        return Ok(());
+        return Ok(stats);
     }
 
     if mode == IndexingMode::Incremental {
+        let delete_started = Instant::now();
         delete_file_changes_for_commits(tx, repo_id, pending_commit_shas)?;
+        stats.file_change_delete += delete_started.elapsed();
     }
 
+    let extract_started = Instant::now();
+    let mut upsert_duration = Duration::default();
     stream_file_changes_for_commits(repo_root, pending_commit_shas, |change| {
         pending_file_changes.push(change);
         if pending_file_changes.len() >= FILE_CHANGE_DB_BATCH_SIZE {
-            *file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
-                tx,
-                repo_id,
-                pending_file_changes,
-            )?);
+            let upsert_started = Instant::now();
+            stats.file_changes_indexed = stats
+                .file_changes_indexed
+                .saturating_add(upsert_file_changes(tx, repo_id, pending_file_changes)?);
+            upsert_duration += upsert_started.elapsed();
             pending_file_changes.clear();
         }
         Ok(())
     })?;
+    let extract_elapsed = extract_started.elapsed();
+    stats.file_change_upsert += upsert_duration;
+    stats.file_diff_extract += extract_elapsed.saturating_sub(upsert_duration);
 
     pending_commit_shas.clear();
-    Ok(())
+    Ok(stats)
 }
 
 fn update_checkpoint_candidate(
@@ -402,4 +468,8 @@ fn build_checkpoint(
         last_commit_sha,
         indexed_at_epoch,
     })
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }

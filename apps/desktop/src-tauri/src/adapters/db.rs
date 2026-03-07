@@ -123,11 +123,39 @@ pub fn delete_file_changes_for_commits(
         return Ok(());
     }
 
-    let mut stmt =
-        conn.prepare("DELETE FROM file_changes WHERE repo_id = ?1 AND commit_sha = ?2")?;
-    for sha in commit_shas {
-        stmt.execute(params![repo_id, sha.as_str()])?;
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS current_pending_file_change_delete_shas (
+          sha TEXT PRIMARY KEY
+        );
+        DELETE FROM current_pending_file_change_delete_shas;
+    "#,
+    )?;
+
+    {
+        let mut insert_stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO current_pending_file_change_delete_shas (sha)
+            VALUES (?1)
+            ON CONFLICT(sha) DO NOTHING
+        "#,
+        )?;
+        for sha in commit_shas {
+            insert_stmt.execute([sha.as_str()])?;
+        }
     }
+
+    conn.execute(
+        r#"
+        DELETE FROM file_changes
+        WHERE repo_id = ?1
+          AND commit_sha IN (
+            SELECT sha
+            FROM current_pending_file_change_delete_shas
+          )
+    "#,
+        [repo_id],
+    )?;
 
     Ok(())
 }
@@ -910,12 +938,13 @@ mod tests {
     use rusqlite::{params, Connection};
 
     use super::{
-        count_commits, load_commit_shas_by_rowids, load_commit_shas_for_rowids,
-        load_index_checkpoint, load_neighbor_rowids_batch, load_neighbor_rowids_for_sources,
-        load_neighbor_shas_batch, load_pull_neighbor_rowids, run_migrations,
-        upsert_index_checkpoint, FRONTIER_PULL_QUERY_CHUNK_SIZE, ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE,
+        count_commits, delete_file_changes_for_commits, load_commit_shas_by_rowids,
+        load_commit_shas_for_rowids, load_index_checkpoint, load_neighbor_rowids_batch,
+        load_neighbor_rowids_for_sources, load_neighbor_shas_batch, load_pull_neighbor_rowids,
+        run_migrations, upsert_file_changes, upsert_index_checkpoint,
+        FRONTIER_PULL_QUERY_CHUNK_SIZE, ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE,
     };
-    use crate::domain::models::{GraphDirection, IndexCheckpoint};
+    use crate::domain::models::{GraphDirection, IndexCheckpoint, ParsedFileChange};
 
     #[test]
     fn migrations_are_idempotent() {
@@ -975,6 +1004,71 @@ mod tests {
         assert_eq!(loaded.last_committer_time, 123);
         assert_eq!(loaded.last_commit_sha, "abc123");
         assert_eq!(loaded.indexed_at_epoch, 456);
+    }
+
+    #[test]
+    fn delete_file_changes_for_commits_removes_requested_shas_only() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            ["/tmp/delete-repo", "delete-repo", "/tmp/delete-repo/.git"],
+        )
+        .expect("insert repo");
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/delete-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let file_changes = vec![
+            ParsedFileChange {
+                commit_sha: "c1".to_string(),
+                file_path: "a.txt".to_string(),
+                additions: 1,
+                deletions: 0,
+                change_type: "add".to_string(),
+            },
+            ParsedFileChange {
+                commit_sha: "c2".to_string(),
+                file_path: "b.txt".to_string(),
+                additions: 2,
+                deletions: 1,
+                change_type: "modify".to_string(),
+            },
+            ParsedFileChange {
+                commit_sha: "c3".to_string(),
+                file_path: "c.txt".to_string(),
+                additions: 0,
+                deletions: 4,
+                change_type: "delete".to_string(),
+            },
+        ];
+        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert file changes");
+
+        delete_file_changes_for_commits(&conn, repo_id, &["c1".to_string(), "c3".to_string()])
+            .expect("delete selected file changes");
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .expect("count remaining file changes");
+        assert_eq!(remaining, 1);
+
+        let remaining_sha: String = conn
+            .query_row(
+                "SELECT commit_sha FROM file_changes WHERE repo_id = ?1 LIMIT 1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .expect("read remaining commit sha");
+        assert_eq!(remaining_sha, "c2");
     }
 
     #[test]

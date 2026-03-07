@@ -8,6 +8,7 @@ param(
     [int]$WindowLimit = 200,
     [int]$MaxNodes = 2000,
     [string]$OutputPath = "tmp/perf-report-latest.txt",
+    [switch]$PreconditionCommitGraph,
     [switch]$KeepFixture,
     [switch]$ProbeOnly
 )
@@ -158,6 +159,9 @@ function Get-ReportArgs {
 
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $args += @("--output", "$OutputPath")
+    }
+    if ($PreconditionCommitGraph) {
+        $args += "--precondition-commit-graph"
     }
     if ($KeepFixture) {
         $args += "--keep-fixture"

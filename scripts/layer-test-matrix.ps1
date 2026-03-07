@@ -125,6 +125,10 @@ try {
         [pscustomobject]@{ metric = "query_benchmark_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "query_benchmark" }
         [pscustomobject]@{ metric = "in_memory_graph_hydration_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "in_memory_graph_hydration" }
         [pscustomobject]@{ metric = "in_memory_query_benchmark_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "in_memory_query_benchmark" }
+        [pscustomobject]@{ metric = "ingest_commit_walk_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "ingest_commit_walk_ms" }
+        [pscustomobject]@{ metric = "ingest_file_diff_extract_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "ingest_file_diff_extract_ms" }
+        [pscustomobject]@{ metric = "ingest_file_change_upsert_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "ingest_file_change_upsert_ms" }
+        [pscustomobject]@{ metric = "ingest_tx_commit_ms"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "ingest_tx_commit_ms" }
         [pscustomobject]@{ metric = "peak_observed_rss_bytes"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "peak_observed_rss" }
         [pscustomobject]@{ metric = "final_rss_bytes"; value = Get-ReportValue -Path $PerfReportOutputPath -Key "final_rss" }
     )

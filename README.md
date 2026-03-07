@@ -100,6 +100,7 @@ Graph traversal performance budget gate:
 
 ```powershell
 pnpm run quality:perf
+pnpm run quality:perf:ingestion
 ```
 
 Repository-scale performance report (build/execute split + phase timing + RAM + in-memory adjacency benchmark):
@@ -109,6 +110,8 @@ pnpm run perf:report
 pnpm run perf:report:smoke
 pnpm run perf:report:large
 pnpm run perf:report:25k
+pnpm run perf:report:25k:precondition
+pnpm run perf:ingestion:25k
 ```
 
 Layered throttling matrix (section-wise test lanes + RAM-aware perf smoke metrics):
