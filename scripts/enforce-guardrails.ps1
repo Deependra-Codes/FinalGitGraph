@@ -277,9 +277,22 @@ if (-not (Test-Path $srcRoot)) {
     $gitAdapterPath = Join-Path $srcRoot "adapters/git.rs"
     if (Test-Path $gitAdapterPath) {
         if (Select-String -Path $gitAdapterPath -Pattern 'Command::new\("git"\)' -Quiet) {
-            Add-Failure "Git adapter hot ingestion path must use libgit2 APIs (no process-spawned git CLI)."
+            Add-Failure "Git adapter hot ingestion path must be in-process (no process-spawned git CLI)."
         } else {
-            Add-Pass "Git adapter uses libgit2 ingestion path (no git CLI process spawn)."
+            Add-Pass "Git adapter avoids process-spawned git CLI ingestion."
+        }
+
+        if (Select-String -Path $gitAdapterPath -Pattern '(^|\W)git2::' -Quiet) {
+            Add-Failure "Git adapter must not reintroduce git2/libgit2 APIs after gix migration."
+        } elseif (
+            (Select-String -Path $gitAdapterPath -Pattern '^\s*use\s+gix::Repository;' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\brev_walk\(' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\bdiff_tree_to_tree\(' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\btrack_rewrites\(' -Quiet)
+        ) {
+            Add-Pass "Git adapter uses gix revision-walk and tree-diff ingestion APIs."
+        } else {
+            Add-Failure "Git adapter must keep gix-backed ingestion path (rev_walk + diff_tree_to_tree + track_rewrites)."
         }
 
         if (Select-String -Path $gitAdapterPath -Pattern 'fn run_git_command' -Quiet) {
@@ -350,12 +363,37 @@ if (-not (Test-Path $srcRoot)) {
 
         if (
             (Select-String -Path $gitAdapterPath -Pattern 'diff_requires_line_stats' -Quiet) -and
-            (Select-String -Path $gitAdapterPath -Pattern 'Patch::from_diff' -Quiet) -and
+            (
+                (Select-String -Path $gitAdapterPath -Pattern 'Patch::from_diff' -Quiet) -or
+                (Select-String -Path $gitAdapterPath -Pattern 'PATCH_FROM_DIFF_GUARDRAIL_MARKER' -Quiet)
+            ) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'line_counts' -Quiet) -and
             (Select-String -Path $gitAdapterPath -Pattern 'collect_patch_line_stats' -Quiet)
         ) {
             Add-Pass "Git adapter keeps two-stage selective line-count extraction for file diffs."
         } else {
-            Add-Failure "Git adapter must keep two-stage selective line-count extraction (`diff_requires_line_stats` + `Patch::from_diff`)."
+            Add-Failure "Git adapter must keep two-stage selective line-count extraction (`diff_requires_line_stats` + gix line_counts + guardrail marker)."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'pub struct FileDiffTelemetry' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'diff_build' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'rename_find' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'delta_emit' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps diff sub-phase telemetry contract."
+        } else {
+            Add-Failure "Git adapter must keep diff sub-phase telemetry contract (`diff_build`, `rename_find`, `delta_emit`)."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'parse_hex_object_id' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'object_cache_bytes_for_workers' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'object_cache_size_if_unset' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps SHA validation and bounded object-cache sizing guards."
+        } else {
+            Add-Failure "Git adapter must keep SHA validation and bounded object-cache sizing guards."
         }
 
         if (
@@ -475,6 +513,7 @@ $requiredDocs = @(
     "docs/adr/0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md",
     "docs/adr/0010-bounded-rename-detection-and-ingestion-phase-telemetry.md",
     "docs/adr/0011-core-file-change-ingestion-and-jit-enrichment.md",
+    "docs/adr/0012-gitoxide-ingestion-adapter-migration.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )

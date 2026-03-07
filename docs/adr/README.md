@@ -17,6 +17,7 @@ Use `NNNN-short-title.md`, for example:
 1. `0001-rust-workspace-governance.md`
 2. `0002-indexing-checkpoint-strategy.md`
 3. `0006-streaming-libgit2-ingestion.md`
+4. `0012-gitoxide-ingestion-adapter-migration.md`
 
 ## Template
 

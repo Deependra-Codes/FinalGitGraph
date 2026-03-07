@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Transaction};
@@ -13,7 +15,8 @@ use crate::adapters::db::{
 };
 use crate::adapters::git::{
     load_file_change_line_stats_for_targets, load_refs, stream_commits, stream_commits_with_hide,
-    stream_file_changes_for_commits, validate_repository, FILE_CHANGE_COMMIT_BATCH_SIZE,
+    stream_file_changes_for_commits, validate_repository, FileDiffTelemetry,
+    FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
 use crate::application::graph_queries;
 use crate::domain::models::{
@@ -27,8 +30,10 @@ use crate::support::error::{AppError, AppResult};
 const DEFAULT_WINDOW_LIMIT: usize = 100;
 const MAX_WINDOW_LIMIT: usize = 5_000;
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
+const FULL_FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 512;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
 const FILE_CHANGE_JIT_ENRICH_BATCH_SIZE: usize = 1_024;
+const FILE_CHANGE_DIFF_PIPELINE_CAPACITY: usize = 8;
 
 #[derive(Default)]
 struct IngestionPhaseTiming {
@@ -36,6 +41,9 @@ struct IngestionPhaseTiming {
     commit_upsert: Duration,
     edge_materialize: Duration,
     file_diff_extract: Duration,
+    file_diff_build: Duration,
+    file_diff_rename_find: Duration,
+    file_diff_delta_emit: Duration,
     file_change_delete: Duration,
     file_change_upsert: Duration,
     tx_commit: Duration,
@@ -48,6 +56,9 @@ impl IngestionPhaseTiming {
             commit_upsert: duration_ms(self.commit_upsert),
             edge_materialize: duration_ms(self.edge_materialize),
             file_diff_extract: duration_ms(self.file_diff_extract),
+            file_diff_build: duration_ms(self.file_diff_build),
+            file_diff_rename_find: duration_ms(self.file_diff_rename_find),
+            file_diff_delta_emit: duration_ms(self.file_diff_delta_emit),
             file_change_delete: duration_ms(self.file_change_delete),
             file_change_upsert: duration_ms(self.file_change_upsert),
             tx_commit: duration_ms(self.tx_commit),
@@ -59,8 +70,23 @@ impl IngestionPhaseTiming {
 struct FileChangeFlushStats {
     file_changes_indexed: usize,
     file_diff_extract: Duration,
+    file_diff_build: Duration,
+    file_diff_rename_find: Duration,
+    file_diff_delta_emit: Duration,
     file_change_delete: Duration,
     file_change_upsert: Duration,
+}
+
+struct DiffExtractBatch {
+    commit_shas: Vec<String>,
+    changes: Vec<ParsedFileChange>,
+    telemetry: FileDiffTelemetry,
+}
+
+struct FileChangeExtractionPipeline {
+    sender: Option<SyncSender<Vec<String>>>,
+    receiver: Receiver<Result<DiffExtractBatch, String>>,
+    in_flight_batches: usize,
 }
 
 pub struct Indexer {
@@ -138,8 +164,17 @@ impl Indexer {
         let mut file_changes_indexed = 0usize;
         let mut ingestion_timing = IngestionPhaseTiming::default();
         let mut checkpoint_candidate: Option<(i64, String)> = None;
-        let mut pending_commit_shas = Vec::with_capacity(FILE_CHANGE_COMMIT_BATCH_SIZE);
+        let file_change_commit_batch_size = if effective_mode == IndexingMode::Full {
+            FULL_FILE_CHANGE_COMMIT_BATCH_SIZE
+        } else {
+            FILE_CHANGE_COMMIT_BATCH_SIZE
+        };
+        let mut pending_commit_shas = Vec::with_capacity(file_change_commit_batch_size);
         let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
+        let mut file_change_pipeline = FileChangeExtractionPipeline::spawn(
+            &canonical_repo.root,
+            FILE_CHANGE_DIFF_PIPELINE_CAPACITY,
+        );
 
         {
             tx.execute_batch(
@@ -207,20 +242,20 @@ impl Indexer {
                         }
                         ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
 
-                        if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
-                            let flush_stats = flush_pending_commit_file_changes(
+                        if pending_commit_shas.len() >= file_change_commit_batch_size {
+                            dispatch_pending_commit_batch(
+                                &mut file_change_pipeline,
+                                &mut pending_commit_shas,
+                            )?;
+                            drain_ready_file_change_batches(
                                 &tx,
-                                &canonical_repo.root,
                                 repo_id,
                                 effective_mode,
-                                &mut pending_commit_shas,
+                                &mut file_change_pipeline,
                                 &mut pending_file_changes,
+                                &mut file_changes_indexed,
+                                &mut ingestion_timing,
                             )?;
-                            file_changes_indexed = file_changes_indexed
-                                .saturating_add(flush_stats.file_changes_indexed);
-                            ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
-                            ingestion_timing.file_change_delete += flush_stats.file_change_delete;
-                            ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
                         }
                         pending_commit_shas.push(commit.sha.clone());
                         update_checkpoint_candidate(
@@ -255,20 +290,20 @@ impl Indexer {
                     }
                     ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
 
-                    if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
-                        let flush_stats = flush_pending_commit_file_changes(
+                    if pending_commit_shas.len() >= file_change_commit_batch_size {
+                        dispatch_pending_commit_batch(
+                            &mut file_change_pipeline,
+                            &mut pending_commit_shas,
+                        )?;
+                        drain_ready_file_change_batches(
                             &tx,
-                            &canonical_repo.root,
                             repo_id,
                             effective_mode,
-                            &mut pending_commit_shas,
+                            &mut file_change_pipeline,
                             &mut pending_file_changes,
+                            &mut file_changes_indexed,
+                            &mut ingestion_timing,
                         )?;
-                        file_changes_indexed =
-                            file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
-                        ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
-                        ingestion_timing.file_change_delete += flush_stats.file_change_delete;
-                        ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
                     }
                     pending_commit_shas.push(commit.sha.clone());
                     update_checkpoint_candidate(
@@ -308,19 +343,17 @@ impl Indexer {
             ingestion_timing.edge_materialize += edge_materialize_started.elapsed();
         }
 
-        let flush_stats = flush_pending_commit_file_changes(
+        dispatch_pending_commit_batch(&mut file_change_pipeline, &mut pending_commit_shas)?;
+        file_change_pipeline.close_input();
+        drain_all_file_change_batches(
             &tx,
-            &canonical_repo.root,
             repo_id,
             effective_mode,
-            &mut pending_commit_shas,
+            &mut file_change_pipeline,
             &mut pending_file_changes,
+            &mut file_changes_indexed,
+            &mut ingestion_timing,
         )?;
-        file_changes_indexed =
-            file_changes_indexed.saturating_add(flush_stats.file_changes_indexed);
-        ingestion_timing.file_diff_extract += flush_stats.file_diff_extract;
-        ingestion_timing.file_change_delete += flush_stats.file_change_delete;
-        ingestion_timing.file_change_upsert += flush_stats.file_change_upsert;
         if !pending_file_changes.is_empty() {
             let file_change_upsert_started = Instant::now();
             file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
@@ -516,28 +549,186 @@ impl Indexer {
     }
 }
 
-fn flush_pending_commit_file_changes(
+impl FileChangeExtractionPipeline {
+    fn spawn(repo_root: &Path, channel_capacity: usize) -> Self {
+        let bounded_capacity = channel_capacity.max(1);
+        let (sender, worker_receiver) = sync_channel::<Vec<String>>(bounded_capacity);
+        let (worker_sender, receiver) =
+            sync_channel::<Result<DiffExtractBatch, String>>(bounded_capacity);
+        let repo_root = repo_root.to_path_buf();
+        thread::spawn(move || {
+            while let Ok(commit_shas) = worker_receiver.recv() {
+                let mut changes = Vec::new();
+                let telemetry =
+                    match stream_file_changes_for_commits(&repo_root, &commit_shas, |change| {
+                        changes.push(change);
+                        Ok(())
+                    }) {
+                        Ok(telemetry) => telemetry,
+                        Err(error) => {
+                            let _ = worker_sender.send(Err(error.to_string()));
+                            return;
+                        }
+                    };
+                let batch = DiffExtractBatch {
+                    commit_shas,
+                    changes,
+                    telemetry,
+                };
+                if worker_sender.send(Ok(batch)).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Self {
+            sender: Some(sender),
+            receiver,
+            in_flight_batches: 0,
+        }
+    }
+
+    fn dispatch(&mut self, commit_shas: Vec<String>) -> AppResult<()> {
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+        let Some(sender) = &self.sender else {
+            return Err(AppError::GitCommand(
+                "dispatch file-change extraction batch after pipeline shutdown".to_string(),
+            ));
+        };
+        sender.send(commit_shas).map_err(|_| {
+            AppError::GitCommand("send file-change extraction batch to worker".to_string())
+        })?;
+        self.in_flight_batches = self.in_flight_batches.saturating_add(1);
+        Ok(())
+    }
+
+    fn try_receive(&mut self) -> AppResult<Option<DiffExtractBatch>> {
+        if self.in_flight_batches == 0 {
+            return Ok(None);
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => {
+                self.in_flight_batches = self.in_flight_batches.saturating_sub(1);
+                Ok(Some(map_pipeline_batch_result(result)?))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(AppError::GitCommand(
+                "receive file-change extraction batch: worker channel disconnected".to_string(),
+            )),
+        }
+    }
+
+    fn receive(&mut self) -> AppResult<DiffExtractBatch> {
+        if self.in_flight_batches == 0 {
+            return Err(AppError::GitCommand(
+                "receive file-change extraction batch with no in-flight work".to_string(),
+            ));
+        }
+        let result = self.receiver.recv().map_err(|_| {
+            AppError::GitCommand(
+                "receive file-change extraction batch: worker channel closed".to_string(),
+            )
+        })?;
+        self.in_flight_batches = self.in_flight_batches.saturating_sub(1);
+        map_pipeline_batch_result(result)
+    }
+
+    fn close_input(&mut self) {
+        self.sender.take();
+    }
+
+    fn has_in_flight_batches(&self) -> bool {
+        self.in_flight_batches > 0
+    }
+}
+
+fn map_pipeline_batch_result(
+    result: Result<DiffExtractBatch, String>,
+) -> AppResult<DiffExtractBatch> {
+    result.map_err(|error| {
+        AppError::GitCommand(format!(
+            "extract file-change metadata in pipeline worker: {error}"
+        ))
+    })
+}
+
+fn dispatch_pending_commit_batch(
+    pipeline: &mut FileChangeExtractionPipeline,
+    pending_commit_shas: &mut Vec<String>,
+) -> AppResult<()> {
+    if pending_commit_shas.is_empty() {
+        return Ok(());
+    }
+    pipeline.dispatch(std::mem::take(pending_commit_shas))
+}
+
+fn drain_ready_file_change_batches(
     tx: &Transaction<'_>,
-    repo_root: &Path,
     repo_id: i64,
     mode: IndexingMode,
-    pending_commit_shas: &mut Vec<String>,
+    pipeline: &mut FileChangeExtractionPipeline,
+    pending_file_changes: &mut Vec<ParsedFileChange>,
+    file_changes_indexed: &mut usize,
+    ingestion_timing: &mut IngestionPhaseTiming,
+) -> AppResult<()> {
+    while let Some(batch) = pipeline.try_receive()? {
+        let flush_stats =
+            apply_extracted_file_change_batch(tx, repo_id, mode, batch, pending_file_changes)?;
+        accumulate_flush_stats(file_changes_indexed, ingestion_timing, flush_stats);
+    }
+    Ok(())
+}
+
+fn drain_all_file_change_batches(
+    tx: &Transaction<'_>,
+    repo_id: i64,
+    mode: IndexingMode,
+    pipeline: &mut FileChangeExtractionPipeline,
+    pending_file_changes: &mut Vec<ParsedFileChange>,
+    file_changes_indexed: &mut usize,
+    ingestion_timing: &mut IngestionPhaseTiming,
+) -> AppResult<()> {
+    while pipeline.has_in_flight_batches() {
+        let batch = pipeline.receive()?;
+        let flush_stats =
+            apply_extracted_file_change_batch(tx, repo_id, mode, batch, pending_file_changes)?;
+        accumulate_flush_stats(file_changes_indexed, ingestion_timing, flush_stats);
+    }
+    Ok(())
+}
+
+fn apply_extracted_file_change_batch(
+    tx: &Transaction<'_>,
+    repo_id: i64,
+    mode: IndexingMode,
+    batch: DiffExtractBatch,
     pending_file_changes: &mut Vec<ParsedFileChange>,
 ) -> AppResult<FileChangeFlushStats> {
     let mut stats = FileChangeFlushStats::default();
-    if pending_commit_shas.is_empty() {
-        return Ok(stats);
-    }
+    stats.file_diff_build = stats
+        .file_diff_build
+        .saturating_add(batch.telemetry.diff_build);
+    stats.file_diff_rename_find = stats
+        .file_diff_rename_find
+        .saturating_add(batch.telemetry.rename_find);
+    stats.file_diff_delta_emit = stats
+        .file_diff_delta_emit
+        .saturating_add(batch.telemetry.delta_emit);
+    stats.file_diff_extract = stats
+        .file_diff_extract
+        .saturating_add(batch.telemetry.total());
 
     if mode == IndexingMode::Incremental {
         let delete_started = Instant::now();
-        delete_file_changes_for_commits(tx, repo_id, pending_commit_shas)?;
-        stats.file_change_delete += delete_started.elapsed();
+        delete_file_changes_for_commits(tx, repo_id, &batch.commit_shas)?;
+        stats.file_change_delete = stats
+            .file_change_delete
+            .saturating_add(delete_started.elapsed());
     }
 
-    let extract_started = Instant::now();
-    let mut upsert_duration = Duration::default();
-    stream_file_changes_for_commits(repo_root, pending_commit_shas, |change| {
+    for change in batch.changes {
         pending_file_changes.push(change);
         if pending_file_changes.len() >= FILE_CHANGE_DB_BATCH_SIZE {
             let upsert_started = Instant::now();
@@ -545,17 +736,40 @@ fn flush_pending_commit_file_changes(
                 .file_changes_indexed
                 .saturating_add(upsert_file_changes(tx, repo_id, pending_file_changes)?);
             enqueue_file_changes_for_enrichment(tx, repo_id, pending_file_changes)?;
-            upsert_duration += upsert_started.elapsed();
+            stats.file_change_upsert = stats
+                .file_change_upsert
+                .saturating_add(upsert_started.elapsed());
             pending_file_changes.clear();
         }
-        Ok(())
-    })?;
-    let extract_elapsed = extract_started.elapsed();
-    stats.file_change_upsert += upsert_duration;
-    stats.file_diff_extract += extract_elapsed.saturating_sub(upsert_duration);
+    }
 
-    pending_commit_shas.clear();
     Ok(stats)
+}
+
+fn accumulate_flush_stats(
+    file_changes_indexed: &mut usize,
+    ingestion_timing: &mut IngestionPhaseTiming,
+    stats: FileChangeFlushStats,
+) {
+    *file_changes_indexed = file_changes_indexed.saturating_add(stats.file_changes_indexed);
+    ingestion_timing.file_diff_extract = ingestion_timing
+        .file_diff_extract
+        .saturating_add(stats.file_diff_extract);
+    ingestion_timing.file_diff_build = ingestion_timing
+        .file_diff_build
+        .saturating_add(stats.file_diff_build);
+    ingestion_timing.file_diff_rename_find = ingestion_timing
+        .file_diff_rename_find
+        .saturating_add(stats.file_diff_rename_find);
+    ingestion_timing.file_diff_delta_emit = ingestion_timing
+        .file_diff_delta_emit
+        .saturating_add(stats.file_diff_delta_emit);
+    ingestion_timing.file_change_delete = ingestion_timing
+        .file_change_delete
+        .saturating_add(stats.file_change_delete);
+    ingestion_timing.file_change_upsert = ingestion_timing
+        .file_change_upsert
+        .saturating_add(stats.file_change_upsert);
 }
 
 fn enrich_file_change_stats_batch(

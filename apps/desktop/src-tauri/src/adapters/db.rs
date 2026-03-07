@@ -25,8 +25,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, MIGRATION_0005),
 ];
 
-const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 1_024;
-const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 2_048;
+const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 400;
+const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 800;
 const MAX_COMMIT_WINDOW_LIMIT: usize = 5_000;
 
 pub fn open_database(db_path: &Path) -> AppResult<Connection> {

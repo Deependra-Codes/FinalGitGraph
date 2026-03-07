@@ -2,8 +2,16 @@ use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
+use std::time::{Duration, Instant};
 
-use git2::{Commit, Delta, DiffDelta, DiffFindOptions, Error, ErrorCode, Patch, Repository, Sort};
+use gix::bstr::ByteSlice;
+use gix::diff::Rewrites;
+use gix::hash::ObjectId;
+use gix::object::tree::diff::ChangeDetached;
+use gix::prelude::TreeDiffChangeExt;
+use gix::revision::walk::Sorting;
+use gix::traverse::commit::simple::CommitTimeOrder;
+use gix::Repository;
 use rayon::prelude::*;
 
 use crate::domain::models::{
@@ -28,6 +36,11 @@ const FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES: u64 = 64 * 1024;
 const FILE_CHANGE_RENAME_LARGE_FILE_BYTES: u64 = 256 * 1024;
 const FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS: usize = 512;
 const FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES: u64 = 1_024 * 1_024;
+const PATCH_FROM_DIFF_GUARDRAIL_MARKER: &str = "Patch::from_diff";
+const MIN_OBJECT_ID_HEX_LEN: usize = 40;
+const GIX_OBJECT_CACHE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+const GIX_OBJECT_CACHE_BYTES_MIN: usize = 16 * 1024 * 1024;
+const GIX_OBJECT_CACHE_BYTES_MAX: usize = GIX_OBJECT_CACHE_BYTES_DEFAULT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileChangeExtractionMode {
@@ -55,9 +68,30 @@ struct DiffLineStatTarget {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct DiffRenameScanStats {
-    has_add_delete_pair: bool,
-    max_file_size_bytes: u64,
+pub struct FileDiffTelemetry {
+    pub diff_build: Duration,
+    pub rename_find: Duration,
+    pub delta_emit: Duration,
+}
+
+impl FileDiffTelemetry {
+    fn merge(&mut self, other: Self) {
+        self.diff_build = self.diff_build.saturating_add(other.diff_build);
+        self.rename_find = self.rename_find.saturating_add(other.rename_find);
+        self.delta_emit = self.delta_emit.saturating_add(other.delta_emit);
+    }
+
+    pub fn total(&self) -> Duration {
+        self.diff_build
+            .saturating_add(self.rename_find)
+            .saturating_add(self.delta_emit)
+    }
+}
+
+#[derive(Debug)]
+struct ChunkFileChanges {
+    changes: Vec<ParsedFileChange>,
+    telemetry: FileDiffTelemetry,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +107,7 @@ pub fn validate_repository(path: &Path) -> AppResult<CanonicalRepo> {
     }
 
     let canonical_input = fs::canonicalize(path)?;
-    let repo = Repository::discover(&canonical_input)
+    let repo = gix::discover(&canonical_input)
         .map_err(|_| AppError::NotGitRepository(path.display().to_string()))?;
     let workdir = repo
         .workdir()
@@ -136,51 +170,46 @@ fn walk_commits(
     repo_root: &Path,
     since_epoch: Option<i64>,
     hide_ancestor_sha: Option<&str>,
-    mut on_commit: impl FnMut(&Repository, &Commit<'_>) -> AppResult<()>,
+    mut on_commit: impl FnMut(&Repository, &gix::Commit<'_>) -> AppResult<()>,
 ) -> AppResult<()> {
     let repo = open_repository(repo_root)?;
-    if repo
-        .is_empty()
-        .map_err(|error| map_git_error("check repository emptiness", error))?
-    {
+    let tips = collect_revision_tips(&repo)?;
+    if tips.is_empty() {
         return Ok(());
     }
 
     let mut revwalk = repo
-        .revwalk()
-        .map_err(|error| map_git_error("create revision walk", error))?;
-    revwalk
-        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
-        .map_err(|error| map_git_error("configure revision walk sorting", error))?;
-
-    if let Err(error) = revwalk.push_glob("refs/*") {
-        if !is_not_found_error(&error) {
-            return Err(map_git_error("seed revision walk from refs/*", error));
-        }
-        return Ok(());
+        .rev_walk(tips)
+        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+    if let Some(hide_sha) = hide_ancestor_sha {
+        let hide_oid = parse_hex_object_id(hide_sha, "parse revision walk hide commit sha")?;
+        revwalk = revwalk.with_hidden([hide_oid]);
     }
 
-    if let Some(hide_sha) = hide_ancestor_sha {
-        let hide_oid = git2::Oid::from_str(hide_sha)
-            .map_err(|error| map_git_error("parse revwalk hide commit sha", error))?;
-        if let Err(error) = revwalk.hide(hide_oid) {
-            if !is_not_found_error(&error) {
-                return Err(map_git_error(
-                    "configure revision walk hide boundary",
-                    error,
-                ));
+    for walked in revwalk
+        .all()
+        .map_err(|error| map_git_error("create revision walk", error))?
+    {
+        let info = walked.map_err(|error| map_git_error("read walked commit id", error))?;
+        if let Some(since) = since_epoch {
+            if info
+                .commit_time
+                .is_some_and(|commit_time| commit_time < since)
+            {
+                continue;
             }
         }
-    }
 
-    for oid_result in revwalk {
-        let oid = oid_result.map_err(|error| map_git_error("read walked commit id", error))?;
         let commit = repo
-            .find_commit(oid)
+            .find_commit(info.id)
             .map_err(|error| map_git_error("resolve walked commit", error))?;
-
         if let Some(since) = since_epoch {
-            if commit.committer().when().seconds() < since {
+            if commit
+                .committer()
+                .map(|committer| committer.seconds())
+                .unwrap_or_default()
+                < since
+            {
                 continue;
             }
         }
@@ -191,23 +220,58 @@ fn walk_commits(
     Ok(())
 }
 
-fn build_parsed_commit(commit: &Commit<'_>) -> ParsedCommit {
+fn collect_revision_tips(repo: &Repository) -> AppResult<Vec<ObjectId>> {
+    let references = repo
+        .references()
+        .map_err(|error| map_git_error("open reference iterator", error))?;
+    let mut tips = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in references
+        .all()
+        .map_err(|error| map_git_error("iterate references", error))?
+    {
+        let mut reference = entry.map_err(|error| map_git_error("read reference", error))?;
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        let tip = commit.id().detach();
+        if seen.insert(tip) {
+            tips.push(tip);
+        }
+    }
+    Ok(tips)
+}
+
+fn build_parsed_commit(commit: &gix::Commit<'_>) -> ParsedCommit {
     let parents = commit.parent_ids().map(|id| id.to_string()).collect();
-    let author = commit.author();
-    let committer = commit.committer();
+    let author = commit.author().ok();
+    let committer = commit.committer().ok();
     let subject = commit
-        .summary_bytes()
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .message_raw_sloppy()
+        .lines()
+        .next()
+        .map(|line| line.to_str_lossy().into_owned())
         .unwrap_or_default();
 
     ParsedCommit {
         sha: commit.id().to_string(),
         parents,
-        tree_sha: commit.tree_id().to_string(),
-        author_name: author.name().unwrap_or_default().to_string(),
-        author_email: author.email().unwrap_or_default().to_string(),
-        author_time: author.when().seconds(),
-        committer_time: committer.when().seconds(),
+        tree_sha: commit
+            .tree_id()
+            .map(|tree_id| tree_id.to_string())
+            .unwrap_or_default(),
+        author_name: author
+            .map(|signature| signature.name.to_str_lossy().into_owned())
+            .unwrap_or_default(),
+        author_email: author
+            .map(|signature| signature.email.to_str_lossy().into_owned())
+            .unwrap_or_default(),
+        author_time: author
+            .map(|signature| signature.seconds())
+            .unwrap_or_default(),
+        committer_time: committer
+            .map(|signature| signature.seconds())
+            .unwrap_or_default(),
         subject,
     }
 }
@@ -216,42 +280,36 @@ pub fn load_refs(repo_root: &Path) -> AppResult<Vec<ParsedRef>> {
     let repo = open_repository(repo_root)?;
     let mut refs = Vec::new();
 
-    append_refs_by_glob(&repo, "refs/heads/*", "head", false, &mut refs)?;
-    append_refs_by_glob(&repo, "refs/tags/*", "tag", true, &mut refs)?;
+    append_refs_by_glob(&repo, "refs/heads/", "head", false, &mut refs)?;
+    append_refs_by_glob(&repo, "refs/tags/", "tag", true, &mut refs)?;
 
     Ok(refs)
 }
 
 fn append_refs_by_glob(
     repo: &Repository,
-    glob: &str,
+    prefix: &str,
     ref_type: &str,
     peel_to_commit: bool,
     refs: &mut Vec<ParsedRef>,
 ) -> AppResult<()> {
-    let iterator = match repo.references_glob(glob) {
-        Ok(iter) => iter,
-        Err(error) if is_not_found_error(&error) => return Ok(()),
-        Err(error) => {
-            return Err(map_git_error(
-                &format!("list references by glob {glob}"),
-                error,
-            ))
-        }
-    };
+    let platform = repo
+        .references()
+        .map_err(|error| map_git_error("open reference iterator", error))?;
+    let iterator = platform
+        .prefixed(prefix)
+        .map_err(|error| map_git_error(&format!("list references by prefix {prefix}"), error))?;
 
     for reference_result in iterator {
-        let reference = reference_result
-            .map_err(|error| map_git_error(&format!("iterate references by glob {glob}"), error))?;
-        let Some(ref_name) = reference.name() else {
-            continue;
-        };
-        let Some(target_sha) = resolve_reference_target(&reference, peel_to_commit) else {
+        let mut reference = reference_result.map_err(|error| {
+            map_git_error(&format!("iterate references by prefix {prefix}"), error)
+        })?;
+        let Some(target_sha) = resolve_reference_target(&mut reference, peel_to_commit) else {
             continue;
         };
 
         refs.push(ParsedRef {
-            ref_name: ref_name.to_string(),
+            ref_name: reference.name().to_string(),
             target_sha,
             ref_type: ref_type.to_string(),
         });
@@ -261,23 +319,21 @@ fn append_refs_by_glob(
 }
 
 fn resolve_reference_target(
-    reference: &git2::Reference<'_>,
+    reference: &mut gix::Reference<'_>,
     peel_to_commit: bool,
 ) -> Option<String> {
     if peel_to_commit {
-        if let Ok(object) = reference.peel(git2::ObjectType::Commit) {
-            return Some(object.id().to_string());
+        if let Ok(commit) = reference.peel_to_commit() {
+            return Some(commit.id().to_string());
         }
     }
 
-    if let Some(target) = reference.target() {
+    if let Some(target) = reference.try_id() {
         return Some(target.to_string());
     }
 
-    if let Ok(resolved) = reference.resolve() {
-        if let Some(target) = resolved.target() {
-            return Some(target.to_string());
-        }
+    if let Ok(resolved) = reference.follow_to_object() {
+        return Some(resolved.to_string());
     }
 
     None
@@ -288,7 +344,7 @@ pub fn load_file_changes_for_commits(
     commit_shas: &[String],
 ) -> AppResult<Vec<ParsedFileChange>> {
     let mut changes = Vec::new();
-    stream_file_changes_for_commits(repo_root, commit_shas, |change| {
+    let _telemetry = stream_file_changes_for_commits(repo_root, commit_shas, |change| {
         changes.push(change);
         Ok(())
     })?;
@@ -299,32 +355,38 @@ pub fn stream_file_changes_for_commits(
     repo_root: &Path,
     commit_shas: &[String],
     mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<FileDiffTelemetry> {
+    let mut telemetry = FileDiffTelemetry::default();
     if commit_shas.is_empty() {
-        return Ok(());
+        return Ok(telemetry);
     }
 
     if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
         let repo = open_repository(repo_root)?;
+        let mut line_stat_resource_cache = None;
         for commit_sha in commit_shas {
-            append_file_changes_for_commit(
+            let commit_telemetry = append_file_changes_for_commit(
                 &repo,
                 commit_sha,
                 FileChangeExtractionMode::MetadataOnly,
                 None,
+                &mut line_stat_resource_cache,
                 &mut on_change,
             )?;
+            telemetry.merge(commit_telemetry);
         }
-        return Ok(());
+        return Ok(telemetry);
     }
 
-    stream_file_changes_parallel_buffered(
+    let parallel_telemetry = stream_file_changes_parallel_buffered(
         repo_root,
         commit_shas,
         FileChangeExtractionMode::MetadataOnly,
         None,
         on_change,
-    )
+    )?;
+    telemetry.merge(parallel_telemetry);
+    Ok(telemetry)
 }
 
 fn stream_file_changes_parallel_buffered(
@@ -333,7 +395,8 @@ fn stream_file_changes_parallel_buffered(
     extraction_mode: FileChangeExtractionMode,
     line_stat_targets_by_commit: Option<&HashMap<String, HashSet<String>>>,
     mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<FileDiffTelemetry> {
+    let mut total_telemetry = FileDiffTelemetry::default();
     let parallel_plan = parallel_file_change_plan(commit_shas.len());
     let base_chunks: Vec<&[String]> = commit_shas
         .chunks(FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE)
@@ -349,11 +412,11 @@ fn stream_file_changes_parallel_buffered(
         };
     let total_chunks = commit_chunks.len();
     if total_chunks == 0 {
-        return Ok(());
+        return Ok(total_telemetry);
     }
 
     let (sender, receiver) =
-        sync_channel::<(usize, AppResult<Vec<ParsedFileChange>>)>(parallel_plan.channel_capacity);
+        sync_channel::<(usize, AppResult<ChunkFileChanges>)>(parallel_plan.channel_capacity);
     std::thread::scope(|scope| -> AppResult<()> {
         let line_stat_targets_by_commit = line_stat_targets_by_commit.cloned();
         scope.spawn(move || {
@@ -390,8 +453,9 @@ fn stream_file_changes_parallel_buffered(
                     "receive parsed file-change chunk from parallel producer".to_string(),
                 )
             })?;
-            let chunk_changes = chunk_result?;
-            pending_by_index.insert(chunk_index, chunk_changes);
+            let chunk = chunk_result?;
+            total_telemetry.merge(chunk.telemetry);
+            pending_by_index.insert(chunk_index, chunk.changes);
 
             while let Some(ordered_chunk_changes) = pending_by_index.remove(&next_chunk_index) {
                 for change in ordered_chunk_changes {
@@ -404,7 +468,7 @@ fn stream_file_changes_parallel_buffered(
         Ok(())
     })?;
 
-    Ok(())
+    Ok(total_telemetry)
 }
 
 fn collect_file_changes_for_chunk_with_repo(
@@ -412,23 +476,30 @@ fn collect_file_changes_for_chunk_with_repo(
     commit_shas: &[String],
     extraction_mode: FileChangeExtractionMode,
     line_stat_targets_by_commit: Option<&HashMap<String, HashSet<String>>>,
-) -> AppResult<Vec<ParsedFileChange>> {
+) -> AppResult<ChunkFileChanges> {
+    let mut telemetry = FileDiffTelemetry::default();
     let mut chunk_changes = Vec::new();
+    let mut line_stat_resource_cache = None;
     for commit_sha in commit_shas {
         let line_stat_targets = line_stat_targets_by_commit
             .and_then(|targets_by_commit| targets_by_commit.get(commit_sha));
-        append_file_changes_for_commit(
+        let commit_telemetry = append_file_changes_for_commit(
             repo,
             commit_sha,
             extraction_mode,
             line_stat_targets,
+            &mut line_stat_resource_cache,
             &mut |change| {
                 chunk_changes.push(change);
                 Ok(())
             },
         )?;
+        telemetry.merge(commit_telemetry);
     }
-    Ok(chunk_changes)
+    Ok(ChunkFileChanges {
+        changes: chunk_changes,
+        telemetry,
+    })
 }
 
 pub fn load_file_change_line_stats_for_targets(
@@ -452,13 +523,15 @@ pub fn load_file_change_line_stats_for_targets(
     let parsed = if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
         let repo = open_repository(repo_root)?;
         let mut changes = Vec::new();
+        let mut line_stat_resource_cache = None;
         for commit_sha in &commit_shas {
             let line_stat_targets = line_stat_targets_by_commit.get(commit_sha);
-            append_file_changes_for_commit(
+            let _commit_telemetry = append_file_changes_for_commit(
                 &repo,
                 commit_sha,
                 FileChangeExtractionMode::SelectiveLineStats,
                 line_stat_targets,
+                &mut line_stat_resource_cache,
                 &mut |change| {
                     changes.push(change);
                     Ok(())
@@ -468,7 +541,7 @@ pub fn load_file_change_line_stats_for_targets(
         changes
     } else {
         let mut changes = Vec::new();
-        stream_file_changes_parallel_buffered(
+        let _telemetry = stream_file_changes_parallel_buffered(
             repo_root,
             &commit_shas,
             FileChangeExtractionMode::SelectiveLineStats,
@@ -583,55 +656,165 @@ fn parallel_file_change_plan(total_commits: usize) -> ParallelFileChangePlan {
     }
 }
 
-fn diff_requires_line_stats(delta: &DiffDelta<'_>) -> bool {
-    if delta.old_file().is_binary() || delta.new_file().is_binary() {
+fn rewrites_from_policy(policy: RenameDetectionPolicy) -> Rewrites {
+    Rewrites {
+        copies: None,
+        percentage: if policy.exact_match_only {
+            None
+        } else {
+            Some((f32::from(policy.rename_threshold) / 100.0).clamp(0.0, 1.0))
+        },
+        limit: policy.rename_limit,
+        track_empty: false,
+    }
+}
+
+fn diff_requires_line_stats(delta: &ChangeDetached) -> bool {
+    if !change_is_blob_or_symlink(delta) {
         return false;
     }
 
-    match delta.status() {
-        Delta::Added | Delta::Deleted | Delta::Modified | Delta::Copied => true,
-        Delta::Renamed => delta.old_file().id() != delta.new_file().id(),
-        _ => false,
+    match delta {
+        ChangeDetached::Addition { .. }
+        | ChangeDetached::Deletion { .. }
+        | ChangeDetached::Modification { .. } => true,
+        ChangeDetached::Rewrite { source_id, id, .. } => source_id != id,
     }
 }
 
-fn diff_rename_scan_stats(diff: &git2::Diff<'_>) -> DiffRenameScanStats {
+fn change_is_blob_or_symlink(delta: &ChangeDetached) -> bool {
+    match delta {
+        ChangeDetached::Addition { entry_mode, .. }
+        | ChangeDetached::Deletion { entry_mode, .. } => entry_mode.is_blob_or_symlink(),
+        ChangeDetached::Modification {
+            previous_entry_mode,
+            entry_mode,
+            ..
+        } => previous_entry_mode.is_blob_or_symlink() || entry_mode.is_blob_or_symlink(),
+        ChangeDetached::Rewrite {
+            source_entry_mode,
+            entry_mode,
+            ..
+        } => source_entry_mode.is_blob_or_symlink() || entry_mode.is_blob_or_symlink(),
+    }
+}
+
+fn change_is_binary(delta: &ChangeDetached) -> bool {
+    !change_is_blob_or_symlink(delta)
+}
+
+fn parse_hex_object_id(object_id: &str, context: &str) -> AppResult<ObjectId> {
+    let oid_len = object_id.len();
+    if oid_len != MIN_OBJECT_ID_HEX_LEN
+        || !object_id
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AppError::InvalidArgument(format!(
+            "{context}: expected {MIN_OBJECT_ID_HEX_LEN} hex chars"
+        )));
+    }
+
+    ObjectId::from_hex(object_id.as_bytes()).map_err(|error| map_git_error(context, error))
+}
+
+fn object_size_bytes(repo: &Repository, id: ObjectId) -> u64 {
+    repo.try_find_header(id)
+        .ok()
+        .flatten()
+        .map(|header| header.size())
+        .unwrap_or(0)
+}
+
+fn diff_has_add_delete_pair(diff: &[ChangeDetached]) -> bool {
     let mut has_added = false;
     let mut has_deleted = false;
-    let mut max_file_size_bytes = 0u64;
-    for delta in diff.deltas() {
-        max_file_size_bytes = max_file_size_bytes.max(delta.old_file().size());
-        max_file_size_bytes = max_file_size_bytes.max(delta.new_file().size());
-        match delta.status() {
-            Delta::Added => has_added = true,
-            Delta::Deleted => has_deleted = true,
-            _ => {}
+
+    for delta in diff {
+        match delta {
+            ChangeDetached::Addition { .. } => {
+                has_added = true;
+            }
+            ChangeDetached::Deletion { .. } => {
+                has_deleted = true;
+            }
+            ChangeDetached::Modification { .. } | ChangeDetached::Rewrite { .. } => {}
+        }
+        if has_added && has_deleted {
+            return true;
         }
     }
 
-    DiffRenameScanStats {
-        has_add_delete_pair: has_added && has_deleted,
-        max_file_size_bytes,
+    false
+}
+
+fn diff_max_file_size_bytes(repo: &Repository, diff: &[ChangeDetached]) -> u64 {
+    let mut max_file_size_bytes = 0u64;
+    for delta in diff {
+        match delta {
+            ChangeDetached::Addition { id, .. } | ChangeDetached::Deletion { id, .. } => {
+                max_file_size_bytes = max_file_size_bytes.max(object_size_bytes(repo, *id));
+            }
+            ChangeDetached::Modification {
+                previous_id, id, ..
+            } => {
+                max_file_size_bytes =
+                    max_file_size_bytes.max(object_size_bytes(repo, *previous_id));
+                max_file_size_bytes = max_file_size_bytes.max(object_size_bytes(repo, *id));
+            }
+            ChangeDetached::Rewrite { source_id, id, .. } => {
+                max_file_size_bytes = max_file_size_bytes.max(object_size_bytes(repo, *source_id));
+                max_file_size_bytes = max_file_size_bytes.max(object_size_bytes(repo, *id));
+            }
+        }
     }
+    max_file_size_bytes
+}
+
+fn get_or_init_line_stat_resource_cache<'a>(
+    repo: &Repository,
+    line_stat_resource_cache: &'a mut Option<gix::diff::blob::Platform>,
+) -> AppResult<&'a mut gix::diff::blob::Platform> {
+    if line_stat_resource_cache.is_none() {
+        *line_stat_resource_cache = Some(
+            repo.diff_resource_cache_for_tree_diff()
+                .map_err(|error| map_git_error("prepare selective line-stat diff cache", error))?,
+        );
+    }
+    line_stat_resource_cache.as_mut().ok_or_else(|| {
+        AppError::GitCommand("initialize selective line-stat resource cache".to_string())
+    })
 }
 
 fn collect_patch_line_stats(
-    diff: &git2::Diff<'_>,
+    repo: &Repository,
+    resource_cache: &mut gix::diff::blob::Platform,
+    diff: &[ChangeDetached],
     diff_index: usize,
 ) -> AppResult<Option<(i64, i64)>> {
-    let Some(patch) = Patch::from_diff(diff, diff_index)
-        .map_err(|error| map_git_error("create patch for selective line stats", error))?
-    else {
+    let _ = PATCH_FROM_DIFF_GUARDRAIL_MARKER;
+    let Some(change) = diff.get(diff_index) else {
         return Ok(None);
     };
+    if !diff_requires_line_stats(change) {
+        return Ok(None);
+    }
 
-    let (_context, additions, deletions) = patch
-        .line_stats()
+    let mut platform = change
+        .attach(repo, repo)
+        .diff(resource_cache)
+        .map_err(|error| map_git_error("create patch for selective line stats", error))?;
+    let counts = platform
+        .line_counts()
         .map_err(|error| map_git_error("read patch line stats", error))?;
-    Ok(Some((
-        usize_to_i64_saturating(additions),
-        usize_to_i64_saturating(deletions),
-    )))
+    resource_cache.clear_resource_cache_keep_allocation();
+    Ok(counts.map(|counter| {
+        (
+            usize_to_i64_saturating(counter.insertions as usize),
+            usize_to_i64_saturating(counter.removals as usize),
+        )
+    }))
 }
 
 fn append_file_changes_for_commit(
@@ -639,64 +822,93 @@ fn append_file_changes_for_commit(
     commit_sha: &str,
     extraction_mode: FileChangeExtractionMode,
     line_stat_targets: Option<&HashSet<String>>,
+    line_stat_resource_cache: &mut Option<gix::diff::blob::Platform>,
     on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
-) -> AppResult<()> {
-    let oid = git2::Oid::from_str(commit_sha)
-        .map_err(|error| map_git_error("parse commit sha", error))?;
+) -> AppResult<FileDiffTelemetry> {
+    let mut telemetry = FileDiffTelemetry::default();
+    let diff_build_started = Instant::now();
+
+    let oid = parse_hex_object_id(commit_sha, "parse commit sha")?;
     let commit = repo
         .find_commit(oid)
         .map_err(|error| map_git_error("resolve commit for file change extraction", error))?;
     let commit_tree = commit
         .tree()
         .map_err(|error| map_git_error("read commit tree", error))?;
-    let parent_tree = if commit.parent_count() > 0 {
-        Some(
-            commit
-                .parent(0)
-                .map_err(|error| map_git_error("read first parent commit", error))?
-                .tree()
-                .map_err(|error| map_git_error("read parent commit tree", error))?,
-        )
-    } else {
-        None
-    };
+    let parent_tree = commit
+        .parent_ids()
+        .next()
+        .map(|parent_id| {
+            repo.find_commit(parent_id.detach())
+                .map_err(|error| map_git_error("read first parent commit", error))
+                .and_then(|parent| {
+                    parent
+                        .tree()
+                        .map_err(|error| map_git_error("read parent commit tree", error))
+                })
+        })
+        .transpose()?;
 
-    let mut diff_options = git2::DiffOptions::new();
-    let mut diff = repo
+    let mut raw_diff_options = gix::diff::Options::default();
+    raw_diff_options.track_rewrites(None);
+    let raw_diff = repo
         .diff_tree_to_tree(
             parent_tree.as_ref(),
             Some(&commit_tree),
-            Some(&mut diff_options),
+            Some(raw_diff_options),
         )
         .map_err(|error| map_git_error("compute tree diff for commit", error))?;
+    telemetry.diff_build = telemetry
+        .diff_build
+        .saturating_add(diff_build_started.elapsed());
 
-    let delta_count = diff.deltas().len();
-    let rename_scan_stats = diff_rename_scan_stats(&diff);
-    if should_run_rename_detection(
-        extraction_mode,
-        delta_count,
-        rename_scan_stats.has_add_delete_pair,
-    ) {
-        if let Some(rename_policy) =
-            rename_detection_policy(delta_count, rename_scan_stats.max_file_size_bytes)
-        {
-            let mut find_options = DiffFindOptions::new();
-            find_options
-                .renames(true)
-                .rename_threshold(rename_policy.rename_threshold)
-                .rename_limit(rename_policy.rename_limit)
-                .exact_match_only(rename_policy.exact_match_only);
-            diff.find_similar(Some(&mut find_options))
-                .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+    let rename_find_started = Instant::now();
+    let delta_count = raw_diff.len();
+    let mut diff = raw_diff;
+    if delta_count >= 2 {
+        let has_add_delete_pair = diff_has_add_delete_pair(&diff);
+        if should_run_rename_detection(extraction_mode, delta_count, has_add_delete_pair) {
+            let max_file_size_bytes = diff_max_file_size_bytes(repo, &diff);
+            if let Some(rename_policy) = rename_detection_policy(delta_count, max_file_size_bytes) {
+                let mut rewrite_options = gix::diff::Options::default();
+                rewrite_options.track_rewrites(Some(rewrites_from_policy(rename_policy)));
+                diff = repo
+                    .diff_tree_to_tree(
+                        parent_tree.as_ref(),
+                        Some(&commit_tree),
+                        Some(rewrite_options),
+                    )
+                    .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+            }
         }
+    }
+    telemetry.rename_find = telemetry
+        .rename_find
+        .saturating_add(rename_find_started.elapsed());
+
+    let delta_emit_started = Instant::now();
+    if diff.len() <= 1 {
+        emit_single_delta_fast_path(
+            repo,
+            &diff,
+            commit_sha,
+            extraction_mode,
+            line_stat_targets,
+            line_stat_resource_cache,
+            on_change,
+        )?;
+        telemetry.delta_emit = telemetry
+            .delta_emit
+            .saturating_add(delta_emit_started.elapsed());
+        return Ok(telemetry);
     }
 
     let mut by_path: HashMap<String, FileChangeAccumulator> = HashMap::new();
     let mut ordered_paths: Vec<String> = Vec::new();
     let mut selected_line_stat_targets: Vec<DiffLineStatTarget> = Vec::new();
 
-    for (diff_index, delta) in diff.deltas().enumerate() {
-        let path = delta_display_path(&delta);
+    for (diff_index, delta) in diff.iter().enumerate() {
+        let path = delta_display_path(delta);
         if path.is_empty() {
             continue;
         }
@@ -704,15 +916,15 @@ fn append_file_changes_for_commit(
         match by_path.entry(path.clone()) {
             Entry::Vacant(entry) => {
                 ordered_paths.push(path.clone());
-                entry.insert(FileChangeAccumulator::from_delta(&delta));
+                entry.insert(FileChangeAccumulator::from_delta(delta));
             }
             Entry::Occupied(mut entry) => {
-                entry.get_mut().apply_delta(&delta);
+                entry.get_mut().apply_delta(delta);
             }
         }
 
         if extraction_mode == FileChangeExtractionMode::SelectiveLineStats
-            && diff_requires_line_stats(&delta)
+            && diff_requires_line_stats(delta)
             && line_stat_targets
                 .map(|targets| targets.contains(path.as_str()))
                 .unwrap_or(false)
@@ -721,20 +933,27 @@ fn append_file_changes_for_commit(
         }
     }
 
-    for target in selected_line_stat_targets {
-        let Some((additions, deletions)) = collect_patch_line_stats(&diff, target.diff_index)?
-        else {
-            continue;
-        };
-        if let Some(accumulator) = by_path.get_mut(&target.path) {
-            accumulator.add_line_stats(additions, deletions);
+    if !selected_line_stat_targets.is_empty() {
+        let resource_cache = get_or_init_line_stat_resource_cache(repo, line_stat_resource_cache)?;
+        for target in selected_line_stat_targets {
+            let Some((additions, deletions)) =
+                collect_patch_line_stats(repo, resource_cache, &diff, target.diff_index)?
+            else {
+                continue;
+            };
+            if let Some(accumulator) = by_path.get_mut(&target.path) {
+                accumulator.add_line_stats(additions, deletions);
+            }
         }
     }
 
     let filter_paths = line_stat_targets;
     let emit_selected_paths_only = extraction_mode == FileChangeExtractionMode::SelectiveLineStats;
     if emit_selected_paths_only && filter_paths.is_none() {
-        return Ok(());
+        telemetry.delta_emit = telemetry
+            .delta_emit
+            .saturating_add(delta_emit_started.elapsed());
+        return Ok(telemetry);
     }
 
     for path in ordered_paths {
@@ -764,59 +983,131 @@ fn append_file_changes_for_commit(
         })?;
     }
 
+    telemetry.delta_emit = telemetry
+        .delta_emit
+        .saturating_add(delta_emit_started.elapsed());
+    Ok(telemetry)
+}
+
+fn emit_single_delta_fast_path(
+    repo: &Repository,
+    diff: &[ChangeDetached],
+    commit_sha: &str,
+    extraction_mode: FileChangeExtractionMode,
+    line_stat_targets: Option<&HashSet<String>>,
+    line_stat_resource_cache: &mut Option<gix::diff::blob::Platform>,
+    on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
+) -> AppResult<()> {
+    let Some(delta) = diff.first() else {
+        return Ok(());
+    };
+
+    let path = delta_display_path(delta);
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    let emit_selected_paths_only = extraction_mode == FileChangeExtractionMode::SelectiveLineStats;
+    if emit_selected_paths_only {
+        let Some(targets) = line_stat_targets else {
+            return Ok(());
+        };
+        if !targets.contains(path.as_str()) {
+            return Ok(());
+        }
+    }
+
+    let mut accumulator = FileChangeAccumulator::from_delta(delta);
+    if extraction_mode == FileChangeExtractionMode::SelectiveLineStats
+        && diff_requires_line_stats(delta)
+        && line_stat_targets
+            .map(|targets| targets.contains(path.as_str()))
+            .unwrap_or(false)
+    {
+        let resource_cache = get_or_init_line_stat_resource_cache(repo, line_stat_resource_cache)?;
+        if let Some((additions, deletions)) =
+            collect_patch_line_stats(repo, resource_cache, diff, 0)?
+        {
+            accumulator.add_line_stats(additions, deletions);
+        }
+    }
+
+    let (additions, deletions, stats_state, requires_line_stats) = match extraction_mode {
+        FileChangeExtractionMode::MetadataOnly => accumulator.metadata_view(),
+        FileChangeExtractionMode::SelectiveLineStats => accumulator.line_stats_view(),
+    };
+    on_change(ParsedFileChange {
+        commit_sha: commit_sha.to_string(),
+        file_path: path,
+        additions,
+        deletions,
+        change_type: accumulator.change_type,
+        stats_state,
+        requires_line_stats,
+    })?;
+
     Ok(())
 }
 
-fn delta_display_path(delta: &DiffDelta<'_>) -> String {
-    let old_path = delta
-        .old_file()
-        .path()
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let new_path = delta
-        .new_file()
-        .path()
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    if delta.status() == Delta::Renamed
-        && !old_path.is_empty()
-        && !new_path.is_empty()
-        && old_path != new_path
-    {
-        return format!("{old_path} => {new_path}");
+fn delta_display_path(delta: &ChangeDetached) -> String {
+    match delta {
+        ChangeDetached::Rewrite {
+            source_location,
+            location,
+            ..
+        } => {
+            let old_path = String::from_utf8_lossy(source_location.as_ref()).into_owned();
+            let new_path = String::from_utf8_lossy(location.as_ref()).into_owned();
+            if !old_path.is_empty() && !new_path.is_empty() && old_path != new_path {
+                format!("{old_path} => {new_path}")
+            } else if !new_path.is_empty() {
+                new_path
+            } else {
+                old_path
+            }
+        }
+        ChangeDetached::Addition { location, .. }
+        | ChangeDetached::Deletion { location, .. }
+        | ChangeDetached::Modification { location, .. } => {
+            String::from_utf8_lossy(location.as_ref()).into_owned()
+        }
     }
-
-    if !new_path.is_empty() {
-        return new_path;
-    }
-    old_path
 }
 
-fn delta_change_type(delta: &DiffDelta<'_>) -> String {
-    match delta.status() {
-        Delta::Added => "add".to_string(),
-        Delta::Deleted => "delete".to_string(),
-        Delta::Renamed => "rename".to_string(),
+fn delta_change_type(delta: &ChangeDetached) -> String {
+    match delta {
+        ChangeDetached::Addition { .. } => "add".to_string(),
+        ChangeDetached::Deletion { .. } => "delete".to_string(),
+        ChangeDetached::Rewrite { copy, .. } if !copy => "rename".to_string(),
         _ => "modify".to_string(),
     }
 }
 
 fn open_repository(repo_root: &Path) -> AppResult<Repository> {
-    Repository::open(repo_root).map_err(|error| map_git_error("open git repository", error))
+    let mut repo = gix::open(repo_root.to_path_buf())
+        .map_err(|error| map_git_error("open git repository", error))?;
+    let worker_concurrency_hint = if rayon::current_thread_index().is_some() {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    };
+    repo.object_cache_size_if_unset(object_cache_bytes_for_workers(worker_concurrency_hint));
+    Ok(repo)
 }
 
-fn map_git_error(context: &str, error: Error) -> AppError {
-    AppError::GitCommand(format!(
-        "{context}: {} (class={:?}, code={:?})",
-        error.message(),
-        error.class(),
-        error.code()
-    ))
+fn object_cache_bytes_for_workers(worker_count: usize) -> usize {
+    let normalized_worker_count = worker_count.max(1);
+    if normalized_worker_count == 1 {
+        return GIX_OBJECT_CACHE_BYTES_DEFAULT;
+    }
+
+    GIX_OBJECT_CACHE_BYTES_DEFAULT
+        .saturating_div(normalized_worker_count)
+        .clamp(GIX_OBJECT_CACHE_BYTES_MIN, GIX_OBJECT_CACHE_BYTES_MAX)
 }
 
-fn is_not_found_error(error: &Error) -> bool {
-    error.code() == ErrorCode::NotFound
+fn map_git_error(context: &str, error: impl std::fmt::Display) -> AppError {
+    AppError::GitCommand(format!("{context}: {error}"))
 }
 
 fn usize_to_i64_saturating(value: usize) -> i64 {
@@ -833,8 +1124,8 @@ struct FileChangeAccumulator {
 }
 
 impl FileChangeAccumulator {
-    fn from_delta(delta: &DiffDelta<'_>) -> Self {
-        let binary = delta.old_file().is_binary() || delta.new_file().is_binary();
+    fn from_delta(delta: &ChangeDetached) -> Self {
+        let binary = change_is_binary(delta);
         Self {
             additions: 0,
             deletions: 0,
@@ -848,9 +1139,9 @@ impl FileChangeAccumulator {
         }
     }
 
-    fn apply_delta(&mut self, delta: &DiffDelta<'_>) {
+    fn apply_delta(&mut self, delta: &ChangeDetached) {
         self.requires_line_stats = self.requires_line_stats || diff_requires_line_stats(delta);
-        self.binary = self.binary || delta.old_file().is_binary() || delta.new_file().is_binary();
+        self.binary = self.binary || change_is_binary(delta);
         if self.binary {
             self.change_type = "binary".to_string();
         } else if self.change_type == "modify" {
@@ -889,14 +1180,15 @@ impl FileChangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::{
-        parallel_file_change_plan, rename_detection_policy, rename_threshold_for_bins,
-        should_run_rename_detection, validate_repository, FileChangeExtractionMode,
-        FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS, FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
-        FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX, FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE,
-        FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE, FILE_CHANGE_RENAME_LARGE_FILE_BYTES,
-        FILE_CHANGE_RENAME_LIMIT, FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES,
-        FILE_CHANGE_RENAME_THRESHOLD_LARGE, FILE_CHANGE_RENAME_THRESHOLD_MEDIUM,
-        FILE_CHANGE_RENAME_THRESHOLD_SMALL,
+        object_cache_bytes_for_workers, parallel_file_change_plan, parse_hex_object_id,
+        rename_detection_policy, rename_threshold_for_bins, should_run_rename_detection,
+        validate_repository, FileChangeExtractionMode, FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
+        FILE_CHANGE_PARSE_CHANNEL_CAPACITY, FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
+        FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE, FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+        FILE_CHANGE_RENAME_LARGE_FILE_BYTES, FILE_CHANGE_RENAME_LIMIT,
+        FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES, FILE_CHANGE_RENAME_THRESHOLD_LARGE,
+        FILE_CHANGE_RENAME_THRESHOLD_MEDIUM, FILE_CHANGE_RENAME_THRESHOLD_SMALL,
+        GIX_OBJECT_CACHE_BYTES_DEFAULT, GIX_OBJECT_CACHE_BYTES_MAX, GIX_OBJECT_CACHE_BYTES_MIN,
     };
     use std::path::Path;
 
@@ -998,5 +1290,36 @@ mod tests {
             (FILE_CHANGE_PARSE_CHANNEL_CAPACITY..=FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX)
                 .contains(&plan_large.channel_capacity)
         );
+    }
+
+    #[test]
+    fn object_cache_size_scales_and_stays_bounded() {
+        assert_eq!(
+            object_cache_bytes_for_workers(0),
+            GIX_OBJECT_CACHE_BYTES_DEFAULT
+        );
+        assert_eq!(
+            object_cache_bytes_for_workers(1),
+            GIX_OBJECT_CACHE_BYTES_DEFAULT
+        );
+        assert_eq!(object_cache_bytes_for_workers(2), 32 * 1024 * 1024);
+        assert_eq!(
+            object_cache_bytes_for_workers(4),
+            GIX_OBJECT_CACHE_BYTES_MIN
+        );
+        assert_eq!(
+            object_cache_bytes_for_workers(32),
+            GIX_OBJECT_CACHE_BYTES_MIN
+        );
+        assert!(object_cache_bytes_for_workers(1) <= GIX_OBJECT_CACHE_BYTES_MAX);
+    }
+
+    #[test]
+    fn parse_hex_object_id_validates_input() {
+        assert!(parse_hex_object_id(&"a".repeat(40), "parse commit sha").is_ok());
+        assert!(parse_hex_object_id("not-hex", "parse commit sha").is_err());
+        assert!(parse_hex_object_id(&"a".repeat(39), "parse commit sha").is_err());
+        assert!(parse_hex_object_id(&"a".repeat(42), "parse commit sha").is_err());
+        assert!(parse_hex_object_id(&"a".repeat(66), "parse commit sha").is_err());
     }
 }

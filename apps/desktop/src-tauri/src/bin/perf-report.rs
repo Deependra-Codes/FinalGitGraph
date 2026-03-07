@@ -1437,6 +1437,12 @@ fn format_report(input: &ReportInput<'_>) -> String {
     let ingest_commit_walk_ms = full_ingestion.commit_walk + incremental_ingestion.commit_walk;
     let ingest_file_diff_extract_ms =
         full_ingestion.file_diff_extract + incremental_ingestion.file_diff_extract;
+    let ingest_file_diff_build_ms =
+        full_ingestion.file_diff_build + incremental_ingestion.file_diff_build;
+    let ingest_file_diff_rename_find_ms =
+        full_ingestion.file_diff_rename_find + incremental_ingestion.file_diff_rename_find;
+    let ingest_file_diff_delta_emit_ms =
+        full_ingestion.file_diff_delta_emit + incremental_ingestion.file_diff_delta_emit;
     let ingest_file_change_upsert_ms =
         full_ingestion.file_change_upsert + incremental_ingestion.file_change_upsert;
     let ingest_tx_commit_ms = full_ingestion.tx_commit + incremental_ingestion.tx_commit;
@@ -1564,6 +1570,9 @@ ingestion_phase_timing_ms:
   full_commit_upsert: {:.3}
   full_edge_materialize: {:.3}
   full_file_diff_extract: {:.3}
+  full_file_diff_build: {:.3}
+  full_file_diff_rename_find: {:.3}
+  full_file_diff_delta_emit: {:.3}
   full_file_change_delete: {:.3}
   full_file_change_upsert: {:.3}
   full_tx_commit: {:.3}
@@ -1571,11 +1580,17 @@ ingestion_phase_timing_ms:
   incremental_commit_upsert: {:.3}
   incremental_edge_materialize: {:.3}
   incremental_file_diff_extract: {:.3}
+  incremental_file_diff_build: {:.3}
+  incremental_file_diff_rename_find: {:.3}
+  incremental_file_diff_delta_emit: {:.3}
   incremental_file_change_delete: {:.3}
   incremental_file_change_upsert: {:.3}
   incremental_tx_commit: {:.3}
   ingest_commit_walk_ms: {:.3}
   ingest_file_diff_extract_ms: {:.3}
+  ingest_file_diff_build_ms: {:.3}
+  ingest_file_diff_rename_find_ms: {:.3}
+  ingest_file_diff_delta_emit_ms: {:.3}
   ingest_file_change_upsert_ms: {:.3}
   ingest_tx_commit_ms: {:.3}
 
@@ -1660,6 +1675,9 @@ in_memory_vs_sqlite_median_speedup:
         full_ingestion.commit_upsert,
         full_ingestion.edge_materialize,
         full_ingestion.file_diff_extract,
+        full_ingestion.file_diff_build,
+        full_ingestion.file_diff_rename_find,
+        full_ingestion.file_diff_delta_emit,
         full_ingestion.file_change_delete,
         full_ingestion.file_change_upsert,
         full_ingestion.tx_commit,
@@ -1667,11 +1685,17 @@ in_memory_vs_sqlite_median_speedup:
         incremental_ingestion.commit_upsert,
         incremental_ingestion.edge_materialize,
         incremental_ingestion.file_diff_extract,
+        incremental_ingestion.file_diff_build,
+        incremental_ingestion.file_diff_rename_find,
+        incremental_ingestion.file_diff_delta_emit,
         incremental_ingestion.file_change_delete,
         incremental_ingestion.file_change_upsert,
         incremental_ingestion.tx_commit,
         ingest_commit_walk_ms,
         ingest_file_diff_extract_ms,
+        ingest_file_diff_build_ms,
+        ingest_file_diff_rename_find_ms,
+        ingest_file_diff_delta_emit_ms,
         ingest_file_change_upsert_ms,
         ingest_tx_commit_ms,
         format_latency(input.query.commit_window),

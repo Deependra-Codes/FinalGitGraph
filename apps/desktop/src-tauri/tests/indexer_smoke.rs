@@ -109,6 +109,42 @@ fn incremental_indexing_and_commit_window_work() {
 }
 
 #[test]
+fn ingestion_diff_subphase_telemetry_is_consistent_for_zero_and_single_delta_commits() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+
+    write_file(repo_dir.join("README.md"), "v2\n");
+    git_commit(&repo_dir, "v2");
+
+    run_git(&repo_dir, &["commit", "--allow-empty", "-m", "empty"]);
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    let stats = index_commits_with_mode(&repo_str, Some(&db_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("full index: {error}"));
+
+    let telemetry = stats.ingestion_phase_timing_ms;
+    let subphase_sum = telemetry.file_diff_build
+        + telemetry.file_diff_rename_find
+        + telemetry.file_diff_delta_emit;
+    let extract_delta = (telemetry.file_diff_extract - subphase_sum).abs();
+    assert!(
+        extract_delta < 0.01,
+        "expected file_diff_extract ({}) to match sub-phase sum ({})",
+        telemetry.file_diff_extract,
+        subphase_sum
+    );
+}
+
+#[test]
 fn indexing_large_history_keeps_file_change_ingestion_correct() {
     let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
     let repo_dir = temp.path().join("repo");
