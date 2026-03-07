@@ -766,6 +766,7 @@ fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use rusqlite::{params, Connection};
@@ -913,45 +914,54 @@ mod tests {
         .expect("insert repository");
         let repo_id = tx.last_insert_rowid();
 
+        let mut commit_ids: HashMap<String, i64> = HashMap::new();
+
         let mut insert_commit = tx
             .prepare("INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)")
             .expect("prepare commit insert");
         insert_commit
             .execute(params![repo_id, "root"])
             .expect("insert root");
+        commit_ids.insert("root".to_string(), tx.last_insert_rowid());
 
         for index in 0..frontier_width {
             let sha = format!("l1-{index:05}");
             insert_commit
-                .execute(params![repo_id, sha])
+                .execute(params![repo_id, sha.as_str()])
                 .expect("insert l1 commit");
+            commit_ids.insert(sha, tx.last_insert_rowid());
         }
         for index in 0..sink_width {
             let sha = format!("l2-{index:05}");
             insert_commit
-                .execute(params![repo_id, sha])
+                .execute(params![repo_id, sha.as_str()])
                 .expect("insert l2 commit");
+            commit_ids.insert(sha, tx.last_insert_rowid());
         }
         drop(insert_commit);
 
         let mut insert_edge = tx
             .prepare(
-                "INSERT INTO commit_edges (repo_id, child_sha, parent_sha) VALUES (?1, ?2, ?3)",
+                "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
             )
             .expect("prepare edge insert");
 
         for index in 0..frontier_width {
             let child = format!("l1-{index:05}");
+            let child_id = *commit_ids.get(&child).expect("resolve l1 child id");
+            let root_id = *commit_ids.get("root").expect("resolve root id");
             insert_edge
-                .execute(params![repo_id, child, "root"])
+                .execute(params![repo_id, child_id, root_id])
                 .expect("insert root->l1 edge");
         }
         for left in 0..frontier_width {
             let parent = format!("l1-{left:05}");
+            let parent_id = *commit_ids.get(&parent).expect("resolve l1 parent id");
             for right in 0..sink_width {
                 let child = format!("l2-{right:05}");
+                let child_id = *commit_ids.get(&child).expect("resolve l2 child id");
                 insert_edge
-                    .execute(params![repo_id, child, parent])
+                    .execute(params![repo_id, child_id, parent_id])
                     .expect("insert l1->l2 edge");
             }
         }
@@ -961,7 +971,7 @@ mod tests {
 
         let root_rowid: i64 = conn
             .query_row(
-                "SELECT rowid FROM commits WHERE repo_id = ?1 AND sha = 'root'",
+                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = 'root'",
                 [repo_id],
                 |row| row.get(0),
             )

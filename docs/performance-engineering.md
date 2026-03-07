@@ -13,7 +13,9 @@ Keep graph-query code performant by default on medium/large repositories without
 3. Use batched neighbor loading for frontier expansion where possible.
 4. Keep algorithm output contracts unchanged (`sha` remains external DTO identity).
 5. Preserve deterministic traversal ordering and typed error semantics.
-6. Do not modify docs/guardrails alone to satisfy quality gates; policy edits must be paired with implementation changes.
+6. Keep indexing database writes single-writer and transaction-bounded.
+7. If Rayon is used in ingestion, keep parallelism bounded/chunked and deterministic.
+8. Do not modify docs/guardrails alone to satisfy quality gates; policy edits must be paired with implementation changes.
 
 ## Current Strategy in This Repository
 
@@ -26,6 +28,8 @@ Keep graph-query code performant by default on medium/large repositories without
 7. SQLite statement cache is enabled and hot graph queries use cached prepared statements.
 8. Repository indexing uses libgit2 streaming adapters (`revwalk` + in-process diff callbacks), not full-buffer Git CLI log/show parsing.
 9. Indexer memory is bounded by explicit commit/file-change batch sizes rather than repository-total history size.
+10. File-change extraction uses bounded Rayon chunk parallelism in `adapters/git.rs`, while DB writes stay in the indexer's single transaction.
+11. Graph hot-path edge storage uses integer commit IDs (`child_commit_id`/`parent_commit_id`) instead of SHA edge columns.
 
 ## Why This Strategy
 
@@ -35,6 +39,8 @@ Keep graph-query code performant by default on medium/large repositories without
 4. Ordered vector batch decoding removes repeated source-node hash lookups during frontier expansion.
 5. Direction-optimizing BFS lowers duplicate expansion work when frontier becomes large.
 6. Reusing prepared statements reduces parse/compile overhead in repeated query loops.
+7. Parallel file-change compute improves CPU utilization while preserving write-side SQLite constraints.
+8. Integer edge columns remove repeated SHA join and string comparison overhead in neighbor expansion paths.
 
 ## Guardrail Enforcement
 
@@ -54,6 +60,10 @@ Keep graph-query code performant by default on medium/large repositories without
 5. Automation guardrails and script-platform policy are defined in `docs/automation-guardrails.md`.
 6. Git adapter indexing hot path must avoid process-spawned Git CLI and expose streaming APIs.
 7. Indexer must use streaming commit ingestion with bounded file-change batch buffers.
+8. Git adapter must keep bounded Rayon chunk parallelism for file-change compute.
+9. Git adapter must remain DB-free (`rusqlite` must not be imported in `adapters/git.rs`).
+10. Indexer must keep explicit single-writer transaction boundary for ingestion writes.
+11. DB adapter graph hot-path queries must use integer edge columns (no SHA edge columns).
 
 ## Ingestion Performance Policy
 
@@ -61,6 +71,8 @@ Keep graph-query code performant by default on medium/large repositories without
 2. Keep commit ingestion streaming.
 3. Keep file-change extraction and database writes bounded by explicit batch sizes.
 4. Keep index transaction semantics and idempotent upsert behavior unchanged.
+5. Keep parse/compute parallelism in Git adapter separated from DB write ownership.
+6. Keep integer edge storage contract for graph-query hot paths (`child_commit_id`/`parent_commit_id`).
 
 ## Direction-Optimizing BFS Policy
 
@@ -91,7 +103,8 @@ Keep graph-query code performant by default on medium/large repositories without
 2. Verify batch DB path is used for BFS-like expansion.
 3. Verify BFS mode-switch heuristic still satisfies deterministic output and perf budget test.
 4. Add or update unit/integration tests covering correctness and error contracts.
-5. Run:
+5. Verify file-change extraction parallel path remains bounded and deterministic.
+6. Run:
    - `pnpm run guardrails`
    - `pnpm run dev:gate:fast`
    - `pnpm run dev:gate`
@@ -111,3 +124,5 @@ Keep graph-query code performant by default on medium/large repositories without
 10. libgit2 diff callback API: https://libgit2.org/docs/reference/main/diff/git_diff_foreach.html
 11. Git commit-graph command: https://git-scm.com/docs/git-commit-graph
 12. Git maintenance tasks (`commit-graph`): https://git-scm.com/docs/git-maintenance
+13. Rayon parallel iterator guide: https://docs.rs/rayon/latest/rayon/iter/index.html
+14. Git commit-graph format: https://git-scm.com/docs/gitformat-commit-graph

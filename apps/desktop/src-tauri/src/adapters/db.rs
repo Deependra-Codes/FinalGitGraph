@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
 use crate::domain::models::{
     CommitWindowCursor, CommitWindowItem, GraphDirection, IndexCheckpoint, ParsedFileChange,
@@ -14,11 +14,16 @@ use crate::support::error::AppResult;
 const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
 const MIGRATION_0002: &str = include_str!("../../migrations/0002_repo_scoped_commit_keys.sql");
 const MIGRATION_0003: &str = include_str!("../../migrations/0003_indexing_checkpoints.sql");
+const MIGRATION_0004: &str = include_str!("../../migrations/0004_integer_commit_edges.sql");
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_0001),
     (2, MIGRATION_0002),
     (3, MIGRATION_0003),
+    (4, MIGRATION_0004),
 ];
+
+const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 400;
+const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 800;
 
 pub fn open_database(db_path: &Path) -> AppResult<Connection> {
     if let Some(parent) = db_path.parent() {
@@ -353,7 +358,7 @@ pub fn count_commits(conn: &Connection, repo_id: i64) -> AppResult<usize> {
 pub fn load_commit_rowid(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Option<i64>> {
     let rowid = conn
         .query_row(
-            "SELECT rowid FROM commits WHERE repo_id = ?1 AND sha = ?2 LIMIT 1",
+            "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2 LIMIT 1",
             params![repo_id, sha],
             |row| row.get(0),
         )
@@ -394,9 +399,9 @@ pub fn load_commit_shas_by_rowids(
 
     let mut stmt = conn.prepare(
         r#"
-        SELECT c.rowid, c.sha
+        SELECT c.commit_id, c.sha
         FROM commits c
-        JOIN current_graph_rowids r ON r.commit_rowid = c.rowid
+        JOIN current_graph_rowids r ON r.commit_rowid = c.commit_id
         WHERE c.repo_id = ?1
     "#,
     )?;
@@ -450,7 +455,7 @@ pub fn load_commit_shas_for_rowids(
         r#"
         SELECT c.sha
         FROM current_graph_rowid_order o
-        JOIN commits c ON c.rowid = o.commit_rowid
+        JOIN commits c ON c.commit_id = o.commit_rowid
         WHERE c.repo_id = ?1
         ORDER BY o.ord ASC
     "#,
@@ -470,17 +475,9 @@ pub fn load_neighbor_shas(
     sha: &str,
     direction: GraphDirection,
 ) -> AppResult<Vec<String>> {
-    match direction {
-        GraphDirection::Parents => load_parent_shas(conn, repo_id, sha),
-        GraphDirection::Children => load_child_shas(conn, repo_id, sha),
-        GraphDirection::Both => {
-            let mut combined = load_parent_shas(conn, repo_id, sha)?;
-            combined.extend(load_child_shas(conn, repo_id, sha)?);
-            combined.sort();
-            combined.dedup();
-            Ok(combined)
-        }
-    }
+    let batch = vec![sha.to_string()];
+    let neighbors = load_neighbor_shas_batch(conn, repo_id, &batch, direction)?;
+    Ok(neighbors.get(sha).cloned().unwrap_or_default())
 }
 
 pub fn load_neighbor_shas_batch(
@@ -493,6 +490,57 @@ pub fn load_neighbor_shas_batch(
         return Ok(HashMap::new());
     }
 
+    let mut neighbors = HashMap::with_capacity(shas.len());
+    for sha in shas {
+        neighbors.entry(sha.clone()).or_default();
+    }
+
+    let source_commit_ids = load_commit_ids_for_shas(conn, repo_id, shas)?;
+    if source_commit_ids.is_empty() {
+        return Ok(neighbors);
+    }
+
+    let mut ordered_source_ids = Vec::new();
+    let mut ordered_source_shas = Vec::new();
+    for sha in shas {
+        if let Some(commit_id) = source_commit_ids.get(sha) {
+            ordered_source_ids.push(*commit_id);
+            ordered_source_shas.push(sha.clone());
+        }
+    }
+
+    let rowid_neighbors =
+        load_neighbor_rowids_batch(conn, repo_id, &ordered_source_ids, direction)?;
+    let mut neighbor_ids = Vec::new();
+    for source_id in &ordered_source_ids {
+        if let Some(source_neighbors) = rowid_neighbors.get(source_id) {
+            neighbor_ids.extend(source_neighbors.iter().copied());
+        }
+    }
+    neighbor_ids.sort_unstable();
+    neighbor_ids.dedup();
+    let neighbor_shas = load_commit_shas_by_rowids(conn, repo_id, &neighbor_ids)?;
+
+    for (source_sha, source_id) in ordered_source_shas.iter().zip(ordered_source_ids.iter()) {
+        let mut source_neighbor_shas = Vec::new();
+        if let Some(source_neighbors) = rowid_neighbors.get(source_id) {
+            for neighbor_id in source_neighbors {
+                if let Some(neighbor_sha) = neighbor_shas.get(neighbor_id) {
+                    source_neighbor_shas.push(neighbor_sha.clone());
+                }
+            }
+        }
+        neighbors.insert(source_sha.clone(), source_neighbor_shas);
+    }
+
+    Ok(neighbors)
+}
+
+fn load_commit_ids_for_shas(
+    conn: &Connection,
+    repo_id: i64,
+    shas: &[String],
+) -> AppResult<HashMap<String, i64>> {
     conn.execute_batch(
         r#"
         CREATE TEMP TABLE IF NOT EXISTS current_graph_nodes (
@@ -503,7 +551,7 @@ pub fn load_neighbor_shas_batch(
     )?;
 
     {
-        let mut insert_stmt = conn.prepare(
+        let mut insert_stmt = conn.prepare_cached(
             r#"
             INSERT INTO current_graph_nodes (sha)
             VALUES (?1)
@@ -515,49 +563,26 @@ pub fn load_neighbor_shas_batch(
         }
     }
 
-    let mut neighbors = match direction {
-        GraphDirection::Parents => query_neighbors_for_sources(
-            conn,
-            repo_id,
-            "child_sha",
-            "parent_sha",
-            "parent_sha DESC",
-        )?,
-        GraphDirection::Children => {
-            query_neighbors_for_sources(conn, repo_id, "parent_sha", "child_sha", "child_sha DESC")?
-        }
-        GraphDirection::Both => {
-            let mut merged = query_neighbors_for_sources(
-                conn,
-                repo_id,
-                "child_sha",
-                "parent_sha",
-                "parent_sha DESC",
-            )?;
-            let children = query_neighbors_for_sources(
-                conn,
-                repo_id,
-                "parent_sha",
-                "child_sha",
-                "child_sha DESC",
-            )?;
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT c.sha, c.commit_id
+        FROM commits c
+        JOIN current_graph_nodes node ON node.sha = c.sha
+        WHERE c.repo_id = ?1
+    "#,
+    )?;
+    let rows = stmt.query_map([repo_id], |row| {
+        let sha: String = row.get(0)?;
+        let commit_id: i64 = row.get(1)?;
+        Ok((sha, commit_id))
+    })?;
 
-            for (source_sha, mut child_neighbors) in children {
-                let entry = merged.entry(source_sha).or_default();
-                entry.append(&mut child_neighbors);
-                entry.sort();
-                entry.dedup();
-                entry.reverse();
-            }
-            merged
-        }
-    };
-
-    for sha in shas {
-        neighbors.entry(sha.clone()).or_default();
+    let mut result = HashMap::new();
+    for row in rows {
+        let (sha, commit_id) = row?;
+        result.insert(sha, commit_id);
     }
-
-    Ok(neighbors)
+    Ok(result)
 }
 
 pub fn load_neighbor_rowids(
@@ -609,80 +634,55 @@ pub fn load_neighbor_rowids_for_sources(
         return Ok(Vec::new());
     }
 
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowid_order (
-          ord INTEGER PRIMARY KEY,
-          commit_rowid INTEGER NOT NULL
-        );
-        DELETE FROM current_graph_rowid_order;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_graph_rowid_order (ord, commit_rowid)
-            VALUES (?1, ?2)
-        "#,
-        )?;
-        for (ord, rowid) in rowids.iter().enumerate() {
-            insert_stmt.execute(params![ord as i64, rowid])?;
-        }
-    }
-
-    let mut neighbors = match direction {
-        GraphDirection::Parents => query_neighbor_rowids_for_ordered_sources(
-            conn,
-            repo_id,
-            "child_sha",
-            "parent_sha",
-            "neighbor.rowid DESC",
-        )?,
-        GraphDirection::Children => query_neighbor_rowids_for_ordered_sources(
-            conn,
-            repo_id,
-            "parent_sha",
-            "child_sha",
-            "neighbor.rowid DESC",
-        )?,
-        GraphDirection::Both => {
-            let mut merged = query_neighbor_rowids_for_ordered_sources(
+    let mut neighbors = Vec::with_capacity(rowids.len());
+    for rowid_chunk in rowids.chunks(ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE) {
+        let mut chunk_neighbors = match direction {
+            GraphDirection::Parents => query_neighbor_rowids_for_ordered_sources_chunk(
                 conn,
                 repo_id,
-                "child_sha",
-                "parent_sha",
-                "neighbor.rowid DESC",
-            )?;
-            if merged.len() < rowids.len() {
-                merged.resize_with(rowids.len(), Vec::new);
-            }
-
-            let mut children = query_neighbor_rowids_for_ordered_sources(
+                rowid_chunk,
+                "child_commit_id",
+                "parent_commit_id",
+                "edge.parent_commit_id DESC",
+            )?,
+            GraphDirection::Children => query_neighbor_rowids_for_ordered_sources_chunk(
                 conn,
                 repo_id,
-                "parent_sha",
-                "child_sha",
-                "neighbor.rowid DESC",
-            )?;
-            if children.len() < rowids.len() {
-                children.resize_with(rowids.len(), Vec::new);
-            }
+                rowid_chunk,
+                "parent_commit_id",
+                "child_commit_id",
+                "edge.child_commit_id DESC",
+            )?,
+            GraphDirection::Both => {
+                let mut merged = query_neighbor_rowids_for_ordered_sources_chunk(
+                    conn,
+                    repo_id,
+                    rowid_chunk,
+                    "child_commit_id",
+                    "parent_commit_id",
+                    "edge.parent_commit_id DESC",
+                )?;
+                let children = query_neighbor_rowids_for_ordered_sources_chunk(
+                    conn,
+                    repo_id,
+                    rowid_chunk,
+                    "parent_commit_id",
+                    "child_commit_id",
+                    "edge.child_commit_id DESC",
+                )?;
 
-            for (merged_neighbors, mut child_neighbors) in
-                merged.iter_mut().zip(children.into_iter())
-            {
-                merged_neighbors.append(&mut child_neighbors);
-                merged_neighbors.sort_unstable();
-                merged_neighbors.dedup();
-                merged_neighbors.reverse();
+                for (merged_neighbors, child_neighbors) in
+                    merged.iter_mut().zip(children.into_iter())
+                {
+                    merged_neighbors.extend(child_neighbors);
+                    merged_neighbors.sort_unstable();
+                    merged_neighbors.dedup();
+                    merged_neighbors.reverse();
+                }
+                merged
             }
-            merged
-        }
-    };
-
-    if neighbors.len() < rowids.len() {
-        neighbors.resize_with(rowids.len(), Vec::new);
+        };
+        neighbors.append(&mut chunk_neighbors);
     }
 
     Ok(neighbors)
@@ -698,102 +698,54 @@ pub fn load_pull_neighbor_rowids(
         return Ok(Vec::new());
     }
 
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_frontier (
-          commit_rowid INTEGER PRIMARY KEY
-        );
-        DELETE FROM current_graph_frontier;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare(
-            r#"
-            INSERT INTO current_graph_frontier (commit_rowid)
-            VALUES (?1)
-            ON CONFLICT(commit_rowid) DO NOTHING
-        "#,
-        )?;
-        for rowid in frontier_rowids {
-            insert_stmt.execute([rowid])?;
-        }
-    }
-
-    match direction {
-        GraphDirection::Parents => {
-            query_pull_rowids_for_frontier(conn, repo_id, "parent_sha", "child_sha")
-        }
-        GraphDirection::Children => {
-            query_pull_rowids_for_frontier(conn, repo_id, "child_sha", "parent_sha")
-        }
-        GraphDirection::Both => {
-            let mut combined =
-                query_pull_rowids_for_frontier(conn, repo_id, "parent_sha", "child_sha")?;
-            combined.extend(query_pull_rowids_for_frontier(
+    let mut combined = Vec::new();
+    for frontier_chunk in frontier_rowids.chunks(FRONTIER_PULL_QUERY_CHUNK_SIZE) {
+        match direction {
+            GraphDirection::Parents => combined.extend(query_pull_rowids_for_frontier_chunk(
                 conn,
                 repo_id,
-                "child_sha",
-                "parent_sha",
-            )?);
-            combined.sort_unstable_by(|left, right| right.cmp(left));
-            combined.dedup();
-            Ok(combined)
+                frontier_chunk,
+                "parent_commit_id",
+                "child_commit_id",
+            )?),
+            GraphDirection::Children => combined.extend(query_pull_rowids_for_frontier_chunk(
+                conn,
+                repo_id,
+                frontier_chunk,
+                "child_commit_id",
+                "parent_commit_id",
+            )?),
+            GraphDirection::Both => {
+                combined.extend(query_pull_rowids_for_frontier_chunk(
+                    conn,
+                    repo_id,
+                    frontier_chunk,
+                    "parent_commit_id",
+                    "child_commit_id",
+                )?);
+                combined.extend(query_pull_rowids_for_frontier_chunk(
+                    conn,
+                    repo_id,
+                    frontier_chunk,
+                    "child_commit_id",
+                    "parent_commit_id",
+                )?);
+            }
         }
     }
-}
 
-fn load_parent_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec<String>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT parent_sha
-        FROM commit_edges
-        WHERE repo_id = ?1 AND child_sha = ?2
-        ORDER BY parent_sha DESC
-    "#,
-    )?;
-    let rows = stmt.query_map(params![repo_id, sha], |row| row.get(0))?;
-
-    let mut shas = Vec::new();
-    for row in rows {
-        shas.push(row?);
-    }
-
-    Ok(shas)
-}
-
-fn load_child_shas(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Vec<String>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT child_sha
-        FROM commit_edges
-        WHERE repo_id = ?1 AND parent_sha = ?2
-        ORDER BY child_sha DESC
-    "#,
-    )?;
-    let rows = stmt.query_map(params![repo_id, sha], |row| row.get(0))?;
-
-    let mut shas = Vec::new();
-    for row in rows {
-        shas.push(row?);
-    }
-
-    Ok(shas)
+    combined.sort_unstable_by(|left, right| right.cmp(left));
+    combined.dedup();
+    Ok(combined)
 }
 
 fn load_parent_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT parent.rowid
-        FROM commit_edges edge
-        JOIN commits child
-          ON child.repo_id = edge.repo_id
-         AND child.sha = edge.child_sha
-        JOIN commits parent
-          ON parent.repo_id = edge.repo_id
-         AND parent.sha = edge.parent_sha
-        WHERE edge.repo_id = ?1 AND child.rowid = ?2
-        ORDER BY parent.rowid DESC
+        SELECT parent_commit_id
+        FROM commit_edges
+        WHERE repo_id = ?1 AND child_commit_id = ?2
+        ORDER BY parent_commit_id DESC
     "#,
     )?;
     let rows = stmt.query_map(params![repo_id, rowid], |row| row.get(0))?;
@@ -809,16 +761,10 @@ fn load_parent_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<
 fn load_child_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT child.rowid
-        FROM commit_edges edge
-        JOIN commits parent
-          ON parent.repo_id = edge.repo_id
-         AND parent.sha = edge.parent_sha
-        JOIN commits child
-          ON child.repo_id = edge.repo_id
-         AND child.sha = edge.child_sha
-        WHERE edge.repo_id = ?1 AND parent.rowid = ?2
-        ORDER BY child.rowid DESC
+        SELECT child_commit_id
+        FROM commit_edges
+        WHERE repo_id = ?1 AND parent_commit_id = ?2
+        ORDER BY child_commit_id DESC
     "#,
     )?;
     let rows = stmt.query_map(params![repo_id, rowid], |row| row.get(0))?;
@@ -831,114 +777,115 @@ fn load_child_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<V
     Ok(rowids)
 }
 
-fn query_neighbors_for_sources(
+fn query_neighbor_rowids_for_ordered_sources_chunk(
     conn: &Connection,
     repo_id: i64,
-    source_column: &str,
-    neighbor_column: &str,
-    neighbor_order: &str,
-) -> AppResult<HashMap<String, Vec<String>>> {
-    let sql = format!(
-        r#"
-        SELECT edge.{source_column} AS source_sha, edge.{neighbor_column} AS neighbor_sha
-        FROM commit_edges edge
-        JOIN current_graph_nodes node ON node.sha = edge.{source_column}
-        WHERE edge.repo_id = ?1
-        ORDER BY edge.{source_column} DESC, {neighbor_order}
-    "#
-    );
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([repo_id], |row| {
-        let source_sha: String = row.get(0)?;
-        let neighbor_sha: String = row.get(1)?;
-        Ok((source_sha, neighbor_sha))
-    })?;
-
-    let mut result = HashMap::new();
-    for row in rows {
-        let (source_sha, neighbor_sha) = row?;
-        result
-            .entry(source_sha)
-            .or_insert_with(Vec::new)
-            .push(neighbor_sha);
-    }
-
-    Ok(result)
-}
-
-fn query_neighbor_rowids_for_ordered_sources(
-    conn: &Connection,
-    repo_id: i64,
-    source_sha_column: &str,
-    neighbor_sha_column: &str,
+    rowids: &[i64],
+    source_id_column: &str,
+    neighbor_id_column: &str,
     neighbor_order: &str,
 ) -> AppResult<Vec<Vec<i64>>> {
+    if rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut ordered_values = String::new();
+    for index in 0..rowids.len() {
+        if index > 0 {
+            ordered_values.push_str(", ");
+        }
+        let ord_param = index * 2 + 1;
+        let rowid_param = index * 2 + 2;
+        ordered_values.push_str(&format!("(?{ord_param}, ?{rowid_param})"));
+    }
+    let repo_param = rowids.len() * 2 + 1;
+
     let sql = format!(
         r#"
-        SELECT o.ord AS source_ord, neighbor.rowid AS neighbor_rowid
-        FROM current_graph_rowid_order o
-        JOIN commits source
-          ON source.rowid = o.commit_rowid
-         AND source.repo_id = ?1
+        WITH ordered(ord, commit_rowid) AS (
+          VALUES {ordered_values}
+        )
+        SELECT ordered.ord AS source_ord, edge.{neighbor_id_column} AS neighbor_rowid
+        FROM ordered
         JOIN commit_edges edge
-          ON edge.repo_id = source.repo_id
-         AND edge.{source_sha_column} = source.sha
-        JOIN commits neighbor
-          ON neighbor.repo_id = edge.repo_id
-         AND neighbor.sha = edge.{neighbor_sha_column}
-        ORDER BY o.ord ASC, {neighbor_order}
+          ON edge.repo_id = ?{repo_param}
+         AND edge.{source_id_column} = ordered.commit_rowid
+        ORDER BY ordered.ord ASC, {neighbor_order}
     "#
     );
 
+    let mut query_params = Vec::with_capacity(rowids.len() * 2 + 1);
+    for (ord, rowid) in rowids.iter().enumerate() {
+        query_params.push(Value::Integer(ord as i64));
+        query_params.push(Value::Integer(*rowid));
+    }
+    query_params.push(Value::Integer(repo_id));
+
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([repo_id], |row| {
+    let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
         let source_ord: i64 = row.get(0)?;
         let neighbor_rowid: i64 = row.get(1)?;
         Ok((source_ord, neighbor_rowid))
     })?;
 
-    let mut result: Vec<Vec<i64>> = Vec::new();
+    let mut result: Vec<Vec<i64>> = vec![Vec::new(); rowids.len()];
     for row in rows {
         let (source_ord, neighbor_rowid) = row?;
         if source_ord < 0 {
             continue;
         }
         let source_index = source_ord as usize;
-        if source_index >= result.len() {
-            result.resize_with(source_index + 1, Vec::new);
+        if source_index < result.len() {
+            result[source_index].push(neighbor_rowid);
         }
-        result[source_index].push(neighbor_rowid);
     }
 
     Ok(result)
 }
 
-fn query_pull_rowids_for_frontier(
+fn query_pull_rowids_for_frontier_chunk(
     conn: &Connection,
     repo_id: i64,
-    candidate_sha_column: &str,
-    frontier_sha_column: &str,
+    frontier_rowids: &[i64],
+    candidate_id_column: &str,
+    frontier_id_column: &str,
 ) -> AppResult<Vec<i64>> {
+    if frontier_rowids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut frontier_values = String::new();
+    for index in 0..frontier_rowids.len() {
+        if index > 0 {
+            frontier_values.push_str(", ");
+        }
+        let frontier_param = index + 1;
+        frontier_values.push_str(&format!("(?{frontier_param})"));
+    }
+    let repo_param = frontier_rowids.len() + 1;
+
     let sql = format!(
         r#"
-        SELECT DISTINCT neighbor.rowid AS neighbor_rowid
+        WITH frontier(commit_rowid) AS (
+          VALUES {frontier_values}
+        )
+        SELECT DISTINCT edge.{candidate_id_column} AS neighbor_rowid
         FROM commit_edges edge
-        JOIN commits source
-          ON source.repo_id = edge.repo_id
-         AND source.sha = edge.{frontier_sha_column}
-        JOIN current_graph_frontier frontier
-          ON frontier.commit_rowid = source.rowid
-        JOIN commits neighbor
-          ON neighbor.repo_id = edge.repo_id
-         AND neighbor.sha = edge.{candidate_sha_column}
-        WHERE edge.repo_id = ?1
-        ORDER BY neighbor.rowid DESC
+        JOIN frontier
+          ON frontier.commit_rowid = edge.{frontier_id_column}
+        WHERE edge.repo_id = ?{repo_param}
+        ORDER BY edge.{candidate_id_column} DESC
     "#
     );
 
+    let mut query_params = Vec::with_capacity(frontier_rowids.len() + 1);
+    for frontier_rowid in frontier_rowids {
+        query_params.push(Value::Integer(*frontier_rowid));
+    }
+    query_params.push(Value::Integer(repo_id));
+
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([repo_id], |row| row.get(0))?;
+    let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| row.get(0))?;
 
     let mut result = Vec::new();
     for row in rows {
@@ -966,7 +913,7 @@ mod tests {
         count_commits, load_commit_shas_by_rowids, load_commit_shas_for_rowids,
         load_index_checkpoint, load_neighbor_rowids_batch, load_neighbor_rowids_for_sources,
         load_neighbor_shas_batch, load_pull_neighbor_rowids, run_migrations,
-        upsert_index_checkpoint,
+        upsert_index_checkpoint, FRONTIER_PULL_QUERY_CHUNK_SIZE, ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE,
     };
     use crate::domain::models::{GraphDirection, IndexCheckpoint};
 
@@ -983,15 +930,15 @@ mod tests {
         run_migrations(&mut conn).expect("migration run");
 
         let commits_pk = primary_key_columns(&conn, "commits");
-        assert_eq!(commits_pk, vec!["repo_id".to_string(), "sha".to_string()]);
+        assert_eq!(commits_pk, vec!["commit_id".to_string()]);
 
         let edges_pk = primary_key_columns(&conn, "commit_edges");
         assert_eq!(
             edges_pk,
             vec![
                 "repo_id".to_string(),
-                "child_sha".to_string(),
-                "parent_sha".to_string()
+                "child_commit_id".to_string(),
+                "parent_commit_id".to_string()
             ]
         );
     }
@@ -1064,38 +1011,38 @@ mod tests {
         )
         .expect("insert c3");
 
-        conn.execute(
-            "INSERT INTO commit_edges (repo_id, child_sha, parent_sha) VALUES (?1, ?2, ?3)",
-            params![repo_id, "c2", "c1"],
-        )
-        .expect("insert edge c2->c1");
-        conn.execute(
-            "INSERT INTO commit_edges (repo_id, child_sha, parent_sha) VALUES (?1, ?2, ?3)",
-            params![repo_id, "c3", "c2"],
-        )
-        .expect("insert edge c3->c2");
-
         let c1_rowid: i64 = conn
             .query_row(
-                "SELECT rowid FROM commits WHERE repo_id = ?1 AND sha = ?2",
+                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
                 params![repo_id, "c1"],
                 |row| row.get(0),
             )
             .expect("fetch c1 rowid");
         let c2_rowid: i64 = conn
             .query_row(
-                "SELECT rowid FROM commits WHERE repo_id = ?1 AND sha = ?2",
+                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
                 params![repo_id, "c2"],
                 |row| row.get(0),
             )
             .expect("fetch c2 rowid");
         let c3_rowid: i64 = conn
             .query_row(
-                "SELECT rowid FROM commits WHERE repo_id = ?1 AND sha = ?2",
+                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
                 params![repo_id, "c3"],
                 |row| row.get(0),
             )
             .expect("fetch c3 rowid");
+
+        conn.execute(
+            "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
+            params![repo_id, c2_rowid, c1_rowid],
+        )
+        .expect("insert edge c2->c1");
+        conn.execute(
+            "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
+            params![repo_id, c3_rowid, c2_rowid],
+        )
+        .expect("insert edge c3->c2");
 
         let batch = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
         let parents = load_neighbor_shas_batch(&conn, repo_id, &batch, GraphDirection::Parents)
@@ -1168,6 +1115,130 @@ mod tests {
             ordered_shas,
             vec!["c3".to_string(), "c1".to_string(), "c2".to_string()]
         );
+    }
+
+    #[test]
+    fn neighbor_queries_handle_chunk_boundaries() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            ["/tmp/chunk-repo", "chunk-repo", "/tmp/chunk-repo/.git"],
+        )
+        .expect("insert repo");
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/chunk-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let commit_count = FRONTIER_PULL_QUERY_CHUNK_SIZE + 100;
+        {
+            let tx = conn.transaction().expect("start insert tx");
+            let mut commit_stmt = tx
+                .prepare_cached("INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)")
+                .expect("prepare commit insert");
+            for index in 0..commit_count {
+                let sha = format!("c{index:04}");
+                commit_stmt
+                    .execute(params![repo_id, sha])
+                    .expect("insert commit");
+            }
+            drop(commit_stmt);
+            tx.commit().expect("commit inserts");
+        }
+
+        let commit_ids = {
+            let mut id_stmt = conn
+                .prepare_cached(
+                    r#"
+                SELECT commit_id
+                FROM commits
+                WHERE repo_id = ?1
+                ORDER BY sha ASC
+            "#,
+                )
+                .expect("prepare commit id query");
+            let id_rows = id_stmt
+                .query_map([repo_id], |row| row.get::<_, i64>(0))
+                .expect("query commit ids");
+            let mut commit_ids = Vec::with_capacity(commit_count);
+            for row in id_rows {
+                commit_ids.push(row.expect("read commit id"));
+            }
+            commit_ids
+        };
+
+        {
+            let tx = conn.transaction().expect("start edge insert tx");
+            let mut edge_stmt = tx
+                .prepare_cached(
+                    r#"
+                    INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
+                    VALUES (?1, ?2, ?3)
+                "#,
+                )
+                .expect("prepare edge insert");
+            for index in 1..commit_ids.len() {
+                edge_stmt
+                    .execute(params![repo_id, commit_ids[index], commit_ids[index - 1]])
+                    .expect("insert edge");
+            }
+            drop(edge_stmt);
+            tx.commit().expect("commit edges");
+        }
+
+        let source_rowids: Vec<i64> = commit_ids.iter().skip(1).copied().collect();
+        assert!(
+            source_rowids.len() > ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE,
+            "test must cross ordered-neighbor chunk size"
+        );
+        let ordered_parents = load_neighbor_rowids_for_sources(
+            &conn,
+            repo_id,
+            &source_rowids,
+            GraphDirection::Parents,
+        )
+        .expect("load ordered parents");
+        assert_eq!(ordered_parents.len(), source_rowids.len());
+        for (index, parents) in ordered_parents.iter().enumerate() {
+            assert_eq!(parents, &vec![commit_ids[index]]);
+        }
+
+        let frontier: Vec<i64> = commit_ids
+            .iter()
+            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 50)
+            .copied()
+            .collect();
+        assert!(
+            frontier.len() > FRONTIER_PULL_QUERY_CHUNK_SIZE,
+            "test must cross pull-frontier chunk size"
+        );
+
+        let pull_children =
+            load_pull_neighbor_rowids(&conn, repo_id, &frontier, GraphDirection::Children)
+                .expect("load pull children");
+        let mut expected_children: Vec<i64> = commit_ids
+            .iter()
+            .skip(1)
+            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 50)
+            .copied()
+            .collect();
+        expected_children.sort_unstable_by(|left, right| right.cmp(left));
+        assert_eq!(pull_children, expected_children);
+
+        let pull_both = load_pull_neighbor_rowids(&conn, repo_id, &frontier, GraphDirection::Both)
+            .expect("load pull both");
+        let mut expected_both: Vec<i64> = commit_ids
+            .iter()
+            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 51)
+            .copied()
+            .collect();
+        expected_both.sort_unstable_by(|left, right| right.cmp(left));
+        assert_eq!(pull_both, expected_both);
     }
 
     fn primary_key_columns(conn: &Connection, table_name: &str) -> Vec<String> {

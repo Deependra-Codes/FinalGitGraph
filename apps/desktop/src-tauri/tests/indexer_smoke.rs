@@ -105,6 +105,42 @@ fn incremental_indexing_and_commit_window_work() {
 }
 
 #[test]
+fn indexing_large_history_keeps_file_change_ingestion_correct() {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+
+    let commit_count = 72usize;
+    for index in 0..commit_count {
+        write_file(repo_dir.join("README.md"), &format!("commit-{index:03}\n"));
+        git_commit(&repo_dir, &format!("commit-{index:03}"));
+    }
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    let stats = index_commits(&repo_str, Some(&db_str))
+        .unwrap_or_else(|error| panic!("index large history: {error}"));
+    assert_eq!(stats.mode, IndexingMode::Full);
+    assert_eq!(stats.commits_indexed, commit_count);
+    assert!(stats.file_changes_indexed >= commit_count);
+
+    let conn = Connection::open(db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let db_commit_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("query commit count: {error}"));
+    assert_eq!(db_commit_count, commit_count as i64);
+
+    let db_file_change_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("query file_changes count: {error}"));
+    assert!(db_file_change_count >= commit_count as i64);
+}
+
+#[test]
 fn graph_traversal_and_shortest_path_work() {
     let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
     let repo_dir = temp.path().join("repo");

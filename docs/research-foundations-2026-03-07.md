@@ -26,6 +26,10 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - Decision: enable SQLite prepared-statement caching and favor cached preparation in graph-query adapters.
 11. Repository indexing hot paths should avoid full-buffer subprocess output collection.
    - Decision: migrate indexing hot path to libgit2 streaming APIs and bounded in-memory batches.
+12. SQLite write-path scaling should use bounded parallel compute with single-writer ownership.
+   - Decision: parallelize file-change compute via bounded Rayon chunks in Git adapter while keeping DB writes transaction-owned in indexer/db adapters.
+13. Graph traversal hot paths should store edges with integer commit IDs, not SHA text pairs.
+   - Decision: migrate `commit_edges` to `(repo_id, child_commit_id, parent_commit_id)` and remove SHA edge joins from DB hot-path queries.
 
 ## Sources
 
@@ -67,3 +71,9 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - https://docs.rs/git2/latest/git2/struct.Revwalk.html
 19. libgit2 diff iteration:
    - https://libgit2.org/docs/reference/main/diff/git_diff_foreach.html
+20. SQLite transactions (single writer model):
+   - https://www.sqlite.org/lang_transaction.html
+21. Rayon parallel iterators:
+   - https://docs.rs/rayon/latest/rayon/iter/index.html
+22. Git commit-graph format:
+   - https://git-scm.com/docs/gitformat-commit-graph

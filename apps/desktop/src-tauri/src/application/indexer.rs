@@ -104,6 +104,23 @@ impl Indexer {
         let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
 
         {
+            tx.execute_batch(
+                r#"
+                CREATE TEMP TABLE IF NOT EXISTS current_pending_commit_edges (
+                  child_sha TEXT NOT NULL,
+                  parent_sha TEXT NOT NULL
+                );
+                DELETE FROM current_pending_commit_edges;
+            "#,
+            )?;
+
+            let mut pending_edge_stmt = tx.prepare_cached(
+                r#"
+                INSERT INTO current_pending_commit_edges (child_sha, parent_sha)
+                VALUES (?1, ?2)
+            "#,
+            )?;
+
             let mut commit_stmt = tx.prepare(
                 r#"
                 INSERT INTO commits (
@@ -116,14 +133,6 @@ impl Indexer {
                   committer_time = excluded.committer_time,
                   subject = excluded.subject,
                   tree_sha = excluded.tree_sha
-            "#,
-            )?;
-
-            let mut edge_stmt = tx.prepare(
-                r#"
-                INSERT INTO commit_edges (child_sha, parent_sha, repo_id)
-                VALUES (?1, ?2, ?3)
-                ON CONFLICT(repo_id, child_sha, parent_sha) DO NOTHING
             "#,
             )?;
 
@@ -141,7 +150,7 @@ impl Indexer {
                 commits_inserted += 1;
 
                 for parent in &commit.parents {
-                    edge_stmt.execute(params![commit.sha.as_str(), parent.as_str(), repo_id])?;
+                    pending_edge_stmt.execute(params![commit.sha.as_str(), parent.as_str()])?;
                     edges_inserted += 1;
                 }
 
@@ -165,6 +174,25 @@ impl Indexer {
 
                 Ok(())
             })?;
+
+            tx.execute(
+                r#"
+                INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
+                SELECT
+                  ?1 AS repo_id,
+                  child.commit_id AS child_commit_id,
+                  parent.commit_id AS parent_commit_id
+                FROM current_pending_commit_edges edge
+                JOIN commits child
+                  ON child.repo_id = ?1
+                 AND child.sha = edge.child_sha
+                JOIN commits parent
+                  ON parent.repo_id = ?1
+                 AND parent.sha = edge.parent_sha
+                ON CONFLICT(repo_id, child_commit_id, parent_commit_id) DO NOTHING
+            "#,
+                params![repo_id],
+            )?;
         }
 
         flush_pending_commit_file_changes(

@@ -263,6 +263,22 @@ if (-not (Test-Path $srcRoot)) {
         } else {
             Add-Failure "Git adapter must expose streaming commit/file-change ingestion APIs."
         }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\.par_chunks\(' -Quiet)
+        ) {
+            Add-Pass "Git adapter keeps bounded Rayon parallel file-change compute path."
+        } else {
+            Add-Failure "Git adapter must keep bounded Rayon parallel file-change compute path."
+        }
+
+        if (Select-String -Path $gitAdapterPath -Pattern '\brusqlite::' -Quiet) {
+            Add-Failure "Git adapter must remain DB-free (no rusqlite dependency in adapters/git.rs)."
+        } else {
+            Add-Pass "Git adapter remains DB-free (single-writer DB contract stays in indexer/db adapters)."
+        }
     }
 
     $indexerPath = Join-Path $srcRoot "application/indexer.rs"
@@ -281,7 +297,49 @@ if (-not (Test-Path $srcRoot)) {
         } else {
             Add-Failure "Indexer must keep bounded file-change batch buffers."
         }
+
+        if (
+            (Select-String -Path $indexerPath -Pattern 'let tx = conn\.transaction\(\)\?;' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'tx\.commit\(\)\?;' -Quiet)
+        ) {
+            Add-Pass "Indexer keeps single-writer transaction boundary for ingestion writes."
+        } else {
+            Add-Failure "Indexer must keep explicit single-writer transaction boundary for ingestion writes."
+        }
     }
+
+    $dbAdapterPath = Join-Path $srcRoot "adapters/db.rs"
+    if (Test-Path $dbAdapterPath) {
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'child_commit_id' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'parent_commit_id' -Quiet)
+        ) {
+            Add-Pass "DB adapter uses integer edge columns for graph neighbor hot paths."
+        } else {
+            Add-Failure "DB adapter must use integer edge columns (`child_commit_id` / `parent_commit_id`) for graph neighbor hot paths."
+        }
+
+        if (Select-String -Path $dbAdapterPath -Pattern '\bchild_sha\b|\bparent_sha\b' -Quiet) {
+            Add-Failure "DB adapter must not use SHA edge columns in graph hot-path queries."
+        } else {
+            Add-Pass "DB adapter avoids SHA edge columns in graph hot-path queries."
+        }
+    }
+}
+
+$integerEdgeMigrationPath = Join-Path $repoRoot "apps/desktop/src-tauri/migrations/0004_integer_commit_edges.sql"
+if (Test-Path $integerEdgeMigrationPath) {
+    if (
+        (Select-String -Path $integerEdgeMigrationPath -Pattern 'commit_id INTEGER PRIMARY KEY' -Quiet) -and
+        (Select-String -Path $integerEdgeMigrationPath -Pattern 'child_commit_id' -Quiet) -and
+        (Select-String -Path $integerEdgeMigrationPath -Pattern 'parent_commit_id' -Quiet)
+    ) {
+        Add-Pass "Integer-edge migration contract present."
+    } else {
+        Add-Failure "Integer-edge migration must define stable commit_id and integer edge columns."
+    }
+} else {
+    Add-Failure "Missing integer-edge migration file: apps/desktop/src-tauri/migrations/0004_integer_commit_edges.sql"
 }
 
 $requiredDocs = @(
@@ -289,6 +347,8 @@ $requiredDocs = @(
     "docs/from-scratch-system.md",
     "docs/adr/README.md",
     "docs/adr/0006-streaming-libgit2-ingestion.md",
+    "docs/adr/0007-bounded-rayon-ingestion-compute-single-writer-db.md",
+    "docs/adr/0008-integer-edge-schema-for-graph-hot-path.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )

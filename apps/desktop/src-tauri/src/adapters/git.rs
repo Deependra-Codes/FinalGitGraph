@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 use git2::{
     Commit, Delta, DiffDelta, DiffFindOptions, DiffLineType, Error, ErrorCode, Repository, Sort,
 };
+use rayon::prelude::*;
 
 use crate::domain::models::{ParsedCommit, ParsedFileChange, ParsedRef};
 use crate::support::error::{AppError, AppResult};
 
 pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 200;
+const FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS: usize = 64;
+const FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct CanonicalRepo {
@@ -230,12 +233,47 @@ pub fn stream_file_changes_for_commits(
         return Ok(());
     }
 
-    let repo = open_repository(repo_root)?;
-    for commit_sha in commit_shas {
-        append_file_changes_for_commit(&repo, commit_sha, &mut on_change)?;
+    if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
+        let repo = open_repository(repo_root)?;
+        for commit_sha in commit_shas {
+            append_file_changes_for_commit(&repo, commit_sha, &mut on_change)?;
+        }
+        return Ok(());
+    }
+
+    let chunked_changes = collect_file_changes_for_chunks(repo_root, commit_shas)?;
+    for chunk_changes in chunked_changes {
+        for change in chunk_changes {
+            on_change(change)?;
+        }
     }
 
     Ok(())
+}
+
+fn collect_file_changes_for_chunks(
+    repo_root: &Path,
+    commit_shas: &[String],
+) -> AppResult<Vec<Vec<ParsedFileChange>>> {
+    commit_shas
+        .par_chunks(FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE)
+        .map(|chunk| collect_file_changes_for_chunk(repo_root, chunk))
+        .collect()
+}
+
+fn collect_file_changes_for_chunk(
+    repo_root: &Path,
+    commit_shas: &[String],
+) -> AppResult<Vec<ParsedFileChange>> {
+    let repo = open_repository(repo_root)?;
+    let mut chunk_changes = Vec::new();
+    for commit_sha in commit_shas {
+        append_file_changes_for_commit(&repo, commit_sha, &mut |change| {
+            chunk_changes.push(change);
+            Ok(())
+        })?;
+    }
+    Ok(chunk_changes)
 }
 
 fn append_file_changes_for_commit(

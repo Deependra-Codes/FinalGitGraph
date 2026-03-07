@@ -67,6 +67,11 @@ Repository-scale indexing guardrails now also enforce:
 1. no process-spawned Git CLI hot path in `adapters/git.rs`
 2. streaming ingest APIs for commits and file changes
 3. bounded buffering in `application/indexer.rs` for commit/file-change batches
+4. bounded Rayon chunk parallelism for file-change compute in `adapters/git.rs`
+5. no database dependency in `adapters/git.rs` so DB writes stay single-owner in indexer/db adapters
+6. explicit single transaction boundary in `application/indexer.rs` for ingestion writes
+7. integer edge schema for graph hot paths (`child_commit_id`/`parent_commit_id`) in DB adapter and migrations
+8. no SHA edge hot-path queries in `adapters/db.rs`
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
 
