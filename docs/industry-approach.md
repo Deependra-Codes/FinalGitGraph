@@ -36,7 +36,7 @@ Yes, using Rust is intentional, not accidental.
    - transactional writes
    - resumable jobs and checkpoints
 4. Security controls:
-   - strict argument arrays for git subprocess calls
+   - in-process repository access via libgit2 APIs in indexing hot paths
    - path canonicalization and repo boundary checks
    - secret storage only in OS keychain
 5. Observability:
@@ -69,7 +69,7 @@ Phase 2 target: make the core operationally production-ready before advanced fea
    - full vs incremental mode using last indexed checkpoint
    - batch insert pipeline with bounded memory
 3. File change ingestion
-   - populate `file_changes` from git stats pipeline
+   - populate `file_changes` from streaming libgit2 diff pipeline
    - support rename/change type classification
 4. Job orchestration
    - priority queues (`interactive`, `background`, `maintenance`)

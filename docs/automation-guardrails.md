@@ -60,6 +60,16 @@ This ordering fails fast on automation regressions before expensive lanes.
 2. No slowdown of traversal/runtime algorithm paths due to automation checks.
 3. No policy that blocks performance-oriented refactors by default.
 
+## Ingestion Guardrails
+
+Repository-scale indexing guardrails now also enforce:
+
+1. no process-spawned Git CLI hot path in `adapters/git.rs`
+2. streaming ingest APIs for commits and file changes
+3. bounded buffering in `application/indexer.rs` for commit/file-change batches
+
+This protects against memory-regression classes on large histories while preserving domain/API contracts.
+
 ## References
 
 1. GitHub workflow shell behavior (`cmd` default on Windows, different defaults elsewhere): https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions

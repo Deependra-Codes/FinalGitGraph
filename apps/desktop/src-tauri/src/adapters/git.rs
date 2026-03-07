@@ -1,9 +1,16 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use git2::{
+    Commit, Delta, DiffDelta, DiffFindOptions, DiffLineType, Error, ErrorCode, Repository, Sort,
+};
 
 use crate::domain::models::{ParsedCommit, ParsedFileChange, ParsedRef};
 use crate::support::error::{AppError, AppResult};
+
+pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct CanonicalRepo {
@@ -18,21 +25,13 @@ pub fn validate_repository(path: &Path) -> AppResult<CanonicalRepo> {
     }
 
     let canonical_input = fs::canonicalize(path)?;
-    let inside_flag = run_git_command(&canonical_input, &["rev-parse", "--is-inside-work-tree"])?;
-    if inside_flag.trim() != "true" {
-        return Err(AppError::NotGitRepository(path.display().to_string()));
-    }
-
-    let top_level = run_git_command(&canonical_input, &["rev-parse", "--show-toplevel"])?;
-    let root = fs::canonicalize(top_level.trim())?;
-
-    let git_dir_raw = run_git_command(&root, &["rev-parse", "--git-dir"])?;
-    let git_dir_candidate = PathBuf::from(git_dir_raw.trim());
-    let git_dir = if git_dir_candidate.is_absolute() {
-        fs::canonicalize(git_dir_candidate)?
-    } else {
-        fs::canonicalize(root.join(git_dir_candidate))?
-    };
+    let repo = Repository::discover(&canonical_input)
+        .map_err(|_| AppError::NotGitRepository(path.display().to_string()))?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| AppError::NotGitRepository(path.display().to_string()))?;
+    let root = fs::canonicalize(workdir)?;
+    let git_dir = fs::canonicalize(repo.path())?;
 
     let name = root
         .file_name()
@@ -47,223 +46,391 @@ pub fn validate_repository(path: &Path) -> AppResult<CanonicalRepo> {
 }
 
 pub fn load_commits(repo_root: &Path) -> AppResult<Vec<ParsedCommit>> {
-    let format = "%H%x1f%P%x1f%T%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1e";
-    let pretty = format!("--pretty=format:{format}");
-    let log_output = run_git_command(
-        repo_root,
-        &[
-            "log",
-            "--all",
-            "--topo-order",
-            "--date-order",
-            pretty.as_str(),
-        ],
-    )?;
-
-    parse_git_log_records(&log_output)
+    collect_commits(repo_root, None)
 }
 
 pub fn load_commits_since(repo_root: &Path, since_epoch: i64) -> AppResult<Vec<ParsedCommit>> {
-    let safe_since = since_epoch.max(0);
-    let format = "%H%x1f%P%x1f%T%x1f%an%x1f%ae%x1f%at%x1f%ct%x1f%s%x1e";
-    let pretty = format!("--pretty=format:{format}");
-    let since = format!("--since=@{safe_since}");
-
-    let log_output = run_git_command(
-        repo_root,
-        &[
-            "log",
-            "--all",
-            "--topo-order",
-            "--date-order",
-            since.as_str(),
-            pretty.as_str(),
-        ],
-    )?;
-
-    parse_git_log_records(&log_output)
+    collect_commits(repo_root, Some(since_epoch.max(0)))
 }
 
-fn parse_git_log_records(log_output: &str) -> AppResult<Vec<ParsedCommit>> {
+pub fn stream_commits(
+    repo_root: &Path,
+    since_epoch: Option<i64>,
+    mut on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<()> {
+    walk_commits(repo_root, since_epoch, |_repo, commit| {
+        on_commit(build_parsed_commit(commit))
+    })
+}
+
+fn collect_commits(repo_root: &Path, since_epoch: Option<i64>) -> AppResult<Vec<ParsedCommit>> {
     let mut commits = Vec::new();
-    for record in log_output.split('\u{1e}') {
-        let trimmed = record.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = trimmed.split('\u{1f}').collect();
-        if fields.len() != 8 {
-            return Err(AppError::Parse(format!(
-                "unexpected commit log field count: {}",
-                fields.len()
-            )));
-        }
-
-        let parents = if fields[1].trim().is_empty() {
-            Vec::new()
-        } else {
-            fields[1]
-                .split_whitespace()
-                .map(|item| item.to_string())
-                .collect()
-        };
-
-        let author_time = fields[5]
-            .parse::<i64>()
-            .map_err(|_| AppError::Parse("invalid author_time".to_string()))?;
-        let committer_time = fields[6]
-            .parse::<i64>()
-            .map_err(|_| AppError::Parse("invalid committer_time".to_string()))?;
-
-        commits.push(ParsedCommit {
-            sha: fields[0].to_string(),
-            parents,
-            tree_sha: fields[2].to_string(),
-            author_name: fields[3].to_string(),
-            author_email: fields[4].to_string(),
-            author_time,
-            committer_time,
-            subject: fields[7].to_string(),
-        });
-    }
-
+    stream_commits(repo_root, since_epoch, |commit| {
+        commits.push(commit);
+        Ok(())
+    })?;
     Ok(commits)
 }
 
+fn walk_commits(
+    repo_root: &Path,
+    since_epoch: Option<i64>,
+    mut on_commit: impl FnMut(&Repository, &Commit<'_>) -> AppResult<()>,
+) -> AppResult<()> {
+    let repo = open_repository(repo_root)?;
+    if repo
+        .is_empty()
+        .map_err(|error| map_git_error("check repository emptiness", error))?
+    {
+        return Ok(());
+    }
+
+    let mut revwalk = repo
+        .revwalk()
+        .map_err(|error| map_git_error("create revision walk", error))?;
+    revwalk
+        .set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
+        .map_err(|error| map_git_error("configure revision walk sorting", error))?;
+
+    if let Err(error) = revwalk.push_glob("refs/*") {
+        if !is_not_found_error(&error) {
+            return Err(map_git_error("seed revision walk from refs/*", error));
+        }
+        return Ok(());
+    }
+
+    for oid_result in revwalk {
+        let oid = oid_result.map_err(|error| map_git_error("read walked commit id", error))?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|error| map_git_error("resolve walked commit", error))?;
+
+        if let Some(since) = since_epoch {
+            if commit.committer().when().seconds() < since {
+                continue;
+            }
+        }
+
+        on_commit(&repo, &commit)?;
+    }
+
+    Ok(())
+}
+
+fn build_parsed_commit(commit: &Commit<'_>) -> ParsedCommit {
+    let parents = commit.parent_ids().map(|id| id.to_string()).collect();
+    let author = commit.author();
+    let committer = commit.committer();
+    let subject = commit
+        .summary_bytes()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .unwrap_or_default();
+
+    ParsedCommit {
+        sha: commit.id().to_string(),
+        parents,
+        tree_sha: commit.tree_id().to_string(),
+        author_name: author.name().unwrap_or_default().to_string(),
+        author_email: author.email().unwrap_or_default().to_string(),
+        author_time: author.when().seconds(),
+        committer_time: committer.when().seconds(),
+        subject,
+    }
+}
+
 pub fn load_refs(repo_root: &Path) -> AppResult<Vec<ParsedRef>> {
-    let raw_refs = run_git_command(
-        repo_root,
-        &["show-ref", "--heads", "--tags", "--dereference"],
-    )?;
+    let repo = open_repository(repo_root)?;
     let mut refs = Vec::new();
 
-    for line in raw_refs.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    append_refs_by_glob(&repo, "refs/heads/*", "head", false, &mut refs)?;
+    append_refs_by_glob(&repo, "refs/tags/*", "tag", true, &mut refs)?;
 
-        let mut parts = trimmed.split_whitespace();
-        let target_sha = parts.next().unwrap_or_default().to_string();
-        let ref_name = parts.next().unwrap_or_default().to_string();
-        if target_sha.is_empty() || ref_name.is_empty() {
-            continue;
-        }
+    Ok(refs)
+}
 
-        let ref_type = if ref_name.starts_with("refs/heads/") {
-            "head"
-        } else if ref_name.starts_with("refs/tags/") {
-            "tag"
-        } else {
-            "other"
+fn append_refs_by_glob(
+    repo: &Repository,
+    glob: &str,
+    ref_type: &str,
+    peel_to_commit: bool,
+    refs: &mut Vec<ParsedRef>,
+) -> AppResult<()> {
+    let iterator = match repo.references_glob(glob) {
+        Ok(iter) => iter,
+        Err(error) if is_not_found_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(map_git_error(
+                &format!("list references by glob {glob}"),
+                error,
+            ))
+        }
+    };
+
+    for reference_result in iterator {
+        let reference = reference_result
+            .map_err(|error| map_git_error(&format!("iterate references by glob {glob}"), error))?;
+        let Some(ref_name) = reference.name() else {
+            continue;
+        };
+        let Some(target_sha) = resolve_reference_target(&reference, peel_to_commit) else {
+            continue;
         };
 
         refs.push(ParsedRef {
-            ref_name,
+            ref_name: ref_name.to_string(),
             target_sha,
             ref_type: ref_type.to_string(),
         });
     }
 
-    Ok(refs)
+    Ok(())
+}
+
+fn resolve_reference_target(
+    reference: &git2::Reference<'_>,
+    peel_to_commit: bool,
+) -> Option<String> {
+    if peel_to_commit {
+        if let Ok(object) = reference.peel(git2::ObjectType::Commit) {
+            return Some(object.id().to_string());
+        }
+    }
+
+    if let Some(target) = reference.target() {
+        return Some(target.to_string());
+    }
+
+    if let Ok(resolved) = reference.resolve() {
+        if let Some(target) = resolved.target() {
+            return Some(target.to_string());
+        }
+    }
+
+    None
 }
 
 pub fn load_file_changes_for_commits(
     repo_root: &Path,
     commit_shas: &[String],
 ) -> AppResult<Vec<ParsedFileChange>> {
-    if commit_shas.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut changes = Vec::new();
-    for chunk in commit_shas.chunks(200) {
-        let mut owned_args = vec![
-            "show".to_string(),
-            "--numstat".to_string(),
-            "--format=%x1e%H".to_string(),
-            "--no-color".to_string(),
-            "--no-ext-diff".to_string(),
-        ];
-
-        for sha in chunk {
-            owned_args.push(sha.clone());
-        }
-
-        let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
-        let output = run_git_command(repo_root, &args)?;
-        changes.extend(parse_numstat_output(&output));
-    }
-
+    stream_file_changes_for_commits(repo_root, commit_shas, |change| {
+        changes.push(change);
+        Ok(())
+    })?;
     Ok(changes)
 }
 
-fn parse_numstat_output(raw_output: &str) -> Vec<ParsedFileChange> {
-    let mut current_commit_sha: Option<String> = None;
-    let mut changes = Vec::new();
-
-    for line in raw_output.lines() {
-        if let Some(sha) = line.strip_prefix('\u{1e}') {
-            let sha = sha.trim();
-            if !sha.is_empty() {
-                current_commit_sha = Some(sha.to_string());
-            }
-            continue;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let Some(commit_sha) = current_commit_sha.as_ref() else {
-            continue;
-        };
-
-        let mut fields = line.splitn(3, '\t');
-        let Some(additions_raw) = fields.next() else {
-            continue;
-        };
-        let Some(deletions_raw) = fields.next() else {
-            continue;
-        };
-        let Some(file_path_raw) = fields.next() else {
-            continue;
-        };
-
-        let Some((additions, additions_binary)) = parse_numstat_count(additions_raw) else {
-            continue;
-        };
-        let Some((deletions, deletions_binary)) = parse_numstat_count(deletions_raw) else {
-            continue;
-        };
-
-        let file_path = file_path_raw.trim();
-        if file_path.is_empty() {
-            continue;
-        }
-
-        let binary = additions_binary || deletions_binary;
-        let change_type = classify_change_type(file_path, additions, deletions, binary);
-        changes.push(ParsedFileChange {
-            commit_sha: commit_sha.clone(),
-            file_path: file_path.to_string(),
-            additions,
-            deletions,
-            change_type,
-        });
+pub fn stream_file_changes_for_commits(
+    repo_root: &Path,
+    commit_shas: &[String],
+    mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
+) -> AppResult<()> {
+    if commit_shas.is_empty() {
+        return Ok(());
     }
 
-    changes
+    let repo = open_repository(repo_root)?;
+    for commit_sha in commit_shas {
+        append_file_changes_for_commit(&repo, commit_sha, &mut on_change)?;
+    }
+
+    Ok(())
 }
 
-fn parse_numstat_count(value: &str) -> Option<(i64, bool)> {
-    if value == "-" {
-        return Some((0, true));
+fn append_file_changes_for_commit(
+    repo: &Repository,
+    commit_sha: &str,
+    on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
+) -> AppResult<()> {
+    let oid = git2::Oid::from_str(commit_sha)
+        .map_err(|error| map_git_error("parse commit sha", error))?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|error| map_git_error("resolve commit for file change extraction", error))?;
+    let commit_tree = commit
+        .tree()
+        .map_err(|error| map_git_error("read commit tree", error))?;
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(
+            commit
+                .parent(0)
+                .map_err(|error| map_git_error("read first parent commit", error))?
+                .tree()
+                .map_err(|error| map_git_error("read parent commit tree", error))?,
+        )
+    } else {
+        None
+    };
+
+    let mut diff_options = git2::DiffOptions::new();
+    let mut diff = repo
+        .diff_tree_to_tree(
+            parent_tree.as_ref(),
+            Some(&commit_tree),
+            Some(&mut diff_options),
+        )
+        .map_err(|error| map_git_error("compute tree diff for commit", error))?;
+
+    let mut find_options = DiffFindOptions::new();
+    find_options.renames(true);
+    diff.find_similar(Some(&mut find_options))
+        .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+
+    let by_path = RefCell::new(HashMap::new());
+    let ordered_paths = RefCell::new(Vec::new());
+
+    diff.foreach(
+        &mut |delta, _progress| {
+            let path = delta_display_path(&delta);
+            if path.is_empty() {
+                return true;
+            }
+
+            let mut by_path = by_path.borrow_mut();
+            if !by_path.contains_key(&path) {
+                ordered_paths.borrow_mut().push(path.clone());
+                by_path.insert(path.clone(), FileChangeAccumulator::from_delta(&delta));
+            } else if let Some(accumulator) = by_path.get_mut(&path) {
+                accumulator.apply_delta(&delta);
+            }
+            true
+        },
+        None,
+        None,
+        Some(&mut |delta, _hunk, line| {
+            let path = delta_display_path(&delta);
+            if path.is_empty() {
+                return true;
+            }
+
+            if let Some(accumulator) = by_path.borrow_mut().get_mut(&path) {
+                accumulator.apply_line(line.origin_value());
+            }
+            true
+        }),
+    )
+    .map_err(|error| map_git_error("walk commit diff lines", error))?;
+
+    let mut by_path = by_path.into_inner();
+    let ordered_paths = ordered_paths.into_inner();
+    for path in ordered_paths {
+        let Some(accumulator) = by_path.remove(&path) else {
+            continue;
+        };
+        on_change(ParsedFileChange {
+            commit_sha: commit_sha.to_string(),
+            file_path: path.clone(),
+            additions: accumulator.additions,
+            deletions: accumulator.deletions,
+            change_type: accumulator.finalize_change_type(&path),
+        })?;
     }
 
-    value.parse::<i64>().ok().map(|parsed| (parsed, false))
+    Ok(())
+}
+
+fn delta_display_path(delta: &DiffDelta<'_>) -> String {
+    let old_path = delta
+        .old_file()
+        .path()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let new_path = delta
+        .new_file()
+        .path()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if delta.status() == Delta::Renamed
+        && !old_path.is_empty()
+        && !new_path.is_empty()
+        && old_path != new_path
+    {
+        return format!("{old_path} => {new_path}");
+    }
+
+    if !new_path.is_empty() {
+        return new_path;
+    }
+    old_path
+}
+
+fn delta_change_type(delta: &DiffDelta<'_>) -> String {
+    match delta.status() {
+        Delta::Added => "add".to_string(),
+        Delta::Deleted => "delete".to_string(),
+        Delta::Renamed => "rename".to_string(),
+        _ => "modify".to_string(),
+    }
+}
+
+fn open_repository(repo_root: &Path) -> AppResult<Repository> {
+    Repository::open(repo_root).map_err(|error| map_git_error("open git repository", error))
+}
+
+fn map_git_error(context: &str, error: Error) -> AppError {
+    AppError::GitCommand(format!(
+        "{context}: {} (class={:?}, code={:?})",
+        error.message(),
+        error.class(),
+        error.code()
+    ))
+}
+
+fn is_not_found_error(error: &Error) -> bool {
+    error.code() == ErrorCode::NotFound
+}
+
+#[derive(Debug, Clone)]
+struct FileChangeAccumulator {
+    additions: i64,
+    deletions: i64,
+    change_type: String,
+    binary: bool,
+}
+
+impl FileChangeAccumulator {
+    fn from_delta(delta: &DiffDelta<'_>) -> Self {
+        Self {
+            additions: 0,
+            deletions: 0,
+            change_type: delta_change_type(delta),
+            binary: delta.old_file().is_binary() || delta.new_file().is_binary(),
+        }
+    }
+
+    fn apply_delta(&mut self, delta: &DiffDelta<'_>) {
+        self.binary = self.binary || delta.old_file().is_binary() || delta.new_file().is_binary();
+        if self.change_type == "modify" {
+            self.change_type = delta_change_type(delta);
+        }
+    }
+
+    fn apply_line(&mut self, line_type: DiffLineType) {
+        match line_type {
+            DiffLineType::Addition | DiffLineType::AddEOFNL => {
+                self.additions = self.additions.saturating_add(1);
+            }
+            DiffLineType::Deletion | DiffLineType::DeleteEOFNL => {
+                self.deletions = self.deletions.saturating_add(1);
+            }
+            DiffLineType::Binary => {
+                self.binary = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize_change_type(&self, file_path: &str) -> String {
+        if self.binary {
+            return "binary".to_string();
+        }
+        if self.change_type != "modify" {
+            return self.change_type.clone();
+        }
+        classify_change_type(file_path, self.additions, self.deletions, false)
+    }
 }
 
 fn classify_change_type(file_path: &str, additions: i64, deletions: i64, binary: bool) -> String {
@@ -282,53 +449,29 @@ fn classify_change_type(file_path: &str, additions: i64, deletions: i64, binary:
     "modify".to_string()
 }
 
-fn run_git_command(repo_root: &Path, args: &[&str]) -> AppResult<String> {
-    let output = Command::new("git")
-        .arg("--no-pager")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if is_expected_empty_output(&stderr) {
-            return Ok(String::new());
-        }
-
-        return Err(AppError::GitCommand(format!(
-            "{} | args: {:?}",
-            stderr, args
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn is_expected_empty_output(stderr: &str) -> bool {
-    stderr.contains("No references") || stderr.contains("does not have any commits yet")
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{parse_numstat_output, run_git_command};
+    use super::{classify_change_type, validate_repository};
     use std::path::Path;
 
     #[test]
     fn unknown_repo_returns_error() {
-        let result = run_git_command(Path::new("c:/non-existent/repo"), &["status"]);
+        let result = validate_repository(Path::new("c:/non-existent/repo"));
         assert!(result.is_err());
     }
 
     #[test]
-    fn parses_numstat_records() {
-        let raw =
-            "\u{1e}aaaa\n10\t2\tsrc/lib.rs\n-\t-\tassets/logo.png\n\u{1e}bbbb\n1\t0\told => new\n";
-        let parsed = parse_numstat_output(raw);
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].commit_sha, "aaaa");
-        assert_eq!(parsed[0].change_type, "modify");
-        assert_eq!(parsed[1].change_type, "binary");
-        assert_eq!(parsed[2].change_type, "rename");
+    fn classifies_numstat_style_change_types() {
+        assert_eq!(classify_change_type("src/lib.rs", 10, 0, false), "add");
+        assert_eq!(classify_change_type("src/lib.rs", 0, 10, false), "delete");
+        assert_eq!(
+            classify_change_type("old/path.rs => new/path.rs", 1, 1, false),
+            "rename"
+        );
+        assert_eq!(
+            classify_change_type("assets/logo.png", 0, 0, true),
+            "binary"
+        );
+        assert_eq!(classify_change_type("src/lib.rs", 3, 2, false), "modify");
     }
 }

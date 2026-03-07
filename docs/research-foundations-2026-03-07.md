@@ -24,6 +24,8 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - Decision: keep integer rowid/NodeId state and dense visited/frontier structures.
 10. Reused prepared statements are a baseline optimization for repeated SQL hot paths.
    - Decision: enable SQLite prepared-statement caching and favor cached preparation in graph-query adapters.
+11. Repository indexing hot paths should avoid full-buffer subprocess output collection.
+   - Decision: migrate indexing hot path to libgit2 streaming APIs and bounded in-memory batches.
 
 ## Sources
 
@@ -59,3 +61,9 @@ This note captures the source-backed decisions used for the Phase 0 reset.
    - https://www.sqlite.org/cintro.html
 16. SQLite prepare flags (`SQLITE_PREPARE_PERSISTENT`):
    - https://www.sqlite.org/capi3ref.html#prepare_flags
+17. Rust process output collection:
+   - https://doc.rust-lang.org/std/process/struct.Command.html
+18. git2 `Revwalk`:
+   - https://docs.rs/git2/latest/git2/struct.Revwalk.html
+19. libgit2 diff iteration:
+   - https://libgit2.org/docs/reference/main/diff/git_diff_foreach.html

@@ -24,6 +24,8 @@ Keep graph-query code performant by default on medium/large repositories without
 5. BFS/topological and bidirectional shortest-path expansion use batched neighbor queries with ordered vector outputs (`Vec<Vec<i64>>`) on hot paths.
 6. SHA strings are only materialized at API boundaries (request/response) via ordered rowid lookups (no per-node `HashMap` lookups in traversal response assembly).
 7. SQLite statement cache is enabled and hot graph queries use cached prepared statements.
+8. Repository indexing uses libgit2 streaming adapters (`revwalk` + in-process diff callbacks), not full-buffer Git CLI log/show parsing.
+9. Indexer memory is bounded by explicit commit/file-change batch sizes rather than repository-total history size.
 
 ## Why This Strategy
 
@@ -50,6 +52,15 @@ Keep graph-query code performant by default on medium/large repositories without
 4. Anti-tamper rule:
    - if docs/guardrail/policy files are changed, implementation files must also change in the same diff.
 5. Automation guardrails and script-platform policy are defined in `docs/automation-guardrails.md`.
+6. Git adapter indexing hot path must avoid process-spawned Git CLI and expose streaming APIs.
+7. Indexer must use streaming commit ingestion with bounded file-change batch buffers.
+
+## Ingestion Performance Policy
+
+1. Do not reintroduce full-buffer hot-path ingestion (`Command::output`-based `git log`/`git show`) in adapter code.
+2. Keep commit ingestion streaming.
+3. Keep file-change extraction and database writes bounded by explicit batch sizes.
+4. Keep index transaction semantics and idempotent upsert behavior unchanged.
 
 ## Direction-Optimizing BFS Policy
 
@@ -95,3 +106,8 @@ Keep graph-query code performant by default on medium/large repositories without
 5. Ligra (shared-memory graph processing with sparse/dense push-pull): https://jshun.csail.mit.edu/ligra.pdf
 6. GraphIt push/pull scheduling and frontier representation options: https://graphit-lang.org/getting-started
 7. GAP Benchmark Suite (direction-optimizing BFS in a reference benchmark): https://arxiv.org/abs/1508.03619
+8. Rust process output collection semantics: https://doc.rust-lang.org/std/process/struct.Command.html
+9. git2 `Revwalk` API: https://docs.rs/git2/latest/git2/struct.Revwalk.html
+10. libgit2 diff callback API: https://libgit2.org/docs/reference/main/diff/git_diff_foreach.html
+11. Git commit-graph command: https://git-scm.com/docs/git-commit-graph
+12. Git maintenance tasks (`commit-graph`): https://git-scm.com/docs/git-maintenance

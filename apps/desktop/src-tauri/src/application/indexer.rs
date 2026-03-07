@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{params, Transaction};
 
 use crate::adapters::db::{
     clear_repository_index_data, delete_file_changes_for_commits, load_commit_rowid,
@@ -9,13 +9,14 @@ use crate::adapters::db::{
     upsert_repository,
 };
 use crate::adapters::git::{
-    load_commits, load_commits_since, load_file_changes_for_commits, load_refs, validate_repository,
+    load_refs, stream_commits, stream_file_changes_for_commits, validate_repository,
+    FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
 use crate::application::graph_queries;
 use crate::domain::models::{
     CommitWindowCursor, CommitWindowResponse, GraphDirection, GraphTraversalResponse,
-    GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, RepositorySummary,
-    ShortestPathResponse,
+    GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats, ParsedFileChange,
+    RepositorySummary, ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
@@ -23,6 +24,7 @@ use crate::support::error::{AppError, AppResult};
 const DEFAULT_WINDOW_LIMIT: usize = 100;
 const MAX_WINDOW_LIMIT: usize = 500;
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
+const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
 
 pub struct Indexer {
     db_path: PathBuf,
@@ -70,23 +72,21 @@ impl Indexer {
 
         let checkpoint = load_index_checkpoint(&conn, repo_id)?;
         let mut effective_mode = mode;
-        let commits = match mode {
-            IndexingMode::Full => load_commits(&canonical_repo.root)?,
+        let since_epoch = match mode {
+            IndexingMode::Full => None,
             IndexingMode::Incremental => {
                 if let Some(checkpoint) = &checkpoint {
-                    let since = checkpoint
-                        .last_committer_time
-                        .saturating_sub(INCREMENTAL_LOOKBACK_SECONDS);
-                    load_commits_since(&canonical_repo.root, since)?
+                    Some(
+                        checkpoint
+                            .last_committer_time
+                            .saturating_sub(INCREMENTAL_LOOKBACK_SECONDS),
+                    )
                 } else {
                     effective_mode = IndexingMode::Full;
-                    load_commits(&canonical_repo.root)?
+                    None
                 }
             }
         };
-
-        let commit_shas: Vec<String> = commits.iter().map(|commit| commit.sha.clone()).collect();
-        let file_changes = load_file_changes_for_commits(&canonical_repo.root, &commit_shas)?;
 
         let refs = load_refs(&canonical_repo.root)?;
         let indexed_at_epoch = now_epoch_seconds();
@@ -94,12 +94,14 @@ impl Indexer {
         let tx = conn.transaction()?;
         if effective_mode == IndexingMode::Full {
             clear_repository_index_data(&tx, repo_id)?;
-        } else {
-            delete_file_changes_for_commits(&tx, repo_id, &commit_shas)?;
         }
 
         let mut commits_inserted = 0usize;
         let mut edges_inserted = 0usize;
+        let mut file_changes_indexed = 0usize;
+        let mut checkpoint_candidate: Option<(i64, String)> = None;
+        let mut pending_commit_shas = Vec::with_capacity(FILE_CHANGE_COMMIT_BATCH_SIZE);
+        let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
 
         {
             let mut commit_stmt = tx.prepare(
@@ -125,7 +127,7 @@ impl Indexer {
             "#,
             )?;
 
-            for commit in &commits {
+            stream_commits(&canonical_repo.root, since_epoch, |commit| {
                 commit_stmt.execute(params![
                     commit.sha.as_str(),
                     repo_id,
@@ -142,14 +144,51 @@ impl Indexer {
                     edge_stmt.execute(params![commit.sha.as_str(), parent.as_str(), repo_id])?;
                     edges_inserted += 1;
                 }
-            }
+
+                if pending_commit_shas.len() >= FILE_CHANGE_COMMIT_BATCH_SIZE {
+                    flush_pending_commit_file_changes(
+                        &tx,
+                        &canonical_repo.root,
+                        repo_id,
+                        effective_mode,
+                        &mut pending_commit_shas,
+                        &mut pending_file_changes,
+                        &mut file_changes_indexed,
+                    )?;
+                }
+                pending_commit_shas.push(commit.sha.clone());
+                update_checkpoint_candidate(
+                    &mut checkpoint_candidate,
+                    commit.committer_time,
+                    &commit.sha,
+                );
+
+                Ok(())
+            })?;
         }
 
-        let file_changes_indexed = upsert_file_changes(&tx, repo_id, &file_changes)?;
+        flush_pending_commit_file_changes(
+            &tx,
+            &canonical_repo.root,
+            repo_id,
+            effective_mode,
+            &mut pending_commit_shas,
+            &mut pending_file_changes,
+            &mut file_changes_indexed,
+        )?;
+        if !pending_file_changes.is_empty() {
+            file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
+                &tx,
+                repo_id,
+                &pending_file_changes,
+            )?);
+            pending_file_changes.clear();
+        }
+
         let refs_indexed = synchronize_refs(&tx, repo_id, &refs)?;
         set_repository_indexed_at(&tx, repo_id, indexed_at_epoch)?;
 
-        if let Some(checkpoint) = build_checkpoint(&commits, indexed_at_epoch) {
+        if let Some(checkpoint) = build_checkpoint(checkpoint_candidate, indexed_at_epoch) {
             upsert_index_checkpoint(&tx, repo_id, &checkpoint)?;
         }
 
@@ -272,20 +311,67 @@ impl Indexer {
     }
 }
 
+fn flush_pending_commit_file_changes(
+    tx: &Transaction<'_>,
+    repo_root: &Path,
+    repo_id: i64,
+    mode: IndexingMode,
+    pending_commit_shas: &mut Vec<String>,
+    pending_file_changes: &mut Vec<ParsedFileChange>,
+    file_changes_indexed: &mut usize,
+) -> AppResult<()> {
+    if pending_commit_shas.is_empty() {
+        return Ok(());
+    }
+
+    if mode == IndexingMode::Incremental {
+        delete_file_changes_for_commits(tx, repo_id, pending_commit_shas)?;
+    }
+
+    stream_file_changes_for_commits(repo_root, pending_commit_shas, |change| {
+        pending_file_changes.push(change);
+        if pending_file_changes.len() >= FILE_CHANGE_DB_BATCH_SIZE {
+            *file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
+                tx,
+                repo_id,
+                pending_file_changes,
+            )?);
+            pending_file_changes.clear();
+        }
+        Ok(())
+    })?;
+
+    pending_commit_shas.clear();
+    Ok(())
+}
+
+fn update_checkpoint_candidate(
+    checkpoint_candidate: &mut Option<(i64, String)>,
+    committer_time: i64,
+    sha: &str,
+) {
+    match checkpoint_candidate {
+        None => {
+            *checkpoint_candidate = Some((committer_time, sha.to_string()));
+        }
+        Some((best_time, best_sha)) => {
+            if committer_time > *best_time
+                || (committer_time == *best_time && sha > best_sha.as_str())
+            {
+                *best_time = committer_time;
+                *best_sha = sha.to_string();
+            }
+        }
+    }
+}
+
 fn build_checkpoint(
-    commits: &[crate::domain::models::ParsedCommit],
+    checkpoint_candidate: Option<(i64, String)>,
     indexed_at_epoch: i64,
 ) -> Option<IndexCheckpoint> {
-    commits
-        .iter()
-        .max_by(|left, right| {
-            left.committer_time
-                .cmp(&right.committer_time)
-                .then_with(|| left.sha.cmp(&right.sha))
-        })
-        .map(|commit| IndexCheckpoint {
-            last_committer_time: commit.committer_time,
-            last_commit_sha: commit.sha.clone(),
-            indexed_at_epoch,
-        })
+    checkpoint_candidate.map(|(last_committer_time, last_commit_sha)| IndexCheckpoint {
+        last_committer_time,
+        last_commit_sha,
+        indexed_at_epoch,
+    })
 }

@@ -240,12 +240,55 @@ if (-not (Test-Path $srcRoot)) {
             Add-Failure "Graph query engine must use integer frontier state. Found String-heavy patterns at: $($formatted -join ", ")"
         }
     }
+
+    $gitAdapterPath = Join-Path $srcRoot "adapters/git.rs"
+    if (Test-Path $gitAdapterPath) {
+        if (Select-String -Path $gitAdapterPath -Pattern 'Command::new\("git"\)' -Quiet) {
+            Add-Failure "Git adapter hot ingestion path must use libgit2 APIs (no process-spawned git CLI)."
+        } else {
+            Add-Pass "Git adapter uses libgit2 ingestion path (no git CLI process spawn)."
+        }
+
+        if (Select-String -Path $gitAdapterPath -Pattern 'fn run_git_command' -Quiet) {
+            Add-Failure "Legacy full-buffer git command helper must not be reintroduced."
+        } else {
+            Add-Pass "No legacy full-buffer git command helper found in Git adapter."
+        }
+
+        if (
+            (Select-String -Path $gitAdapterPath -Pattern 'stream_commits' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern 'stream_file_changes_for_commits' -Quiet)
+        ) {
+            Add-Pass "Git adapter exposes streaming commit/file-change ingestion APIs."
+        } else {
+            Add-Failure "Git adapter must expose streaming commit/file-change ingestion APIs."
+        }
+    }
+
+    $indexerPath = Join-Path $srcRoot "application/indexer.rs"
+    if (Test-Path $indexerPath) {
+        if (Select-String -Path $indexerPath -Pattern 'stream_commits\(' -Quiet) {
+            Add-Pass "Indexer uses streaming commit ingestion."
+        } else {
+            Add-Failure "Indexer must use streaming commit ingestion."
+        }
+
+        if (
+            (Select-String -Path $indexerPath -Pattern 'FILE_CHANGE_COMMIT_BATCH_SIZE' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'FILE_CHANGE_DB_BATCH_SIZE' -Quiet)
+        ) {
+            Add-Pass "Indexer enforces bounded file-change batch buffers."
+        } else {
+            Add-Failure "Indexer must keep bounded file-change batch buffers."
+        }
+    }
 }
 
 $requiredDocs = @(
     "docs/engineering-system.md",
     "docs/from-scratch-system.md",
     "docs/adr/README.md",
+    "docs/adr/0006-streaming-libgit2-ingestion.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )
