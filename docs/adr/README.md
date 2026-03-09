@@ -18,6 +18,8 @@ Use `NNNN-short-title.md`, for example:
 2. `0002-indexing-checkpoint-strategy.md`
 3. `0006-streaming-libgit2-ingestion.md`
 4. `0012-gitoxide-ingestion-adapter-migration.md`
+5. `0013-quality-perf-workflow-hardening.md`
+6. `0014-runtime-query-graph-cache.md`
 
 ## Template
 

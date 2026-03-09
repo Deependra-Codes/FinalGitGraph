@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-gix = "0.74.1"
+gix = "0.80.0"
 memory-stats = "1.2.0"
 rayon = "1.11.0"
 rusqlite = { version = "0.31.0", features = ["bundled"] }

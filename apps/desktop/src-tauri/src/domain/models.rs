@@ -138,6 +138,41 @@ pub struct IndexingStats {
     pub ingestion_phase_timing_ms: IngestionPhaseTimingMs,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileChangeExtractionQueueMetrics {
+    pub depth: usize,
+    pub oldest_queue_age_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileChangeExtractionDrainStats {
+    pub drained_commits: usize,
+    pub failed_commits: usize,
+    pub file_changes_indexed: usize,
+    pub queue: FileChangeExtractionQueueMetrics,
+    pub phase_timing_ms: FileChangeExtractionDrainPhaseTimingMs,
+    pub batch_stats: FileChangeExtractionDrainBatchStats,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileChangeExtractionDrainPhaseTimingMs {
+    pub queue_fetch: f64,
+    pub diff_extract: f64,
+    pub stage_insert: f64,
+    pub delete_old_rows: f64,
+    pub file_change_merge_upsert: f64,
+    pub enrichment_enqueue: f64,
+    pub queue_clear: f64,
+    pub tx_commit: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileChangeExtractionDrainBatchStats {
+    pub batches: usize,
+    pub commits_per_batch_mean: f64,
+    pub file_changes_per_batch_mean: f64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FileChangeStatsState {
@@ -181,6 +216,11 @@ pub struct IngestionPhaseTimingMs {
     pub file_diff_build: f64,
     pub file_diff_rename_find: f64,
     pub file_diff_delta_emit: f64,
+    pub extraction_dispatch_wait: f64,
+    pub extraction_worker_busy: f64,
+    pub extraction_reorder_buffer_max_depth: f64,
+    pub extraction_worker_errors: f64,
+    pub extraction_worker_aborts: f64,
     pub file_change_delete: f64,
     pub file_change_upsert: f64,
     pub tx_commit: f64,

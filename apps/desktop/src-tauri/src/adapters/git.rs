@@ -2,6 +2,7 @@ use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gix::bstr::ByteSlice;
@@ -21,13 +22,23 @@ use crate::domain::models::{
 use crate::support::error::{AppError, AppResult};
 
 pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 200;
-const FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS: usize = 64;
 const FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE: usize = 16;
 const FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE: usize = 4;
 const FILE_CHANGE_PARSE_PARALLEL_TARGET_CHUNKS_PER_WORKER: usize = 2;
 const FILE_CHANGE_PARSE_CHANNEL_CAPACITY: usize = 8;
 const FILE_CHANGE_PARSE_CHANNEL_CAPACITY_PER_WORKER: usize = 2;
 const FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX: usize = 64;
+const FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX: usize = 8;
+const FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS_DEFAULT_FLOOR: usize = 8;
+const FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS_PER_WORKER: usize = 2;
+const FILE_CHANGE_PARSE_WORKER_THREADS_ENV: &str = "GITGRAPH_FILE_CHANGE_PARALLEL_THREADS";
+const FILE_CHANGE_PARSE_MIN_COMMITS_ENV: &str = "GITGRAPH_FILE_CHANGE_PARALLEL_MIN_COMMITS";
+const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_ENV: &str =
+    "GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE";
+const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_ENV: &str = "GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY";
+const FILE_CHANGE_DIFF_REPO_API_FALLBACK_ENV: &str = "GITGRAPH_FILE_CHANGE_DIFF_REPO_API";
+const COMMIT_WALK_SORT_ENV: &str = "GITGRAPH_COMMIT_WALK_SORT";
+const INDEX_FAST_MODE_ENV: &str = "GITGRAPH_INDEX_FAST_MODE";
 const FILE_CHANGE_RENAME_LIMIT: usize = 400;
 const FILE_CHANGE_RENAME_THRESHOLD_SMALL: u16 = 60;
 const FILE_CHANGE_RENAME_THRESHOLD_MEDIUM: u16 = 65;
@@ -41,11 +52,28 @@ const MIN_OBJECT_ID_HEX_LEN: usize = 40;
 const GIX_OBJECT_CACHE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
 const GIX_OBJECT_CACHE_BYTES_MIN: usize = 16 * 1024 * 1024;
 const GIX_OBJECT_CACHE_BYTES_MAX: usize = GIX_OBJECT_CACHE_BYTES_DEFAULT;
+const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT: usize = 64;
+const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT: usize = 32;
+const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_MAX: usize = 512;
+const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_MAX: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitWalkSortMode {
+    CommitTimeNewest,
+    BreadthFirst,
+    CommitTimeCutoff,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileChangeExtractionMode {
     MetadataOnly,
     SelectiveLineStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileChangeParallelProfile {
+    Interactive,
+    Drain,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +87,7 @@ struct RenameDetectionPolicy {
 struct ParallelFileChangePlan {
     chunk_size: usize,
     channel_capacity: usize,
+    wave_chunk_limit: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -180,7 +209,7 @@ fn walk_commits(
 
     let mut revwalk = repo
         .rev_walk(tips)
-        .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
+        .sorting(resolve_commit_walk_sorting(since_epoch));
     if let Some(hide_sha) = hide_ancestor_sha {
         let hide_oid = parse_hex_object_id(hide_sha, "parse revision walk hide commit sha")?;
         revwalk = revwalk.with_hidden([hide_oid]);
@@ -339,6 +368,136 @@ fn resolve_reference_target(
     None
 }
 
+fn parse_positive_env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn parse_env_bool_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn parse_commit_walk_sort_mode() -> Option<CommitWalkSortMode> {
+    std::env::var(COMMIT_WALK_SORT_ENV).ok().and_then(|value| {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "commit_time_newest" => Some(CommitWalkSortMode::CommitTimeNewest),
+            "breadth_first" => Some(CommitWalkSortMode::BreadthFirst),
+            "commit_time_cutoff" => Some(CommitWalkSortMode::CommitTimeCutoff),
+            _ => None,
+        }
+    })
+}
+
+fn resolve_commit_walk_sorting(since_epoch: Option<i64>) -> Sorting {
+    let explicit = parse_commit_walk_sort_mode();
+    let selected = explicit.unwrap_or_else(|| {
+        if parse_env_bool_enabled(INDEX_FAST_MODE_ENV) {
+            if since_epoch.is_some() {
+                CommitWalkSortMode::CommitTimeCutoff
+            } else {
+                CommitWalkSortMode::BreadthFirst
+            }
+        } else {
+            CommitWalkSortMode::CommitTimeNewest
+        }
+    });
+    match selected {
+        CommitWalkSortMode::CommitTimeNewest => Sorting::ByCommitTime(CommitTimeOrder::NewestFirst),
+        CommitWalkSortMode::BreadthFirst => Sorting::BreadthFirst,
+        CommitWalkSortMode::CommitTimeCutoff => {
+            if let Some(cutoff_epoch) = since_epoch {
+                Sorting::ByCommitTimeCutoff {
+                    order: CommitTimeOrder::NewestFirst,
+                    seconds: cutoff_epoch.max(0),
+                }
+            } else {
+                Sorting::ByCommitTime(CommitTimeOrder::NewestFirst)
+            }
+        }
+    }
+}
+
+fn use_repo_diff_api_fallback() -> bool {
+    static USE_REPO_API_DIFF: OnceLock<bool> = OnceLock::new();
+    *USE_REPO_API_DIFF
+        .get_or_init(|| parse_env_bool_enabled(FILE_CHANGE_DIFF_REPO_API_FALLBACK_ENV))
+}
+
+fn resolve_parallel_worker_count(
+    available_threads: usize,
+    configured_override: Option<usize>,
+) -> usize {
+    let normalized_available = available_threads.max(1);
+    let default_threads = normalized_available.min(FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX);
+    configured_override
+        .unwrap_or(default_threads)
+        .clamp(1, normalized_available)
+}
+
+fn configured_parallel_worker_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    resolve_parallel_worker_count(
+        available,
+        parse_positive_env_usize(FILE_CHANGE_PARSE_WORKER_THREADS_ENV),
+    )
+}
+
+fn parallel_min_commits_threshold_for_workers(
+    worker_count: usize,
+    configured_override: Option<usize>,
+) -> usize {
+    let normalized_worker_count = worker_count.max(1);
+    let default_threshold = FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS_DEFAULT_FLOOR.max(
+        normalized_worker_count.saturating_mul(FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS_PER_WORKER),
+    );
+    configured_override.unwrap_or(default_threshold).max(1)
+}
+
+fn configured_parallel_min_commits_threshold(worker_count: usize) -> usize {
+    parallel_min_commits_threshold_for_workers(
+        worker_count,
+        parse_positive_env_usize(FILE_CHANGE_PARSE_MIN_COMMITS_ENV),
+    )
+}
+
+fn should_use_parallel_file_change_extraction(
+    total_commits: usize,
+    worker_count: usize,
+    min_commits_threshold: usize,
+) -> bool {
+    worker_count > 1 && total_commits >= min_commits_threshold
+}
+
+fn file_change_thread_pool() -> AppResult<&'static rayon::ThreadPool> {
+    static FILE_CHANGE_THREAD_POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+    let pool_result = FILE_CHANGE_THREAD_POOL.get_or_init(|| {
+        let worker_count = configured_parallel_worker_count();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .thread_name(|index| format!("gitgraph-file-change-{index}"))
+            .build()
+            .map_err(|error| format!("build dedicated file-change rayon thread pool: {error}"))
+    });
+
+    match pool_result {
+        Ok(pool) => Ok(pool),
+        Err(message) => Err(AppError::GitCommand(message.clone())),
+    }
+}
+
 pub fn load_file_changes_for_commits(
     repo_root: &Path,
     commit_shas: &[String],
@@ -351,9 +510,73 @@ pub fn load_file_changes_for_commits(
     Ok(changes)
 }
 
+pub(crate) struct FileChangeBatchSequentialExtractor {
+    repo: Repository,
+    diff_resource_cache: Option<gix::diff::blob::Platform>,
+    line_stat_resource_cache: Option<gix::diff::blob::Platform>,
+}
+
+impl FileChangeBatchSequentialExtractor {
+    pub(crate) fn new(repo_root: &Path) -> AppResult<Self> {
+        Ok(Self {
+            repo: open_repository(repo_root)?,
+            diff_resource_cache: None,
+            line_stat_resource_cache: None,
+        })
+    }
+
+    pub(crate) fn batch_sequential_with_reused_repo(
+        &mut self,
+        commit_shas: &[String],
+        mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
+    ) -> AppResult<FileDiffTelemetry> {
+        let mut telemetry = FileDiffTelemetry::default();
+        for commit_sha in commit_shas {
+            let commit_telemetry = append_file_changes_for_commit(
+                &self.repo,
+                commit_sha,
+                FileChangeExtractionMode::MetadataOnly,
+                None,
+                &mut self.diff_resource_cache,
+                &mut self.line_stat_resource_cache,
+                &mut on_change,
+            )?;
+            telemetry.merge(commit_telemetry);
+        }
+        Ok(telemetry)
+    }
+}
+
 pub fn stream_file_changes_for_commits(
     repo_root: &Path,
     commit_shas: &[String],
+    on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
+) -> AppResult<FileDiffTelemetry> {
+    stream_file_changes_for_commits_with_profile(
+        repo_root,
+        commit_shas,
+        FileChangeParallelProfile::Interactive,
+        on_change,
+    )
+}
+
+pub fn stream_file_changes_for_commits_drain(
+    repo_root: &Path,
+    commit_shas: &[String],
+    on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
+) -> AppResult<FileDiffTelemetry> {
+    stream_file_changes_for_commits_with_profile(
+        repo_root,
+        commit_shas,
+        FileChangeParallelProfile::Drain,
+        on_change,
+    )
+}
+
+fn stream_file_changes_for_commits_with_profile(
+    repo_root: &Path,
+    commit_shas: &[String],
+    parallel_profile: FileChangeParallelProfile,
     mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<FileDiffTelemetry> {
     let mut telemetry = FileDiffTelemetry::default();
@@ -361,20 +584,15 @@ pub fn stream_file_changes_for_commits(
         return Ok(telemetry);
     }
 
-    if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
-        let repo = open_repository(repo_root)?;
-        let mut line_stat_resource_cache = None;
-        for commit_sha in commit_shas {
-            let commit_telemetry = append_file_changes_for_commit(
-                &repo,
-                commit_sha,
-                FileChangeExtractionMode::MetadataOnly,
-                None,
-                &mut line_stat_resource_cache,
-                &mut on_change,
-            )?;
-            telemetry.merge(commit_telemetry);
-        }
+    let worker_count = file_change_thread_pool()?.current_num_threads().max(1);
+    let min_commits_threshold = configured_parallel_min_commits_threshold(worker_count);
+    if !should_use_parallel_file_change_extraction(
+        commit_shas.len(),
+        worker_count,
+        min_commits_threshold,
+    ) {
+        let mut extractor = FileChangeBatchSequentialExtractor::new(repo_root)?;
+        telemetry.merge(extractor.batch_sequential_with_reused_repo(commit_shas, &mut on_change)?);
         return Ok(telemetry);
     }
 
@@ -383,6 +601,7 @@ pub fn stream_file_changes_for_commits(
         commit_shas,
         FileChangeExtractionMode::MetadataOnly,
         None,
+        parallel_profile,
         on_change,
     )?;
     telemetry.merge(parallel_telemetry);
@@ -394,15 +613,22 @@ fn stream_file_changes_parallel_buffered(
     commit_shas: &[String],
     extraction_mode: FileChangeExtractionMode,
     line_stat_targets_by_commit: Option<&HashMap<String, HashSet<String>>>,
+    parallel_profile: FileChangeParallelProfile,
     mut on_change: impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<FileDiffTelemetry> {
     let mut total_telemetry = FileDiffTelemetry::default();
-    let parallel_plan = parallel_file_change_plan(commit_shas.len());
+    let _preflight_repo = open_repository(repo_root)?;
+    let pool = file_change_thread_pool()?;
+    let worker_count = pool.current_num_threads().max(1);
+    let parallel_plan =
+        parallel_file_change_plan(commit_shas.len(), worker_count, parallel_profile);
     let base_chunks: Vec<&[String]> = commit_shas
         .chunks(FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE)
         .collect();
     let commit_chunks: Vec<&[String]> =
-        if parallel_plan.chunk_size < FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE {
+        if parallel_plan.chunk_size > FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE {
+            commit_shas.chunks(parallel_plan.chunk_size).collect()
+        } else if parallel_plan.chunk_size < FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE {
             base_chunks
                 .into_iter()
                 .flat_map(|chunk| chunk.chunks(parallel_plan.chunk_size))
@@ -415,58 +641,114 @@ fn stream_file_changes_parallel_buffered(
         return Ok(total_telemetry);
     }
 
-    let (sender, receiver) =
-        sync_channel::<(usize, AppResult<ChunkFileChanges>)>(parallel_plan.channel_capacity);
-    std::thread::scope(|scope| -> AppResult<()> {
-        let line_stat_targets_by_commit = line_stat_targets_by_commit.cloned();
-        scope.spawn(move || {
-            commit_chunks
-                .into_par_iter()
-                .enumerate()
-                .map_init(
-                    || open_repository(repo_root),
-                    |repo_state, (chunk_index, chunk)| {
-                        let chunk_result = match repo_state {
-                            Ok(repo) => collect_file_changes_for_chunk_with_repo(
-                                repo,
-                                chunk,
-                                extraction_mode,
-                                line_stat_targets_by_commit.as_ref(),
-                            ),
-                            Err(error) => Err(AppError::GitCommand(format!(
-                                "initialize parallel file-change extraction worker repository handle: {error}"
-                            ))),
-                        };
-                        (chunk_index, chunk_result)
-                    },
-                )
-                .for_each_with(sender, |tx, (chunk_index, chunk_result)| {
-                    let _ = tx.send((chunk_index, chunk_result));
-                });
-        });
+    let line_stat_targets_by_commit = line_stat_targets_by_commit.cloned();
+    let mut chunk_start = 0usize;
+    while chunk_start < total_chunks {
+        let chunk_end = (chunk_start + parallel_plan.wave_chunk_limit).min(total_chunks);
+        let wave_chunks = &commit_chunks[chunk_start..chunk_end];
+        if wave_chunks.is_empty() {
+            break;
+        }
 
-        let mut next_chunk_index = 0usize;
-        let mut pending_by_index: HashMap<usize, Vec<ParsedFileChange>> = HashMap::new();
-        while next_chunk_index < total_chunks {
-            let (chunk_index, chunk_result) = receiver.recv().map_err(|_| {
+        let channel_capacity = parallel_plan.channel_capacity.min(wave_chunks.len()).max(1);
+        let (sender, receiver) =
+            sync_channel::<(usize, AppResult<ChunkFileChanges>)>(channel_capacity);
+        let mut ordered_wave_results: Vec<Option<ChunkFileChanges>> =
+            std::iter::repeat_with(|| None)
+                .take(wave_chunks.len())
+                .collect();
+        let mut first_error: Option<AppError> = None;
+
+        std::thread::scope(|scope| -> AppResult<()> {
+            let producer_repo_root = repo_root.to_path_buf();
+            let line_stat_targets_by_commit = line_stat_targets_by_commit.clone();
+            scope.spawn(move || {
+                pool.install(|| {
+                    wave_chunks
+                        .into_par_iter()
+                        .enumerate()
+                        .map_init(
+                            || open_repository(&producer_repo_root),
+                            |repo_state, (chunk_index, chunk)| {
+                                let chunk_result = match repo_state {
+                                    Ok(repo) => collect_file_changes_for_chunk_with_repo(
+                                        repo,
+                                        chunk,
+                                        extraction_mode,
+                                        line_stat_targets_by_commit.as_ref(),
+                                    ),
+                                    Err(error) => Err(AppError::GitCommand(format!(
+                                        "initialize parallel file-change extraction worker repository handle: {error}"
+                                    ))),
+                                };
+                                (chunk_index, chunk_result)
+                            },
+                        )
+                        .for_each_with(sender, |tx, (chunk_index, chunk_result)| {
+                            let _ = tx.send((chunk_index, chunk_result));
+                        });
+                });
+            });
+
+            let mut received = 0usize;
+            while received < wave_chunks.len() {
+                let received_chunk = receiver.recv().map_err(|_| {
+                    AppError::GitCommand(
+                        "receive parsed file-change chunk from parallel producer".to_string(),
+                    )
+                });
+                match received_chunk {
+                    Ok((chunk_index, chunk_result)) => {
+                        received = received.saturating_add(1);
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if first_error.is_none() {
+                                    if chunk_index < ordered_wave_results.len() {
+                                        ordered_wave_results[chunk_index] = Some(chunk);
+                                    } else {
+                                        first_error = Some(AppError::Parse(format!(
+                                            "parallel file-change chunk index out of range: {chunk_index}"
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                if first_error.is_none() {
+                                    first_error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            Ok(())
+        })?;
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        for maybe_chunk in ordered_wave_results {
+            let chunk = maybe_chunk.ok_or_else(|| {
                 AppError::GitCommand(
-                    "receive parsed file-change chunk from parallel producer".to_string(),
+                    "missing ordered parallel file-change chunk result".to_string(),
                 )
             })?;
-            let chunk = chunk_result?;
             total_telemetry.merge(chunk.telemetry);
-            pending_by_index.insert(chunk_index, chunk.changes);
-
-            while let Some(ordered_chunk_changes) = pending_by_index.remove(&next_chunk_index) {
-                for change in ordered_chunk_changes {
-                    on_change(change)?;
-                }
-                next_chunk_index = next_chunk_index.saturating_add(1);
+            for change in chunk.changes {
+                on_change(change)?;
             }
         }
 
-        Ok(())
-    })?;
+        chunk_start = chunk_end;
+    }
 
     Ok(total_telemetry)
 }
@@ -479,6 +761,7 @@ fn collect_file_changes_for_chunk_with_repo(
 ) -> AppResult<ChunkFileChanges> {
     let mut telemetry = FileDiffTelemetry::default();
     let mut chunk_changes = Vec::new();
+    let mut diff_resource_cache = None;
     let mut line_stat_resource_cache = None;
     for commit_sha in commit_shas {
         let line_stat_targets = line_stat_targets_by_commit
@@ -488,6 +771,7 @@ fn collect_file_changes_for_chunk_with_repo(
             commit_sha,
             extraction_mode,
             line_stat_targets,
+            &mut diff_resource_cache,
             &mut line_stat_resource_cache,
             &mut |change| {
                 chunk_changes.push(change);
@@ -520,8 +804,15 @@ pub fn load_file_change_line_stats_for_targets(
 
     let mut commit_shas: Vec<String> = line_stat_targets_by_commit.keys().cloned().collect();
     commit_shas.sort_unstable();
-    let parsed = if commit_shas.len() < FILE_CHANGE_PARSE_PARALLEL_MIN_COMMITS {
+    let worker_count = file_change_thread_pool()?.current_num_threads().max(1);
+    let min_commits_threshold = configured_parallel_min_commits_threshold(worker_count);
+    let parsed = if !should_use_parallel_file_change_extraction(
+        commit_shas.len(),
+        worker_count,
+        min_commits_threshold,
+    ) {
         let repo = open_repository(repo_root)?;
+        let mut diff_resource_cache = None;
         let mut changes = Vec::new();
         let mut line_stat_resource_cache = None;
         for commit_sha in &commit_shas {
@@ -531,6 +822,7 @@ pub fn load_file_change_line_stats_for_targets(
                 commit_sha,
                 FileChangeExtractionMode::SelectiveLineStats,
                 line_stat_targets,
+                &mut diff_resource_cache,
                 &mut line_stat_resource_cache,
                 &mut |change| {
                     changes.push(change);
@@ -546,6 +838,7 @@ pub fn load_file_change_line_stats_for_targets(
             &commit_shas,
             FileChangeExtractionMode::SelectiveLineStats,
             Some(&line_stat_targets_by_commit),
+            FileChangeParallelProfile::Interactive,
             |change| {
                 changes.push(change);
                 Ok(())
@@ -630,8 +923,37 @@ fn should_run_rename_detection(
     }
 }
 
-fn parallel_file_change_plan(total_commits: usize) -> ParallelFileChangePlan {
-    let worker_count = rayon::current_num_threads().max(1);
+fn drain_parallel_chunk_size() -> usize {
+    parse_positive_env_usize(FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_ENV)
+        .unwrap_or(FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT)
+        .clamp(
+            FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+            FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_MAX,
+        )
+}
+
+fn drain_parallel_channel_capacity() -> usize {
+    parse_positive_env_usize(FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_ENV)
+        .unwrap_or(FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT)
+        .clamp(1, FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_MAX)
+}
+
+fn parallel_file_change_plan(
+    total_commits: usize,
+    worker_count: usize,
+    profile: FileChangeParallelProfile,
+) -> ParallelFileChangePlan {
+    if profile == FileChangeParallelProfile::Drain {
+        let chunk_size = drain_parallel_chunk_size();
+        let channel_capacity = drain_parallel_channel_capacity();
+        return ParallelFileChangePlan {
+            chunk_size,
+            channel_capacity,
+            wave_chunk_limit: channel_capacity.max(1),
+        };
+    }
+
+    let worker_count = worker_count.max(1);
     let target_chunk_count =
         worker_count.saturating_mul(FILE_CHANGE_PARSE_PARALLEL_TARGET_CHUNKS_PER_WORKER);
     let adaptive_chunk_size = if target_chunk_count == 0 {
@@ -649,10 +971,12 @@ fn parallel_file_change_plan(total_commits: usize) -> ParallelFileChangePlan {
             FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
             FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
         );
+    let wave_chunk_limit = channel_capacity.max(1);
 
     ParallelFileChangePlan {
         chunk_size,
         channel_capacity,
+        wave_chunk_limit,
     }
 }
 
@@ -768,8 +1092,70 @@ fn diff_max_file_size_bytes(repo: &Repository, diff: &[ChangeDetached]) -> u64 {
                 max_file_size_bytes = max_file_size_bytes.max(object_size_bytes(repo, *id));
             }
         }
+        if max_file_size_bytes >= FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES {
+            break;
+        }
     }
     max_file_size_bytes
+}
+
+fn should_probe_max_file_size(delta_count: usize) -> bool {
+    delta_count < FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
+}
+
+fn get_or_init_tree_diff_resource_cache<'a>(
+    repo: &Repository,
+    diff_resource_cache: &'a mut Option<gix::diff::blob::Platform>,
+) -> AppResult<&'a mut gix::diff::blob::Platform> {
+    if diff_resource_cache.is_none() {
+        *diff_resource_cache = Some(
+            repo.diff_resource_cache_for_tree_diff()
+                .map_err(|error| map_git_error("prepare tree-diff resource cache", error))?,
+        );
+    }
+    diff_resource_cache
+        .as_mut()
+        .ok_or_else(|| AppError::GitCommand("initialize tree-diff resource cache".to_string()))
+}
+
+fn diff_commit_trees(
+    repo: &Repository,
+    parent_tree: Option<&gix::Tree<'_>>,
+    commit_tree: &gix::Tree<'_>,
+    rewrite_options: Option<Rewrites>,
+    diff_resource_cache: &mut Option<gix::diff::blob::Platform>,
+) -> AppResult<Vec<ChangeDetached>> {
+    let mut diff_options = gix::diff::Options::default();
+    diff_options.track_rewrites(rewrite_options);
+
+    if use_repo_diff_api_fallback() {
+        return repo
+            .diff_tree_to_tree(parent_tree, Some(commit_tree), Some(diff_options))
+            .map_err(|error| map_git_error("compute tree diff for commit", error));
+    }
+
+    let empty_tree = repo.empty_tree();
+    let base_tree = parent_tree.unwrap_or(&empty_tree);
+    let cache = get_or_init_tree_diff_resource_cache(repo, diff_resource_cache)?;
+
+    let mut platform = base_tree
+        .changes()
+        .map_err(|error| map_git_error("prepare tree-diff platform for commit", error))?;
+    platform.options(|options| {
+        *options = diff_options;
+    });
+
+    let mut out = Vec::new();
+    platform
+        .for_each_to_obtain_tree_with_cache(commit_tree, cache, |change| {
+            out.push(change.detach());
+            Ok::<gix::object::tree::diff::Action, std::convert::Infallible>(
+                gix::object::tree::diff::Action::Continue(()),
+            )
+        })
+        .map_err(|error| map_git_error("compute tree diff for commit", error))?;
+    cache.clear_resource_cache_keep_allocation();
+    Ok(out)
 }
 
 fn get_or_init_line_stat_resource_cache<'a>(
@@ -817,11 +1203,36 @@ fn collect_patch_line_stats(
     }))
 }
 
+fn should_collect_targeted_line_stats(
+    extraction_mode: FileChangeExtractionMode,
+    delta: &ChangeDetached,
+    path: &str,
+    line_stat_targets: Option<&HashSet<String>>,
+) -> bool {
+    extraction_mode == FileChangeExtractionMode::SelectiveLineStats
+        && diff_requires_line_stats(delta)
+        && line_stat_targets
+            .map(|targets| targets.contains(path))
+            .unwrap_or(false)
+}
+
+fn should_emit_path(
+    extraction_mode: FileChangeExtractionMode,
+    path: &str,
+    filter_paths: Option<&HashSet<String>>,
+) -> bool {
+    extraction_mode != FileChangeExtractionMode::SelectiveLineStats
+        || filter_paths
+            .map(|targets| targets.contains(path))
+            .unwrap_or(false)
+}
+
 fn append_file_changes_for_commit(
     repo: &Repository,
     commit_sha: &str,
     extraction_mode: FileChangeExtractionMode,
     line_stat_targets: Option<&HashSet<String>>,
+    diff_resource_cache: &mut Option<gix::diff::blob::Platform>,
     line_stat_resource_cache: &mut Option<gix::diff::blob::Platform>,
     on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<FileDiffTelemetry> {
@@ -849,15 +1260,13 @@ fn append_file_changes_for_commit(
         })
         .transpose()?;
 
-    let mut raw_diff_options = gix::diff::Options::default();
-    raw_diff_options.track_rewrites(None);
-    let raw_diff = repo
-        .diff_tree_to_tree(
-            parent_tree.as_ref(),
-            Some(&commit_tree),
-            Some(raw_diff_options),
-        )
-        .map_err(|error| map_git_error("compute tree diff for commit", error))?;
+    let raw_diff = diff_commit_trees(
+        repo,
+        parent_tree.as_ref(),
+        &commit_tree,
+        None,
+        diff_resource_cache,
+    )?;
     telemetry.diff_build = telemetry
         .diff_build
         .saturating_add(diff_build_started.elapsed());
@@ -868,17 +1277,20 @@ fn append_file_changes_for_commit(
     if delta_count >= 2 {
         let has_add_delete_pair = diff_has_add_delete_pair(&diff);
         if should_run_rename_detection(extraction_mode, delta_count, has_add_delete_pair) {
-            let max_file_size_bytes = diff_max_file_size_bytes(repo, &diff);
+            let max_file_size_bytes = if should_probe_max_file_size(delta_count) {
+                diff_max_file_size_bytes(repo, &diff)
+            } else {
+                0
+            };
             if let Some(rename_policy) = rename_detection_policy(delta_count, max_file_size_bytes) {
-                let mut rewrite_options = gix::diff::Options::default();
-                rewrite_options.track_rewrites(Some(rewrites_from_policy(rename_policy)));
-                diff = repo
-                    .diff_tree_to_tree(
-                        parent_tree.as_ref(),
-                        Some(&commit_tree),
-                        Some(rewrite_options),
-                    )
-                    .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
+                diff = diff_commit_trees(
+                    repo,
+                    parent_tree.as_ref(),
+                    &commit_tree,
+                    Some(rewrites_from_policy(rename_policy)),
+                    diff_resource_cache,
+                )
+                .map_err(|error| map_git_error("detect file renames in commit diff", error))?;
             }
         }
     }
@@ -923,12 +1335,12 @@ fn append_file_changes_for_commit(
             }
         }
 
-        if extraction_mode == FileChangeExtractionMode::SelectiveLineStats
-            && diff_requires_line_stats(delta)
-            && line_stat_targets
-                .map(|targets| targets.contains(path.as_str()))
-                .unwrap_or(false)
-        {
+        if should_collect_targeted_line_stats(
+            extraction_mode,
+            delta,
+            path.as_str(),
+            line_stat_targets,
+        ) {
             selected_line_stat_targets.push(DiffLineStatTarget { diff_index, path });
         }
     }
@@ -957,11 +1369,7 @@ fn append_file_changes_for_commit(
     }
 
     for path in ordered_paths {
-        if emit_selected_paths_only
-            && !filter_paths
-                .map(|targets| targets.contains(path.as_str()))
-                .unwrap_or(false)
-        {
+        if !should_emit_path(extraction_mode, path.as_str(), filter_paths) {
             continue;
         }
 
@@ -1007,22 +1415,12 @@ fn emit_single_delta_fast_path(
         return Ok(());
     }
 
-    let emit_selected_paths_only = extraction_mode == FileChangeExtractionMode::SelectiveLineStats;
-    if emit_selected_paths_only {
-        let Some(targets) = line_stat_targets else {
-            return Ok(());
-        };
-        if !targets.contains(path.as_str()) {
-            return Ok(());
-        }
+    if !should_emit_path(extraction_mode, path.as_str(), line_stat_targets) {
+        return Ok(());
     }
 
     let mut accumulator = FileChangeAccumulator::from_delta(delta);
-    if extraction_mode == FileChangeExtractionMode::SelectiveLineStats
-        && diff_requires_line_stats(delta)
-        && line_stat_targets
-            .map(|targets| targets.contains(path.as_str()))
-            .unwrap_or(false)
+    if should_collect_targeted_line_stats(extraction_mode, delta, path.as_str(), line_stat_targets)
     {
         let resource_cache = get_or_init_line_stat_resource_cache(repo, line_stat_resource_cache)?;
         if let Some((additions, deletions)) =
@@ -1180,11 +1578,15 @@ impl FileChangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::{
-        object_cache_bytes_for_workers, parallel_file_change_plan, parse_hex_object_id,
-        rename_detection_policy, rename_threshold_for_bins, should_run_rename_detection,
-        validate_repository, FileChangeExtractionMode, FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
-        FILE_CHANGE_PARSE_CHANNEL_CAPACITY, FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
-        FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE, FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+        object_cache_bytes_for_workers, parallel_file_change_plan,
+        parallel_min_commits_threshold_for_workers, parse_hex_object_id, rename_detection_policy,
+        rename_threshold_for_bins, resolve_parallel_worker_count, should_probe_max_file_size,
+        should_run_rename_detection, should_use_parallel_file_change_extraction,
+        validate_repository, FileChangeExtractionMode, FileChangeParallelProfile,
+        FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT, FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT,
+        FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS, FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
+        FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX, FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE,
+        FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE, FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX,
         FILE_CHANGE_RENAME_LARGE_FILE_BYTES, FILE_CHANGE_RENAME_LIMIT,
         FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES, FILE_CHANGE_RENAME_THRESHOLD_LARGE,
         FILE_CHANGE_RENAME_THRESHOLD_MEDIUM, FILE_CHANGE_RENAME_THRESHOLD_SMALL,
@@ -1272,8 +1674,25 @@ mod tests {
     }
 
     #[test]
+    fn max_file_size_probe_is_skipped_for_large_delta_sets() {
+        assert!(should_probe_max_file_size(
+            FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS.saturating_sub(1)
+        ));
+        assert!(!should_probe_max_file_size(
+            FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
+        ));
+        assert!(!should_probe_max_file_size(
+            FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS.saturating_add(1)
+        ));
+    }
+
+    #[test]
     fn parallel_file_change_plan_is_bounded() {
-        let plan_small = parallel_file_change_plan(FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE);
+        let plan_small = parallel_file_change_plan(
+            FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+            1,
+            FileChangeParallelProfile::Interactive,
+        );
         assert!((FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE
             ..=FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE)
             .contains(&plan_small.chunk_size));
@@ -1281,8 +1700,10 @@ mod tests {
             (FILE_CHANGE_PARSE_CHANNEL_CAPACITY..=FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX)
                 .contains(&plan_small.channel_capacity)
         );
+        assert_eq!(plan_small.wave_chunk_limit, plan_small.channel_capacity);
 
-        let plan_large = parallel_file_change_plan(10_000);
+        let plan_large =
+            parallel_file_change_plan(10_000, 16, FileChangeParallelProfile::Interactive);
         assert!((FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE
             ..=FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE)
             .contains(&plan_large.chunk_size));
@@ -1290,6 +1711,48 @@ mod tests {
             (FILE_CHANGE_PARSE_CHANNEL_CAPACITY..=FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX)
                 .contains(&plan_large.channel_capacity)
         );
+        assert_eq!(plan_large.wave_chunk_limit, plan_large.channel_capacity);
+    }
+
+    #[test]
+    fn drain_parallel_profile_uses_larger_defaults() {
+        let plan = parallel_file_change_plan(10_000, 8, FileChangeParallelProfile::Drain);
+        assert_eq!(
+            plan.chunk_size,
+            FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT
+        );
+        assert_eq!(
+            plan.channel_capacity,
+            FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT
+        );
+        assert_eq!(plan.wave_chunk_limit, plan.channel_capacity);
+    }
+
+    #[test]
+    fn parallel_activation_supports_incremental_batches() {
+        let threshold = parallel_min_commits_threshold_for_workers(4, None);
+        assert!(
+            threshold <= 10,
+            "expected adaptive threshold to allow 10-commit batches"
+        );
+        assert!(should_use_parallel_file_change_extraction(10, 4, threshold));
+        assert!(!should_use_parallel_file_change_extraction(
+            threshold.saturating_sub(1),
+            4,
+            threshold
+        ));
+        assert!(!should_use_parallel_file_change_extraction(40, 1, 1));
+    }
+
+    #[test]
+    fn parallel_worker_count_respects_bounds_and_overrides() {
+        assert_eq!(
+            resolve_parallel_worker_count(16, None),
+            FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX
+        );
+        assert_eq!(resolve_parallel_worker_count(4, Some(2)), 2);
+        assert_eq!(resolve_parallel_worker_count(4, Some(10)), 4);
+        assert_eq!(resolve_parallel_worker_count(0, None), 1);
     }
 
     #[test]
