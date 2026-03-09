@@ -32,7 +32,7 @@ Keep graph-query code performant by default on medium/large repositories without
 5. BFS/topological and bidirectional shortest-path expansion use batched neighbor queries with ordered vector outputs (`Vec<Vec<i64>>`) on hot paths.
 6. SHA strings are only materialized at API boundaries (request/response) via ordered rowid lookups (no per-node `HashMap` lookups in traversal response assembly).
 7. SQLite statement cache is enabled and hot graph queries use cached prepared statements.
-8. Repository indexing uses libgit2 streaming adapters (`revwalk` + in-process diff callbacks), not full-buffer Git CLI log/show parsing.
+8. Repository indexing uses gix streaming adapters (`rev_walk` + in-process tree diffs), not full-buffer Git CLI log/show parsing.
 9. Indexer memory is bounded by explicit commit/file-change batch sizes rather than repository-total history size.
 10. File-change extraction uses lazy two-stage diff processing in `adapters/git.rs` (delta metadata first, selective `Patch::line_stats` only where required), while DB writes stay in the indexer's single transaction.
 11. Git adapter keeps adaptive-but-bounded Rayon planning for chunk size and channel capacity to improve utilization without unbounded fan-out.
@@ -43,6 +43,11 @@ Keep graph-query code performant by default on medium/large repositories without
 16. File-change ingestion now persists metadata first and defers expensive line stats through `file_change_enrichment_queue` + `stats_state`.
 17. Query-time JIT line-stats enrichment is available via commit-scoped enrichment APIs (`ensure_file_change_stats_for_commits`).
 18. Perf report supports fixture reuse (`--fixture-root` + `--reuse-fixture`) so warm lanes avoid fixture-generation cost.
+19. File-change extraction uses a dedicated bounded Rayon pool (default `min(available CPUs, 8)`) and supports env tuning via `GITGRAPH_FILE_CHANGE_PARALLEL_THREADS`.
+20. File-change parallel activation threshold is adaptive and bounded (default floor 8 commits, scaled by worker count) and supports env override via `GITGRAPH_FILE_CHANGE_PARALLEL_MIN_COMMITS`.
+21. File-change enrichment failures are retryable with bounded exponential cooldown and max-attempt terminal transition to `failed`.
+22. BFS/topological reachable collection enforce node-budget truncation before expensive frontier expansion.
+23. Runtime traversal/shortest-path APIs default to an in-memory adjacency cache keyed by `(db_path, repo_id, indexed_at)` with env-gated SQLite fallback.
 
 ## Why This Strategy
 
@@ -160,6 +165,10 @@ Keep graph-query code performant by default on medium/large repositories without
 14. Warm ingestion budget lanes:
    - `pnpm run perf:ingestion:25k:warm`
    - `pnpm run perf:ingestion:90k:warm`
+15. PR smoke perf lane:
+   - `.github/workflows/rust-ci.yml` job `perf-smoke-pr`
+16. Nightly ingestion budget lane:
+   - `.github/workflows/nightly-ingestion-perf.yml` (`cold` + `warm`, profile `25k|90k`)
 
 ## Change Checklist for Graph Query Work
 
@@ -198,3 +207,4 @@ Keep graph-query code performant by default on medium/large repositories without
 16. git2 diff find options: https://docs.rs/git2/latest/git2/struct.DiffFindOptions.html
 17. SQLite FAQ (batching inserts/transactions): https://sqlite.org/faq.html
 18. SQLite WAL: https://sqlite.org/wal.html
+19. `docs/adr/0014-runtime-query-graph-cache.md`

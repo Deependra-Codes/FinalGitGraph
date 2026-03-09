@@ -41,8 +41,15 @@ These are class-level checks, not tied to a single historical failure.
 1. `Guardrail Policy Check` as an early hard gate.
 2. `Script Contract Probe` via `./scripts/perf-budget.ps1 -ProbeOnly` on both OS runners.
 3. `Performance Budget` execution on Ubuntu (release perf gate).
+4. `Perf Smoke (PR)` report lane on pull requests for fast regression signal.
 
 This ordering fails fast on automation regressions before expensive lanes.
+
+Nightly scale enforcement:
+
+1. `.github/workflows/nightly-ingestion-perf.yml` runs ingestion budget checks on `cold` and `warm` lanes.
+2. Nightly/default profile is `25k`; manual dispatch may select `90k`.
+3. The workflow runs `scripts/perf-ingestion-budget.ps1` with profile/lane inputs and preserves existing ingestion telemetry contracts.
 
 ## Performance Script Resilience Contract
 
@@ -105,6 +112,8 @@ Repository-scale indexing guardrails now also enforce:
 13. adaptive-but-bounded Rayon planning in `adapters/git.rs` for chunk/channel sizing (`parallel_file_change_plan`)
 14. metadata-only file-change hot ingestion mode in `adapters/git.rs` with selective JIT line-stats enrichment path
 15. file-change stats-state + queue persistence contract in DB/migrations (`stats_state`, `file_change_enrichment_queue`)
+16. retryable enrichment scheduling in `adapters/db.rs` (`attempts`, `last_error`, delayed `enqueued_at_epoch`, terminal `failed` at max attempts)
+17. dedicated bounded Rayon pool + adaptive incremental-friendly parallel threshold in `adapters/git.rs` (`GITGRAPH_FILE_CHANGE_PARALLEL_THREADS`, `GITGRAPH_FILE_CHANGE_PARALLEL_MIN_COMMITS`)
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
 

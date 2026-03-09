@@ -1,21 +1,60 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gitgraph_lab_core::application::commands::{
-    ensure_file_change_stats_for_commits, get_commit_window, get_graph_traversal,
-    get_shortest_path, index_commits, index_commits_with_mode, scan_repository,
+    drain_file_change_extraction_queue, ensure_file_change_stats_for_commits, get_commit_window,
+    get_graph_traversal, get_shortest_path, index_commits, index_commits_with_mode,
+    scan_repository,
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use tempfile::TempDir;
+
+fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| panic!("acquire env test guard: {error}"))
+}
+
+struct EnvVarRestore {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvVarRestore {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, original }
+    }
+
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            original: std::env::var(key).ok(),
+        }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(original) = &self.original {
+            std::env::set_var(self.key, original);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 #[test]
 fn scan_and_index_repository_smoke_test() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "# GitGraph Lab\n");
     git_commit(&repo_dir, "initial commit");
@@ -48,10 +87,8 @@ fn scan_and_index_repository_smoke_test() {
 
 #[test]
 fn incremental_indexing_and_commit_window_work() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "v1\n");
     git_commit(&repo_dir, "v1");
@@ -109,11 +146,294 @@ fn incremental_indexing_and_commit_window_work() {
 }
 
 #[test]
+fn fast_mode_indexes_commits_edges_and_drains_extraction_queue() {
+    let _guard = env_test_guard();
+    let _fast_mode_env = EnvVarRestore::set("GITGRAPH_INDEX_FAST_MODE", "1");
+    let _write_profile_env = EnvVarRestore::set("GITGRAPH_SQLITE_WRITE_PROFILE", "throughput");
+    let _walk_sort_env = EnvVarRestore::set("GITGRAPH_COMMIT_WALK_SORT", "breadth_first");
+
+    let (temp, repo_dir) = create_test_repo();
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+    write_file(repo_dir.join("README.md"), "v2\n");
+    git_commit(&repo_dir, "v2");
+    write_file(repo_dir.join("README.md"), "v3\n");
+    git_commit(&repo_dir, "v3");
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    let stats = index_commits_with_mode(&repo_str, Some(&db_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("fast-mode full index: {error}"));
+    assert!(stats.commits_indexed >= 3);
+    assert!(stats.edges_indexed >= 2);
+    assert_eq!(
+        stats.file_changes_indexed, 0,
+        "fast mode should defer file-change extraction from main indexing path"
+    );
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let queue_depth_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_change_extraction_queue",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("count extraction queue rows before drain: {error}"));
+    assert!(queue_depth_before >= 1);
+    drop(conn);
+
+    let drain_stats = drain_file_change_extraction_queue(&repo_str, Some(&db_str), None)
+        .unwrap_or_else(|error| panic!("drain extraction queue: {error}"));
+    assert!(drain_stats.drained_commits >= 1);
+    assert_eq!(drain_stats.failed_commits, 0);
+    assert_eq!(drain_stats.queue.depth, 0);
+    assert!(drain_stats.batch_stats.batches >= 1);
+    assert!(drain_stats.phase_timing_ms.diff_extract >= 0.0);
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let file_change_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count file_changes after drain: {error}"));
+    assert!(file_change_count >= 3);
+}
+
+#[test]
+fn fast_mode_drain_matches_synchronous_file_change_and_enrichment_state() {
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
+
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+    write_file(repo_dir.join("README.md"), "v2\n");
+    git_commit(&repo_dir, "v2");
+    run_git(&repo_dir, &["mv", "README.md", "README-renamed.md"]);
+    git_commit(&repo_dir, "rename readme");
+    write_file(repo_dir.join("README-renamed.md"), "v3\n");
+    git_commit(&repo_dir, "v3");
+
+    let baseline_db_path = temp.path().join("index-baseline.db");
+    let fast_db_path = temp.path().join("index-fast.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let baseline_db_str = baseline_db_path.to_string_lossy().to_string();
+    let fast_db_str = fast_db_path.to_string_lossy().to_string();
+
+    let _fast_mode_restore = EnvVarRestore::set("GITGRAPH_INDEX_FAST_MODE", "0");
+    scan_repository(&repo_str, Some(&baseline_db_str))
+        .unwrap_or_else(|error| panic!("baseline scan: {error}"));
+    index_commits_with_mode(&repo_str, Some(&baseline_db_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("baseline full index: {error}"));
+
+    let baseline_file_changes = load_file_change_snapshot(&baseline_db_path);
+    let baseline_enrichment_queue = load_enrichment_queue_snapshot(&baseline_db_path);
+
+    drop(_fast_mode_restore);
+    let _fast_mode_env = EnvVarRestore::set("GITGRAPH_INDEX_FAST_MODE", "1");
+    let _write_profile_env = EnvVarRestore::set("GITGRAPH_SQLITE_WRITE_PROFILE", "throughput");
+    let _walk_sort_env = EnvVarRestore::set("GITGRAPH_COMMIT_WALK_SORT", "breadth_first");
+    scan_repository(&repo_str, Some(&fast_db_str))
+        .unwrap_or_else(|error| panic!("fast scan: {error}"));
+    index_commits_with_mode(&repo_str, Some(&fast_db_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("fast full index: {error}"));
+    drain_file_change_extraction_queue(&repo_str, Some(&fast_db_str), None)
+        .unwrap_or_else(|error| panic!("fast drain: {error}"));
+
+    let fast_file_changes = load_file_change_snapshot(&fast_db_path);
+    let fast_enrichment_queue = load_enrichment_queue_snapshot(&fast_db_path);
+    assert_eq!(baseline_file_changes, fast_file_changes);
+    assert_eq!(baseline_enrichment_queue, fast_enrichment_queue);
+}
+
+#[test]
+fn drain_failure_rolls_back_staged_changes_for_batch() {
+    let _guard = env_test_guard();
+    let _fast_mode_env = EnvVarRestore::set("GITGRAPH_INDEX_FAST_MODE", "1");
+    let _write_profile_env = EnvVarRestore::set("GITGRAPH_SQLITE_WRITE_PROFILE", "throughput");
+    let _walk_sort_env = EnvVarRestore::set("GITGRAPH_COMMIT_WALK_SORT", "breadth_first");
+    let _drain_batch_env =
+        EnvVarRestore::set("GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_DRAIN", "1000");
+
+    let (temp, repo_dir) = create_test_repo();
+    write_file(repo_dir.join("README.md"), "v1\n");
+    git_commit(&repo_dir, "v1");
+    write_file(repo_dir.join("README.md"), "v2\n");
+    git_commit(&repo_dir, "v2");
+
+    let db_path = temp.path().join("index-failure.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+    index_commits_with_mode(&repo_str, Some(&db_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("fast full index: {error}"));
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let repo_id: i64 = conn
+        .query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("load repo id: {error}"));
+    let valid_sha: String = conn
+        .query_row(
+            "SELECT sha FROM commits WHERE repo_id = ?1 ORDER BY sha LIMIT 1",
+            params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("load valid sha: {error}"));
+    conn.execute(
+        "DELETE FROM file_change_extraction_queue WHERE repo_id = ?1",
+        [repo_id],
+    )
+    .unwrap_or_else(|error| panic!("clear extraction queue: {error}"));
+
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("system clock before unix epoch: {error}"))
+        .as_secs() as i64;
+    let invalid_sha = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string();
+    for sha in [&valid_sha, &invalid_sha] {
+        conn.execute(
+            r#"
+            INSERT INTO file_change_extraction_queue (
+              repo_id, commit_sha, enqueued_at_epoch, attempts, last_error, next_retry_epoch
+            ) VALUES (?1, ?2, ?3, 0, NULL, ?3)
+        "#,
+            params![repo_id, sha, now_epoch],
+        )
+        .unwrap_or_else(|error| panic!("seed extraction queue for {sha}: {error}"));
+    }
+    drop(conn);
+
+    let drain_stats = drain_file_change_extraction_queue(&repo_str, Some(&db_str), None)
+        .unwrap_or_else(|error| panic!("drain with invalid sha: {error}"));
+    assert_eq!(drain_stats.drained_commits, 0);
+    assert_eq!(drain_stats.failed_commits, 2);
+    assert_eq!(drain_stats.file_changes_indexed, 0);
+
+    let conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let file_change_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
+            params![repo_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("count file_changes after failed drain: {error}"));
+    assert_eq!(file_change_count, 0);
+
+    let attempts: Vec<(String, i64)> = {
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT commit_sha, attempts
+                FROM file_change_extraction_queue
+                WHERE repo_id = ?1
+                ORDER BY commit_sha ASC
+            "#,
+            )
+            .unwrap_or_else(|error| panic!("prepare queue attempts query: {error}"));
+        let rows = stmt
+            .query_map(params![repo_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap_or_else(|error| panic!("query queue attempts: {error}"));
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row.unwrap_or_else(|error| panic!("read queue attempt row: {error}")));
+        }
+        values
+    };
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|(_, attempt)| *attempt >= 1));
+}
+
+#[test]
+fn commit_window_has_more_is_correct_at_max_limit_boundary() {
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
+
+    write_file(repo_dir.join("README.md"), "seed\n");
+    git_commit(&repo_dir, "seed");
+
+    let db_path = temp.path().join("index.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_str = db_path.to_string_lossy().to_string();
+
+    scan_repository(&repo_str, Some(&db_str)).unwrap_or_else(|error| panic!("scan: {error}"));
+
+    let mut conn = Connection::open(&db_path).unwrap_or_else(|error| panic!("open db: {error}"));
+    let repo_id: i64 = conn
+        .query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("load repo id: {error}"));
+
+    let total_commits = 5_002usize;
+    let tx = conn
+        .transaction()
+        .unwrap_or_else(|error| panic!("open transaction: {error}"));
+    {
+        let mut insert_stmt = tx
+            .prepare(
+                r#"
+                INSERT INTO commits (
+                  repo_id,
+                  sha,
+                  author_name,
+                  author_email,
+                  author_time,
+                  committer_time,
+                  subject,
+                  body,
+                  tree_sha
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            )
+            .unwrap_or_else(|error| panic!("prepare commit insert: {error}"));
+
+        for index in 1..=total_commits {
+            let sha = format!("{index:040x}");
+            let tree_sha = format!("{:040x}", index + total_commits);
+            insert_stmt
+                .execute(params![
+                    repo_id,
+                    sha,
+                    "Perf Bot",
+                    "perf-bot@example.com",
+                    index as i64,
+                    index as i64,
+                    format!("synthetic-commit-{index}"),
+                    "",
+                    tree_sha,
+                ])
+                .unwrap_or_else(|error| panic!("insert synthetic commit {index}: {error}"));
+        }
+    }
+    tx.commit()
+        .unwrap_or_else(|error| panic!("commit synthetic inserts: {error}"));
+    drop(conn);
+
+    let first_window = get_commit_window(&repo_str, Some(&db_str), Some(5_000), None)
+        .unwrap_or_else(|error| panic!("first window at max limit: {error}"));
+    assert_eq!(first_window.commits.len(), 5_000);
+    assert!(first_window.has_more);
+    let first_last_sha = first_window
+        .commits
+        .last()
+        .map(|commit| commit.sha.clone())
+        .unwrap_or_else(|| panic!("expected first window tail sha"));
+    let cursor = first_window
+        .next_cursor
+        .clone()
+        .unwrap_or_else(|| panic!("expected next cursor at max limit"));
+
+    let second_window = get_commit_window(&repo_str, Some(&db_str), Some(5_000), Some(cursor))
+        .unwrap_or_else(|error| panic!("second window at max limit: {error}"));
+    assert_eq!(second_window.commits.len(), total_commits - 5_000);
+    assert!(!second_window.has_more);
+    assert!(second_window.next_cursor.is_none());
+    assert_ne!(first_last_sha, second_window.commits[0].sha);
+}
+
+#[test]
 fn ingestion_diff_subphase_telemetry_is_consistent_for_zero_and_single_delta_commits() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "v1\n");
     git_commit(&repo_dir, "v1");
@@ -146,10 +466,8 @@ fn ingestion_diff_subphase_telemetry_is_consistent_for_zero_and_single_delta_com
 
 #[test]
 fn indexing_large_history_keeps_file_change_ingestion_correct() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     let commit_count = 72usize;
     for index in 0..commit_count {
@@ -181,11 +499,81 @@ fn indexing_large_history_keeps_file_change_ingestion_correct() {
 }
 
 #[test]
+fn full_index_results_are_stable_across_pipeline_worker_counts() {
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
+
+    let commit_count = 48usize;
+    for index in 0..commit_count {
+        write_file(repo_dir.join("README.md"), &format!("commit-{index:03}\n"));
+        git_commit(&repo_dir, &format!("commit-{index:03}"));
+    }
+
+    let db_single_path = temp.path().join("index-single.db");
+    let db_fanout_path = temp.path().join("index-fanout.db");
+    let repo_str = repo_dir.to_string_lossy().to_string();
+    let db_single_str = db_single_path.to_string_lossy().to_string();
+    let db_fanout_str = db_fanout_path.to_string_lossy().to_string();
+
+    let _worker_restore = EnvVarRestore::capture("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS");
+    let _worker_incremental_restore =
+        EnvVarRestore::capture("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS_INCREMENTAL");
+
+    std::env::set_var("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS", "1");
+    std::env::set_var("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS_INCREMENTAL", "1");
+    scan_repository(&repo_str, Some(&db_single_str))
+        .unwrap_or_else(|error| panic!("scan single-worker config: {error}"));
+    let single_stats = index_commits_with_mode(&repo_str, Some(&db_single_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("single-worker full index: {error}"));
+
+    std::env::set_var("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS", "4");
+    std::env::set_var("GITGRAPH_FILE_CHANGE_PIPELINE_WORKERS_INCREMENTAL", "4");
+    scan_repository(&repo_str, Some(&db_fanout_str))
+        .unwrap_or_else(|error| panic!("scan fanout config: {error}"));
+    let fanout_stats = index_commits_with_mode(&repo_str, Some(&db_fanout_str), IndexingMode::Full)
+        .unwrap_or_else(|error| panic!("fanout full index: {error}"));
+
+    assert_eq!(single_stats.commits_indexed, fanout_stats.commits_indexed);
+    assert_eq!(single_stats.edges_indexed, fanout_stats.edges_indexed);
+    assert_eq!(
+        single_stats.file_changes_indexed,
+        fanout_stats.file_changes_indexed
+    );
+
+    let single_conn =
+        Connection::open(&db_single_path).unwrap_or_else(|error| panic!("open single db: {error}"));
+    let fanout_conn =
+        Connection::open(&db_fanout_path).unwrap_or_else(|error| panic!("open fanout db: {error}"));
+
+    let single_commits: i64 = single_conn
+        .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count single commits: {error}"));
+    let fanout_commits: i64 = fanout_conn
+        .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count fanout commits: {error}"));
+    assert_eq!(single_commits, fanout_commits);
+
+    let single_edges: i64 = single_conn
+        .query_row("SELECT COUNT(*) FROM commit_edges", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count single edges: {error}"));
+    let fanout_edges: i64 = fanout_conn
+        .query_row("SELECT COUNT(*) FROM commit_edges", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count fanout edges: {error}"));
+    assert_eq!(single_edges, fanout_edges);
+
+    let single_file_changes: i64 = single_conn
+        .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count single file_changes: {error}"));
+    let fanout_file_changes: i64 = fanout_conn
+        .query_row("SELECT COUNT(*) FROM file_changes", [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("count fanout file_changes: {error}"));
+    assert_eq!(single_file_changes, fanout_file_changes);
+}
+
+#[test]
 fn file_change_stats_are_deferred_and_jit_enrichable() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "v1\n");
     git_commit(&repo_dir, "v1");
@@ -249,10 +637,8 @@ fn file_change_stats_are_deferred_and_jit_enrichable() {
 
 #[test]
 fn jit_enrichment_is_commit_scoped() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "v1\n");
     git_commit(&repo_dir, "v1");
@@ -321,10 +707,8 @@ fn jit_enrichment_is_commit_scoped() {
 
 #[test]
 fn rename_commit_is_recorded_as_rename_change() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("alpha.txt"), "alpha\n");
     git_commit(&repo_dir, "add alpha");
@@ -379,10 +763,8 @@ fn rename_commit_is_recorded_as_rename_change() {
 
 #[test]
 fn graph_traversal_and_shortest_path_work() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "v1\n");
     git_commit(&repo_dir, "v1");
@@ -475,10 +857,8 @@ fn graph_traversal_and_shortest_path_work() {
 
 #[test]
 fn branching_graph_queries_work() {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
-    let repo_dir = temp.path().join("repo");
-    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
-    init_git_repo(&repo_dir);
+    let _guard = env_test_guard();
+    let (temp, repo_dir) = create_test_repo();
 
     write_file(repo_dir.join("README.md"), "base\n");
     git_commit(&repo_dir, "base");
@@ -542,6 +922,32 @@ fn branching_graph_queries_work() {
     assert!(truncated.truncated);
     assert_eq!(truncated.nodes.len(), 2);
 
+    let truncated_dfs = get_graph_traversal(
+        &repo_str,
+        Some(&db_str),
+        &merge_sha,
+        GraphTraversalStrategy::Dfs,
+        GraphDirection::Parents,
+        Some(1),
+    )
+    .unwrap_or_else(|error| panic!("truncated dfs traversal query: {error}"));
+    assert!(truncated_dfs.truncated);
+    assert_eq!(truncated_dfs.nodes.len(), 1);
+    assert_eq!(truncated_dfs.nodes[0].sha, merge_sha);
+
+    let truncated_topological = get_graph_traversal(
+        &repo_str,
+        Some(&db_str),
+        &merge_sha,
+        GraphTraversalStrategy::Topological,
+        GraphDirection::Parents,
+        Some(1),
+    )
+    .unwrap_or_else(|error| panic!("truncated topological traversal query: {error}"));
+    assert!(truncated_topological.truncated);
+    assert_eq!(truncated_topological.nodes.len(), 1);
+    assert_eq!(truncated_topological.nodes[0].sha, merge_sha);
+
     let invalid_topological = get_graph_traversal(
         &repo_str,
         Some(&db_str),
@@ -562,6 +968,94 @@ fn branching_graph_queries_work() {
     )
     .unwrap_err();
     assert_eq!(missing_sha_path.code, "invalid_argument");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileChangeSnapshotRow {
+    commit_sha: String,
+    file_path: String,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    change_type: String,
+    stats_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnrichmentQueueSnapshotRow {
+    commit_sha: String,
+    file_path: String,
+    attempts: i64,
+    last_error: Option<String>,
+}
+
+fn load_file_change_snapshot(path: &Path) -> Vec<FileChangeSnapshotRow> {
+    let conn = Connection::open(path).unwrap_or_else(|error| panic!("open db snapshot: {error}"));
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT commit_sha, file_path, additions, deletions, change_type, stats_state
+            FROM file_changes
+            ORDER BY commit_sha ASC, file_path ASC
+        "#,
+        )
+        .unwrap_or_else(|error| panic!("prepare file_change snapshot query: {error}"));
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(FileChangeSnapshotRow {
+                commit_sha: row.get(0)?,
+                file_path: row.get(1)?,
+                additions: row.get(2)?,
+                deletions: row.get(3)?,
+                change_type: row.get(4)?,
+                stats_state: row.get(5)?,
+            })
+        })
+        .unwrap_or_else(|error| panic!("query file_change snapshot rows: {error}"));
+
+    let mut snapshot = Vec::new();
+    for row in rows {
+        snapshot.push(row.unwrap_or_else(|error| panic!("read file_change snapshot row: {error}")));
+    }
+    snapshot
+}
+
+fn load_enrichment_queue_snapshot(path: &Path) -> Vec<EnrichmentQueueSnapshotRow> {
+    let conn = Connection::open(path).unwrap_or_else(|error| panic!("open db snapshot: {error}"));
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT commit_sha, file_path, attempts, last_error
+            FROM file_change_enrichment_queue
+            ORDER BY commit_sha ASC, file_path ASC
+        "#,
+        )
+        .unwrap_or_else(|error| panic!("prepare enrichment queue snapshot query: {error}"));
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(EnrichmentQueueSnapshotRow {
+                commit_sha: row.get(0)?,
+                file_path: row.get(1)?,
+                attempts: row.get(2)?,
+                last_error: row.get(3)?,
+            })
+        })
+        .unwrap_or_else(|error| panic!("query enrichment queue snapshot rows: {error}"));
+
+    let mut snapshot = Vec::new();
+    for row in rows {
+        snapshot.push(
+            row.unwrap_or_else(|error| panic!("read enrichment queue snapshot row: {error}")),
+        );
+    }
+    snapshot
+}
+
+fn create_test_repo() -> (TempDir, std::path::PathBuf) {
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    fs::create_dir_all(&repo_dir).unwrap_or_else(|error| panic!("create repo dir: {error}"));
+    init_git_repo(&repo_dir);
+    (temp, repo_dir)
 }
 
 fn init_git_repo(repo_dir: &Path) {

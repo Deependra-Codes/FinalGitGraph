@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use rusqlite::Connection;
 
@@ -6,14 +6,13 @@ use crate::adapters::db::{
     count_commits, load_commit_shas_for_rowids, load_neighbor_rowids,
     load_neighbor_rowids_for_sources, load_pull_neighbor_rowids,
 };
+use crate::application::limits::normalize_graph_max_nodes;
 use crate::domain::models::{
     GraphDirection, GraphNodeVisit, GraphTraversalResponse, GraphTraversalStrategy,
     ShortestPathResponse,
 };
 use crate::support::error::{AppError, AppResult};
 
-const DEFAULT_GRAPH_MAX_NODES: usize = 2_000;
-const MAX_GRAPH_MAX_NODES: usize = 2_000_000;
 const BFS_PULL_MIN_FRONTIER: usize = 256;
 const BFS_PULL_MIN_REMAINING: usize = 1_024;
 const BFS_PULL_FRONTIER_TO_REMAINING_RATIO: usize = 8;
@@ -128,12 +127,7 @@ pub fn traverse_graph(
     direction: GraphDirection,
     max_nodes: usize,
 ) -> AppResult<GraphTraversalResponse> {
-    let requested_max_nodes = if max_nodes == 0 {
-        DEFAULT_GRAPH_MAX_NODES
-    } else {
-        max_nodes
-    };
-    let bounded_max_nodes = requested_max_nodes.clamp(1, MAX_GRAPH_MAX_NODES);
+    let bounded_max_nodes = normalize_graph_max_nodes(max_nodes);
 
     let mut nodes = CompactNodeMap::default();
     let start_id = nodes.intern(start_rowid);
@@ -282,10 +276,27 @@ fn traverse_bfs_adaptive(
     let mut frontier = vec![start_id];
 
     while !frontier.is_empty() {
+        let remaining_budget = max_nodes.saturating_sub(visits.len());
+        if remaining_budget == 0 {
+            return Ok((visits, true));
+        }
+
+        let level_len = frontier.len();
+        if level_len > remaining_budget {
+            for node_id in frontier.iter().take(remaining_budget) {
+                visits.push((*node_id, depth));
+            }
+            return Ok((visits, true));
+        }
+
+        for node_id in &frontier {
+            visits.push((*node_id, depth));
+        }
+
         let remaining_nodes = total_nodes.saturating_sub(visited.count());
         let mode = select_bfs_mode(frontier.len(), remaining_nodes);
 
-        let next_frontier = match mode {
+        frontier = match mode {
             BfsMode::Push => {
                 expand_bfs_frontier_push(conn, repo_id, &frontier, direction, &mut visited, nodes)?
             }
@@ -293,17 +304,6 @@ fn traverse_bfs_adaptive(
                 expand_bfs_frontier_pull(conn, repo_id, &frontier, direction, &mut visited, nodes)?
             }
         };
-
-        let level_len = frontier.len();
-        for (index, node_id) in frontier.into_iter().enumerate() {
-            visits.push((node_id, depth));
-            if visits.len() >= max_nodes {
-                let has_more = (index + 1 < level_len) || !next_frontier.is_empty();
-                return Ok((visits, has_more));
-            }
-        }
-
-        frontier = next_frontier;
         depth = depth.saturating_add(1);
     }
 
@@ -326,19 +326,25 @@ fn traverse_bfs_push_only(
     let mut frontier = vec![start_id];
 
     while !frontier.is_empty() {
-        let next_frontier =
-            expand_bfs_frontier_push(conn, repo_id, &frontier, direction, &mut visited, nodes)?;
-
-        let level_len = frontier.len();
-        for (index, node_id) in frontier.into_iter().enumerate() {
-            visits.push((node_id, depth));
-            if visits.len() >= max_nodes {
-                let has_more = (index + 1 < level_len) || !next_frontier.is_empty();
-                return Ok((visits, has_more));
-            }
+        let remaining_budget = max_nodes.saturating_sub(visits.len());
+        if remaining_budget == 0 {
+            return Ok((visits, true));
         }
 
-        frontier = next_frontier;
+        let level_len = frontier.len();
+        if level_len > remaining_budget {
+            for node_id in frontier.iter().take(remaining_budget) {
+                visits.push((*node_id, depth));
+            }
+            return Ok((visits, true));
+        }
+
+        for node_id in &frontier {
+            visits.push((*node_id, depth));
+        }
+
+        frontier =
+            expand_bfs_frontier_push(conn, repo_id, &frontier, direction, &mut visited, nodes)?;
         depth = depth.saturating_add(1);
     }
 
@@ -428,15 +434,6 @@ fn traverse_dfs(
     while let Some((node_id, depth)) = stack.pop() {
         visits.push((node_id, depth));
         let source_rowid = nodes.rowid_for_id(node_id);
-
-        let neighbors = load_neighbor_rowids(conn, repo_id, source_rowid, direction)?;
-        for neighbor_rowid in neighbors.into_iter().rev() {
-            let neighbor_id = nodes.intern(neighbor_rowid);
-            if visited.insert(neighbor_id) {
-                stack.push((neighbor_id, depth.saturating_add(1)));
-            }
-        }
-
         if visits.len() >= max_nodes {
             let has_more = !stack.is_empty()
                 || has_unvisited_neighbors(
@@ -448,6 +445,14 @@ fn traverse_dfs(
                     nodes,
                 )?;
             return Ok((visits, has_more));
+        }
+
+        let neighbors = load_neighbor_rowids(conn, repo_id, source_rowid, direction)?;
+        for neighbor_rowid in neighbors.into_iter().rev() {
+            let neighbor_id = nodes.intern(neighbor_rowid);
+            if visited.insert(neighbor_id) {
+                stack.push((neighbor_id, depth.saturating_add(1)));
+            }
         }
     }
 
@@ -462,18 +467,16 @@ fn traverse_topological(
     max_nodes: usize,
     nodes: &mut CompactNodeMap,
 ) -> AppResult<(Vec<(NodeId, usize)>, bool)> {
-    let (reachable, depths, truncated_reachable) =
+    let (reachable, reachable_depths, truncated_reachable) =
         collect_reachable_bfs(conn, repo_id, start_id, direction, max_nodes, nodes)?;
-    let mut reachable_set = DenseSet::default();
-    for node_id in &reachable {
-        reachable_set.insert(*node_id);
+    let reachable_count = reachable.len();
+    let mut local_index_by_node = vec![usize::MAX; nodes.id_to_rowid.len()];
+    for (local_index, node_id) in reachable.iter().copied().enumerate() {
+        local_index_by_node[node_id] = local_index;
     }
 
-    let mut indegree: HashMap<NodeId, usize> = HashMap::with_capacity(reachable.len());
-    for node_id in &reachable {
-        indegree.insert(*node_id, 0usize);
-    }
-    let mut adjacency: HashMap<NodeId, Vec<NodeId>> = HashMap::with_capacity(reachable.len());
+    let mut indegree = vec![0usize; reachable_count];
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); reachable_count];
 
     let reachable_rowids: Vec<i64> = reachable
         .iter()
@@ -481,67 +484,79 @@ fn traverse_topological(
         .collect();
     let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &reachable_rowids, direction)?;
 
-    for (source_id, source_neighbors) in reachable.iter().zip(neighbors.into_iter()) {
+    for (source_local_index, source_neighbors) in neighbors.into_iter().enumerate() {
         let mut filtered = Vec::new();
         for neighbor_rowid in source_neighbors {
             let neighbor_id = nodes.intern(neighbor_rowid);
-            if reachable_set.contains(neighbor_id) {
-                filtered.push(neighbor_id);
+            if let Some(&neighbor_local_index) = local_index_by_node.get(neighbor_id) {
+                if neighbor_local_index != usize::MAX {
+                    filtered.push(neighbor_local_index);
+                }
             }
         }
 
-        for neighbor_id in &filtered {
-            if let Some(entry) = indegree.get_mut(neighbor_id) {
-                *entry = entry.saturating_add(1);
-            }
+        filtered.sort_unstable();
+        filtered.dedup();
+        for &neighbor_local_index in &filtered {
+            indegree[neighbor_local_index] = indegree[neighbor_local_index].saturating_add(1);
         }
-        adjacency.insert(*source_id, filtered);
+        adjacency[source_local_index] = filtered;
     }
 
-    let mut ready: BTreeSet<(usize, NodeId)> = BTreeSet::new();
-    for source_id in &reachable {
-        if indegree.get(source_id).copied().unwrap_or_default() == 0 {
-            let depth = depths.get(source_id).copied().unwrap_or(usize::MAX);
-            ready.insert((depth, *source_id));
+    let max_depth = reachable_depths.iter().copied().max().unwrap_or_default();
+    let mut ready_depth_buckets: Vec<VecDeque<usize>> = std::iter::repeat_with(VecDeque::new)
+        .take(max_depth.saturating_add(1))
+        .collect();
+    let mut next_ready_depth = ready_depth_buckets.len();
+    for local_index in 0..reachable_count {
+        if indegree[local_index] == 0 {
+            let depth = reachable_depths[local_index];
+            ready_depth_buckets[depth].push_back(local_index);
+            next_ready_depth = next_ready_depth.min(depth);
         }
     }
 
-    let mut ordered = Vec::new();
-    while let Some((_, source_id)) = ready.pop_first() {
+    let mut ordered = Vec::with_capacity(reachable_count);
+    let mut emitted_local = vec![false; reachable_count];
+    while next_ready_depth < ready_depth_buckets.len() {
+        while next_ready_depth < ready_depth_buckets.len()
+            && ready_depth_buckets[next_ready_depth].is_empty()
+        {
+            next_ready_depth = next_ready_depth.saturating_add(1);
+        }
+        if next_ready_depth >= ready_depth_buckets.len() {
+            break;
+        }
+
+        let Some(source_local_index) = ready_depth_buckets[next_ready_depth].pop_front() else {
+            continue;
+        };
+        emitted_local[source_local_index] = true;
         ordered.push((
-            source_id,
-            depths.get(&source_id).copied().unwrap_or_default(),
+            reachable[source_local_index],
+            reachable_depths[source_local_index],
         ));
 
-        if let Some(source_neighbors) = adjacency.get(&source_id) {
-            for neighbor_id in source_neighbors {
-                if let Some(value) = indegree.get_mut(neighbor_id) {
-                    if *value > 0 {
-                        *value -= 1;
-                    }
-                    if *value == 0 {
-                        ready.insert((
-                            depths.get(neighbor_id).copied().unwrap_or(usize::MAX),
-                            *neighbor_id,
-                        ));
-                    }
+        for &neighbor_local_index in &adjacency[source_local_index] {
+            if indegree[neighbor_local_index] == 0 {
+                continue;
+            }
+            indegree[neighbor_local_index] -= 1;
+            if indegree[neighbor_local_index] == 0 {
+                let neighbor_depth = reachable_depths[neighbor_local_index];
+                ready_depth_buckets[neighbor_depth].push_back(neighbor_local_index);
+                if neighbor_depth < next_ready_depth {
+                    next_ready_depth = neighbor_depth;
                 }
             }
         }
     }
 
-    let mut truncated = truncated_reachable || ordered.len() < reachable.len();
-    if ordered.len() < reachable.len() {
-        let mut present = DenseSet::default();
-        for (node_id, _) in &ordered {
-            present.insert(*node_id);
-        }
-        for source_id in reachable {
-            if !present.contains(source_id) {
-                ordered.push((
-                    source_id,
-                    depths.get(&source_id).copied().unwrap_or_default(),
-                ));
+    let mut truncated = truncated_reachable || ordered.len() < reachable_count;
+    if ordered.len() < reachable_count {
+        for (local_index, was_emitted) in emitted_local.into_iter().enumerate() {
+            if !was_emitted {
+                ordered.push((reachable[local_index], reachable_depths[local_index]));
             }
         }
         truncated = true;
@@ -557,13 +572,12 @@ fn collect_reachable_bfs(
     direction: GraphDirection,
     max_nodes: usize,
     nodes: &mut CompactNodeMap,
-) -> AppResult<(Vec<NodeId>, HashMap<NodeId, usize>, bool)> {
+) -> AppResult<(Vec<NodeId>, Vec<usize>, bool)> {
     let mut order = Vec::new();
-    let mut depths = HashMap::new();
+    let mut reachable_depths = Vec::new();
     let mut visited = DenseSet::default();
 
     visited.insert(start_id);
-    depths.insert(start_id, 0usize);
 
     let mut queue = VecDeque::from([(start_id, 0usize)]);
     while !queue.is_empty() {
@@ -575,36 +589,43 @@ fn collect_reachable_bfs(
             }
         }
 
+        let remaining_budget = max_nodes.saturating_sub(order.len());
+        if remaining_budget == 0 {
+            return Ok((order, reachable_depths, true));
+        }
+
+        let level_len = level_nodes.len();
+        if level_len > remaining_budget {
+            for (source_id, depth) in level_nodes.iter().take(remaining_budget) {
+                order.push(*source_id);
+                reachable_depths.push(*depth);
+            }
+            return Ok((order, reachable_depths, true));
+        }
+
+        for (source_id, depth) in &level_nodes {
+            order.push(*source_id);
+            reachable_depths.push(*depth);
+        }
+
         let source_rowids: Vec<i64> = level_nodes
             .iter()
             .map(|(node_id, _)| nodes.rowid_for_id(*node_id))
             .collect();
         let neighbors = load_neighbor_rowids_for_sources(conn, repo_id, &source_rowids, direction)?;
 
-        let level_len = level_nodes.len();
-        for (index, ((source_id, depth), source_neighbors)) in level_nodes
-            .into_iter()
-            .zip(neighbors.into_iter())
-            .enumerate()
-        {
-            order.push(source_id);
+        for ((_, depth), source_neighbors) in level_nodes.into_iter().zip(neighbors.into_iter()) {
             for neighbor_rowid in source_neighbors {
                 let neighbor_id = nodes.intern(neighbor_rowid);
                 if visited.insert(neighbor_id) {
                     let next_depth = depth.saturating_add(1);
-                    depths.insert(neighbor_id, next_depth);
                     queue.push_back((neighbor_id, next_depth));
                 }
-            }
-
-            if order.len() >= max_nodes {
-                let has_more = (index + 1 < level_len) || !queue.is_empty();
-                return Ok((order, depths, has_more));
             }
         }
     }
 
-    Ok((order, depths, false))
+    Ok((order, reachable_depths, false))
 }
 
 fn has_unvisited_neighbors(
@@ -789,6 +810,24 @@ mod tests {
         assert_eq!(select_bfs_mode(2_000, 64), BfsMode::Push);
         assert_eq!(select_bfs_mode(512, 8_192), BfsMode::Push);
         assert_eq!(select_bfs_mode(512, 4_096), BfsMode::Pull);
+    }
+
+    #[test]
+    fn bfs_truncation_respects_low_max_nodes_without_behavior_regression() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&mut conn).expect("run migrations");
+        let fixture = seed_pull_overlap_fixture(&mut conn, 256, 32);
+
+        let (push_visits, push_truncated) =
+            run_push_only(&conn, fixture.repo_id, fixture.root_rowid, 1);
+        assert_eq!(push_visits.len(), 1);
+        assert!(push_truncated);
+
+        let (adaptive_visits, adaptive_truncated) =
+            run_adaptive(&conn, fixture.repo_id, fixture.root_rowid, 1);
+        assert_eq!(adaptive_visits.len(), 1);
+        assert!(adaptive_truncated);
+        assert_eq!(push_visits, adaptive_visits);
     }
 
     #[test]

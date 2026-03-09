@@ -113,3 +113,21 @@ Completed:
 3. Added portable-script policy checks to block OS-specific assumptions in cross-platform scripts.
 4. Added `Script Contract Probe` in Rust CI (`./scripts/perf-budget.ps1 -ProbeOnly`) for both runner OSes.
 5. Hardened automation scripts for cross-platform home/path resolution.
+
+## Phase 2 Slice I Status (2026-03-08)
+
+Completed:
+
+1. Fixed commit-window max-limit sentinel correctness (`limit=5000` still preserves `limit+1` fetch for `has_more`).
+2. Added bounded retryable JIT enrichment lifecycle:
+   - non-terminal failures stay `pending` with delayed queue retries
+   - terminal transition to `failed` at max attempts
+   - re-enqueue resets attempts and last_error for fresh indexing cycles
+3. Hardened traversal budget behavior so BFS/DFS/topological truncation avoids unnecessary neighbor expansion when node budgets are exhausted.
+4. Hardened file-change parallel extraction with:
+   - dedicated bounded Rayon pool
+   - adaptive incremental-friendly parallel threshold defaults
+   - bounded wave/in-flight buffering with strict ordered emit
+5. Added CI/perf coverage upgrades:
+   - PR perf smoke report lane
+   - nightly ingestion perf workflow (`cold` + `warm`, profile-selectable)

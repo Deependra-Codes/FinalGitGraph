@@ -6,13 +6,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use gitgraph_lab_core::adapters::db::verify_sqlite_graph_query_plan_guards;
 use gitgraph_lab_core::application::commands::{
-    ensure_file_change_stats_for_commits, get_commit_window, get_graph_traversal,
-    get_shortest_path, index_commits_with_mode, scan_repository,
+    drain_file_change_extraction_queue, ensure_file_change_stats_for_commits, get_commit_window,
+    get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
 };
 use gitgraph_lab_core::domain::models::{
-    FileChangeStatsStateCounts, GraphDirection, GraphTraversalStrategy, IndexingMode,
+    FileChangeExtractionDrainStats, FileChangeExtractionQueueMetrics, FileChangeStatsStateCounts,
+    GraphDirection, GraphTraversalStrategy, IndexingMode,
 };
+use gitgraph_lab_core::support::clock::now_epoch_seconds;
 use memory_stats::memory_stats;
 use rusqlite::{params, Connection};
 
@@ -80,6 +83,7 @@ struct PhaseTimingSummary {
     full_index: Duration,
     incremental_fixture_append: Duration,
     incremental_index: Duration,
+    file_change_extraction_drain: Duration,
     query_benchmark: Duration,
     jit_file_change_enrichment: Duration,
     in_memory_graph_hydration: Duration,
@@ -96,6 +100,7 @@ struct PhaseMemorySummary {
     full_index_rss_bytes: Option<u64>,
     incremental_fixture_append_rss_bytes: Option<u64>,
     incremental_index_rss_bytes: Option<u64>,
+    file_change_extraction_drain_rss_bytes: Option<u64>,
     query_benchmark_rss_bytes: Option<u64>,
     jit_file_change_enrichment_rss_bytes: Option<u64>,
     in_memory_graph_hydration_rss_bytes: Option<u64>,
@@ -160,6 +165,8 @@ struct ReportInput<'a> {
     fixture_root: &'a Path,
     counts: (i64, i64, i64),
     file_change_stats_state_counts: &'a FileChangeStatsStateCounts,
+    file_change_extraction_queue: &'a FileChangeExtractionQueueMetrics,
+    file_change_extraction_drain: &'a FileChangeExtractionDrainStats,
     full_stats: &'a gitgraph_lab_core::domain::models::IndexingStats,
     incremental_stats: &'a gitgraph_lab_core::domain::models::IndexingStats,
     query: QueryLatencySet<'a>,
@@ -512,6 +519,37 @@ fn run_with_fixture(
     log_phase_done("incremental_index", incremental_index);
     let incremental_index_rss_bytes = memory_tracker.sample_rss();
 
+    let mut file_change_extraction_drain = Duration::default();
+    let mut file_change_extraction_drain_rss_bytes = memory_tracker.sample_rss();
+    let mut file_change_extraction_drain_stats = FileChangeExtractionDrainStats::default();
+    if index_fast_mode_enabled() {
+        log_phase_start("file_change_extraction_drain");
+        let file_change_extraction_drain_started = Instant::now();
+        let drain_stats =
+            drain_file_change_extraction_queue(repo_str.as_str(), Some(db_str.as_str()), None)
+                .map_err(|error| error.to_string())?;
+        file_change_extraction_drain_stats = drain_stats;
+        file_change_extraction_drain = file_change_extraction_drain_started.elapsed();
+        log_phase_done("file_change_extraction_drain", file_change_extraction_drain);
+        file_change_extraction_drain_rss_bytes = memory_tracker.sample_rss();
+        if file_change_extraction_drain_stats
+            .queue
+            .oldest_queue_age_seconds
+            > 60
+        {
+            return Err(format!(
+                "fast-mode queue freshness SLA failed: oldest_file_change_extraction_queue_age_seconds={} > 60",
+                file_change_extraction_drain_stats.queue.oldest_queue_age_seconds
+            ));
+        }
+    }
+
+    let plan_guard_conn = Connection::open(db_path)
+        .map_err(|error| format!("open sqlite db for fallback plan guard: {error}"))?;
+    let plan_guard_repo_id = load_repo_id(&plan_guard_conn)?;
+    verify_sqlite_graph_query_plan_guards(&plan_guard_conn, plan_guard_repo_id)
+        .map_err(|error| error.to_string())?;
+
     log_phase_start("query_benchmark");
     let query_started = Instant::now();
     let commit_window = measure_latencies(config.query_runs, || {
@@ -636,7 +674,8 @@ fn run_with_fixture(
     log_phase_done("jit_file_change_enrichment", jit_file_change_enrichment);
     let jit_file_change_enrichment_rss_bytes = memory_tracker.sample_rss();
 
-    let (counts, file_change_stats_state_counts) = load_repo_counts(db_path)?;
+    let (counts, file_change_stats_state_counts, file_change_extraction_queue) =
+        load_repo_counts(db_path)?;
 
     log_phase_start("in_memory_graph_hydration");
     let in_memory_graph_hydration_started = Instant::now();
@@ -699,6 +738,7 @@ fn run_with_fixture(
         full_index,
         incremental_fixture_append,
         incremental_index,
+        file_change_extraction_drain,
         query_benchmark,
         jit_file_change_enrichment,
         in_memory_graph_hydration,
@@ -713,6 +753,7 @@ fn run_with_fixture(
         full_index_rss_bytes,
         incremental_fixture_append_rss_bytes,
         incremental_index_rss_bytes,
+        file_change_extraction_drain_rss_bytes,
         query_benchmark_rss_bytes,
         jit_file_change_enrichment_rss_bytes,
         in_memory_graph_hydration_rss_bytes,
@@ -726,6 +767,8 @@ fn run_with_fixture(
         fixture_root,
         counts,
         file_change_stats_state_counts: &file_change_stats_state_counts,
+        file_change_extraction_queue: &file_change_extraction_queue,
+        file_change_extraction_drain: &file_change_extraction_drain_stats,
         full_stats: &full_stats,
         incremental_stats: &incremental_stats,
         query: QueryLatencySet {
@@ -867,6 +910,15 @@ fn parse_next_usize(flag: &str, value: Option<String>) -> PerfResult<usize> {
     let raw = value.ok_or_else(|| format!("{flag} requires a numeric value"))?;
     raw.parse::<usize>()
         .map_err(|_| format!("{flag} requires a numeric value"))
+}
+
+fn index_fast_mode_enabled() -> bool {
+    env::var("GITGRAPH_INDEX_FAST_MODE")
+        .map(|raw| {
+            let normalized = raw.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "on" | "yes")
+        })
+        .unwrap_or(false)
 }
 
 fn create_fixture_root() -> PerfResult<PathBuf> {
@@ -1274,7 +1326,13 @@ fn remove_database_files(db_path: &Path) -> PerfResult<()> {
     Ok(())
 }
 
-fn load_repo_counts(db_path: &Path) -> PerfResult<((i64, i64, i64), FileChangeStatsStateCounts)> {
+fn load_repo_counts(
+    db_path: &Path,
+) -> PerfResult<(
+    (i64, i64, i64),
+    FileChangeStatsStateCounts,
+    FileChangeExtractionQueueMetrics,
+)> {
     let conn = Connection::open(db_path)
         .map_err(|error| format!("open database {}: {error}", db_path.to_string_lossy()))?;
     let commits = conn
@@ -1317,7 +1375,36 @@ fn load_repo_counts(db_path: &Path) -> PerfResult<((i64, i64, i64), FileChangeSt
         }
     }
 
-    Ok(((commits, edges, file_changes), stats_state_counts))
+    let queue_depth: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_change_extraction_queue",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("count file_change_extraction_queue rows: {error}"))?;
+    let oldest_enqueued_epoch = conn
+        .query_row(
+            "SELECT MIN(enqueued_at_epoch) FROM file_change_extraction_queue",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(|error| {
+            format!("load min file_change_extraction_queue enqueued_at_epoch: {error}")
+        })?;
+    let now_epoch = now_epoch_seconds();
+    let oldest_queue_age_seconds = oldest_enqueued_epoch
+        .map(|epoch| now_epoch.saturating_sub(epoch).max(0))
+        .unwrap_or(0);
+    let queue_metrics = FileChangeExtractionQueueMetrics {
+        depth: queue_depth.max(0) as usize,
+        oldest_queue_age_seconds,
+    };
+
+    Ok((
+        (commits, edges, file_changes),
+        stats_state_counts,
+        queue_metrics,
+    ))
 }
 
 fn load_in_memory_graph_context(
@@ -1443,6 +1530,17 @@ fn format_report(input: &ReportInput<'_>) -> String {
         full_ingestion.file_diff_rename_find + incremental_ingestion.file_diff_rename_find;
     let ingest_file_diff_delta_emit_ms =
         full_ingestion.file_diff_delta_emit + incremental_ingestion.file_diff_delta_emit;
+    let ingest_extraction_dispatch_wait_ms =
+        full_ingestion.extraction_dispatch_wait + incremental_ingestion.extraction_dispatch_wait;
+    let ingest_extraction_worker_busy_ms =
+        full_ingestion.extraction_worker_busy + incremental_ingestion.extraction_worker_busy;
+    let ingest_extraction_reorder_buffer_max_depth = full_ingestion
+        .extraction_reorder_buffer_max_depth
+        .max(incremental_ingestion.extraction_reorder_buffer_max_depth);
+    let ingest_extraction_worker_errors =
+        full_ingestion.extraction_worker_errors + incremental_ingestion.extraction_worker_errors;
+    let ingest_extraction_worker_aborts =
+        full_ingestion.extraction_worker_aborts + incremental_ingestion.extraction_worker_aborts;
     let ingest_file_change_upsert_ms =
         full_ingestion.file_change_upsert + incremental_ingestion.file_change_upsert;
     let ingest_tx_commit_ms = full_ingestion.tx_commit + incremental_ingestion.tx_commit;
@@ -1477,6 +1575,8 @@ fn format_report(input: &ReportInput<'_>) -> String {
         input.in_memory_query.shortest_both.median_ms,
     );
     let workload_profile_hint = detect_workload_profile_hint(input.config);
+    let drain_phase_timing = &input.file_change_extraction_drain.phase_timing_ms;
+    let drain_batch_stats = &input.file_change_extraction_drain.batch_stats;
 
     let attributed_core = input.phase_timing.fixture_generation.as_secs_f64()
         + input.phase_timing.fixture_summary.as_secs_f64()
@@ -1485,6 +1585,10 @@ fn format_report(input: &ReportInput<'_>) -> String {
         + input.phase_timing.full_index.as_secs_f64()
         + input.phase_timing.incremental_fixture_append.as_secs_f64()
         + input.phase_timing.incremental_index.as_secs_f64()
+        + input
+            .phase_timing
+            .file_change_extraction_drain
+            .as_secs_f64()
         + input.phase_timing.query_benchmark.as_secs_f64()
         + input.phase_timing.jit_file_change_enrichment.as_secs_f64()
         + input.phase_timing.in_memory_graph_hydration.as_secs_f64()
@@ -1515,6 +1619,7 @@ phase_timing_ms:
   full_index: {:.3}
   incremental_fixture_append: {:.3}
   incremental_index: {:.3}
+  file_change_extraction_drain: {:.3}
   query_benchmark: {:.3}
   jit_file_change_enrichment: {:.3}
   in_memory_graph_hydration: {:.3}
@@ -1530,6 +1635,7 @@ phase_memory_bytes:
   full_index_rss: {}
   incremental_fixture_append_rss: {}
   incremental_index_rss: {}
+  file_change_extraction_drain_rss: {}
   query_benchmark_rss: {}
   jit_file_change_enrichment_rss: {}
   in_memory_graph_hydration_rss: {}
@@ -1546,6 +1652,22 @@ file_change_stats_state_counts:
   pending: {}
   ready: {}
   failed: {}
+
+file_change_extraction:
+  file_change_extraction_drain_ms: {:.3}
+  file_change_extraction_queue_depth: {}
+  oldest_file_change_extraction_queue_age_seconds: {}
+  file_change_extraction_drain_phase_timing_ms.queue_fetch: {:.3}
+  file_change_extraction_drain_phase_timing_ms.diff_extract: {:.3}
+  file_change_extraction_drain_phase_timing_ms.stage_insert: {:.3}
+  file_change_extraction_drain_phase_timing_ms.delete_old_rows: {:.3}
+  file_change_extraction_drain_phase_timing_ms.file_change_merge_upsert: {:.3}
+  file_change_extraction_drain_phase_timing_ms.enrichment_enqueue: {:.3}
+  file_change_extraction_drain_phase_timing_ms.queue_clear: {:.3}
+  file_change_extraction_drain_phase_timing_ms.tx_commit: {:.3}
+  file_change_extraction_drain_batches: {}
+  file_change_extraction_drain_commits_per_batch_mean: {:.3}
+  file_change_extraction_drain_file_changes_per_batch_mean: {:.3}
 
 full_index:
   duration_ms: {:.3}
@@ -1573,6 +1695,11 @@ ingestion_phase_timing_ms:
   full_file_diff_build: {:.3}
   full_file_diff_rename_find: {:.3}
   full_file_diff_delta_emit: {:.3}
+  full_extraction_dispatch_wait: {:.3}
+  full_extraction_worker_busy: {:.3}
+  full_extraction_reorder_buffer_max_depth: {:.3}
+  full_extraction_worker_errors: {:.3}
+  full_extraction_worker_aborts: {:.3}
   full_file_change_delete: {:.3}
   full_file_change_upsert: {:.3}
   full_tx_commit: {:.3}
@@ -1583,6 +1710,11 @@ ingestion_phase_timing_ms:
   incremental_file_diff_build: {:.3}
   incremental_file_diff_rename_find: {:.3}
   incremental_file_diff_delta_emit: {:.3}
+  incremental_extraction_dispatch_wait: {:.3}
+  incremental_extraction_worker_busy: {:.3}
+  incremental_extraction_reorder_buffer_max_depth: {:.3}
+  incremental_extraction_worker_errors: {:.3}
+  incremental_extraction_worker_aborts: {:.3}
   incremental_file_change_delete: {:.3}
   incremental_file_change_upsert: {:.3}
   incremental_tx_commit: {:.3}
@@ -1591,6 +1723,11 @@ ingestion_phase_timing_ms:
   ingest_file_diff_build_ms: {:.3}
   ingest_file_diff_rename_find_ms: {:.3}
   ingest_file_diff_delta_emit_ms: {:.3}
+  ingest_extraction_dispatch_wait_ms: {:.3}
+  ingest_extraction_worker_busy_ms: {:.3}
+  ingest_extraction_reorder_buffer_max_depth: {:.3}
+  ingest_extraction_worker_errors: {:.3}
+  ingest_extraction_worker_aborts: {:.3}
   ingest_file_change_upsert_ms: {:.3}
   ingest_tx_commit_ms: {:.3}
 
@@ -1632,6 +1769,7 @@ in_memory_vs_sqlite_median_speedup:
         duration_ms(input.phase_timing.full_index),
         duration_ms(input.phase_timing.incremental_fixture_append),
         duration_ms(input.phase_timing.incremental_index),
+        duration_ms(input.phase_timing.file_change_extraction_drain),
         duration_ms(input.phase_timing.query_benchmark),
         duration_ms(input.phase_timing.jit_file_change_enrichment),
         duration_ms(input.phase_timing.in_memory_graph_hydration),
@@ -1645,6 +1783,7 @@ in_memory_vs_sqlite_median_speedup:
         optional_u64_display(input.phase_memory.full_index_rss_bytes),
         optional_u64_display(input.phase_memory.incremental_fixture_append_rss_bytes),
         optional_u64_display(input.phase_memory.incremental_index_rss_bytes),
+        optional_u64_display(input.phase_memory.file_change_extraction_drain_rss_bytes),
         optional_u64_display(input.phase_memory.query_benchmark_rss_bytes),
         optional_u64_display(input.phase_memory.jit_file_change_enrichment_rss_bytes),
         optional_u64_display(input.phase_memory.in_memory_graph_hydration_rss_bytes),
@@ -1657,6 +1796,20 @@ in_memory_vs_sqlite_median_speedup:
         input.file_change_stats_state_counts.pending,
         input.file_change_stats_state_counts.ready,
         input.file_change_stats_state_counts.failed,
+        duration_ms(input.phase_timing.file_change_extraction_drain),
+        input.file_change_extraction_queue.depth,
+        input.file_change_extraction_queue.oldest_queue_age_seconds,
+        drain_phase_timing.queue_fetch,
+        drain_phase_timing.diff_extract,
+        drain_phase_timing.stage_insert,
+        drain_phase_timing.delete_old_rows,
+        drain_phase_timing.file_change_merge_upsert,
+        drain_phase_timing.enrichment_enqueue,
+        drain_phase_timing.queue_clear,
+        drain_phase_timing.tx_commit,
+        drain_batch_stats.batches,
+        drain_batch_stats.commits_per_batch_mean,
+        drain_batch_stats.file_changes_per_batch_mean,
         duration_ms(input.phase_timing.full_index),
         input.full_stats.commits_indexed,
         input.full_stats.edges_indexed,
@@ -1678,6 +1831,11 @@ in_memory_vs_sqlite_median_speedup:
         full_ingestion.file_diff_build,
         full_ingestion.file_diff_rename_find,
         full_ingestion.file_diff_delta_emit,
+        full_ingestion.extraction_dispatch_wait,
+        full_ingestion.extraction_worker_busy,
+        full_ingestion.extraction_reorder_buffer_max_depth,
+        full_ingestion.extraction_worker_errors,
+        full_ingestion.extraction_worker_aborts,
         full_ingestion.file_change_delete,
         full_ingestion.file_change_upsert,
         full_ingestion.tx_commit,
@@ -1688,6 +1846,11 @@ in_memory_vs_sqlite_median_speedup:
         incremental_ingestion.file_diff_build,
         incremental_ingestion.file_diff_rename_find,
         incremental_ingestion.file_diff_delta_emit,
+        incremental_ingestion.extraction_dispatch_wait,
+        incremental_ingestion.extraction_worker_busy,
+        incremental_ingestion.extraction_reorder_buffer_max_depth,
+        incremental_ingestion.extraction_worker_errors,
+        incremental_ingestion.extraction_worker_aborts,
         incremental_ingestion.file_change_delete,
         incremental_ingestion.file_change_upsert,
         incremental_ingestion.tx_commit,
@@ -1696,6 +1859,11 @@ in_memory_vs_sqlite_median_speedup:
         ingest_file_diff_build_ms,
         ingest_file_diff_rename_find_ms,
         ingest_file_diff_delta_emit_ms,
+        ingest_extraction_dispatch_wait_ms,
+        ingest_extraction_worker_busy_ms,
+        ingest_extraction_reorder_buffer_max_depth,
+        ingest_extraction_worker_errors,
+        ingest_extraction_worker_aborts,
         ingest_file_change_upsert_ms,
         ingest_tx_commit_ms,
         format_latency(input.query.commit_window),

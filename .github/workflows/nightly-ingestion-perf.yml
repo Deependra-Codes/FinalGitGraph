@@ -1,0 +1,65 @@
+name: Nightly Ingestion Perf
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Ingestion budget profile (25k or 90k)"
+        required: false
+        default: "25k"
+
+permissions:
+  contents: read
+
+jobs:
+  ingestion-budget:
+    name: Ingestion Budget (${{ matrix.mode }} / ${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      PERF_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.profile || '25k' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, fast]
+        lane: [cold, warm]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.94.0
+        run: rustup toolchain install 1.94.0 --profile default
+
+      - name: Set Default Rust
+        run: rustup default 1.94.0
+
+      - name: Script Contract Probe
+        shell: pwsh
+        run: ./scripts/perf-ingestion-budget.ps1 -ProbeOnly
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ingestion-${{ matrix.lane }}-${{ env.PERF_PROFILE }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ingestion-${{ matrix.lane }}-${{ env.PERF_PROFILE }}-
+            ${{ runner.os }}-ingestion-
+
+      - name: Ingestion Budget Run
+        shell: pwsh
+        run: |
+          if ("${{ matrix.mode }}" -eq "fast") {
+            ./scripts/perf-ingestion-budget.ps1 -Profile ${{ env.PERF_PROFILE }} -Lane ${{ matrix.lane }} -FastMode -PreconditionCommitGraph
+          } else {
+            ./scripts/perf-ingestion-budget.ps1 -Profile ${{ env.PERF_PROFILE }} -Lane ${{ matrix.lane }}
+          }

@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::application::indexer::Indexer;
 use crate::domain::models::{
-    CommandError, CommitWindowCursor, CommitWindowRequest, CommitWindowResponse, GraphDirection,
-    GraphTraversalRequest, GraphTraversalResponse, GraphTraversalStrategy, IndexRepositoryRequest,
-    IndexingMode, IndexingStats, RepositorySummary, ScanRepositoryRequest, ShortestPathRequest,
-    ShortestPathResponse,
+    CommandError, CommitWindowCursor, CommitWindowRequest, CommitWindowResponse,
+    FileChangeExtractionDrainStats, GraphDirection, GraphTraversalRequest, GraphTraversalResponse,
+    GraphTraversalStrategy, IndexRepositoryRequest, IndexingMode, IndexingStats, RepositorySummary,
+    ScanRepositoryRequest, ShortestPathRequest, ShortestPathResponse,
 };
 
 pub fn scan_repository(
@@ -60,6 +60,17 @@ pub fn enrich_pending_file_change_stats(
     let indexer = build_indexer(db_path);
     indexer
         .enrich_pending_file_change_stats(Path::new(path), max_items)
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn drain_file_change_extraction_queue(
+    path: &str,
+    db_path: Option<&str>,
+    max_commits: Option<usize>,
+) -> Result<FileChangeExtractionDrainStats, CommandError> {
+    let indexer = build_indexer(db_path);
+    indexer
+        .drain_file_change_extraction_queue(Path::new(path), max_commits)
         .map_err(|error| error.into_command_error())
 }
 

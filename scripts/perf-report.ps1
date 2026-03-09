@@ -19,6 +19,8 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoRootPath = $repoRoot.Path
+$cargoTargetRootWasExplicit = $PSBoundParameters.ContainsKey("CargoTargetRoot") -and `
+    -not [string]::IsNullOrWhiteSpace($CargoTargetRoot)
 $userHome = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     $env:USERPROFILE
 } elseif (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
@@ -40,6 +42,30 @@ if (-not (Test-Path $CargoTargetRoot)) {
 }
 $env:CARGO_TARGET_DIR = $CargoTargetRoot
 
+function Normalize-AbsolutePath {
+    param([string]$PathValue)
+
+    if ([string]::IsNullOrWhiteSpace($PathValue)) {
+        return ""
+    }
+
+    $absolute = [System.IO.Path]::GetFullPath($PathValue)
+    return $absolute.TrimEnd('\', '/')
+}
+
+function Set-CargoTargetRoot {
+    param([string]$NextCargoTargetRoot)
+
+    if ([string]::IsNullOrWhiteSpace($NextCargoTargetRoot)) {
+        return
+    }
+    if (-not (Test-Path $NextCargoTargetRoot)) {
+        New-Item -Path $NextCargoTargetRoot -ItemType Directory -Force | Out-Null
+    }
+    $script:CargoTargetRoot = $NextCargoTargetRoot
+    $env:CARGO_TARGET_DIR = $NextCargoTargetRoot
+}
+
 function Format-ElapsedSeconds {
     param([TimeSpan]$Elapsed)
     return [Math]::Round($Elapsed.TotalSeconds, 3)
@@ -60,6 +86,16 @@ function Test-IsPolicyBlocked {
         -or $OutputText -match "os error 4551"
 }
 
+function Test-EnvEnabled {
+    param([string]$Name)
+    $raw = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $false
+    }
+    $normalized = $raw.Trim().ToLowerInvariant()
+    return $normalized -in @("1", "true", "yes", "on")
+}
+
 function Convert-ToBashSingleQuoted {
     param([string]$Value)
     $escaped = $Value -replace "'", "'`"`'`"`'"
@@ -78,10 +114,21 @@ function Invoke-ExternalPhase {
     try {
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
         $previousErrorActionPreference = $ErrorActionPreference
+        $exitCode = 0
+        $invocationError = $null
         try {
             $ErrorActionPreference = "Continue"
-            & $Executable @Arguments 2>&1 | Tee-Object -FilePath $phaseLog.FullName
-            $exitCode = $LASTEXITCODE
+            try {
+                & $Executable @Arguments 2>&1 | Tee-Object -FilePath $phaseLog.FullName
+                $exitCode = $LASTEXITCODE
+            }
+            catch {
+                $invocationError = $_.Exception.Message
+                if (-not [string]::IsNullOrWhiteSpace($invocationError)) {
+                    $invocationError | Tee-Object -FilePath $phaseLog.FullName -Append | Out-Null
+                }
+                $exitCode = 1
+            }
         }
         finally {
             $ErrorActionPreference = $previousErrorActionPreference
@@ -110,7 +157,25 @@ function Get-DockerRunArgs {
         [string]$CommandText
     )
 
-    return @(
+    $forwardedEnvArgs = @()
+    $forwardedEnvKeys = @(
+        "GITGRAPH_INDEX_FAST_MODE",
+        "GITGRAPH_SQLITE_WRITE_PROFILE",
+        "GITGRAPH_COMMIT_WALK_SORT",
+        "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL",
+        "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_DRAIN",
+        "GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE",
+        "GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY",
+        "GITGRAPH_QUERY_RUNTIME_CACHE"
+    )
+    foreach ($key in $forwardedEnvKeys) {
+        $value = [Environment]::GetEnvironmentVariable($key)
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            $forwardedEnvArgs += @("-e", "${key}=${value}")
+        }
+    }
+
+    $baseArgs = @(
         "run",
         "--rm",
         "-v",
@@ -128,7 +193,9 @@ function Get-DockerRunArgs {
         "-e",
         "RUSTUP_HOME=/usr/local/rustup",
         "-e",
-        "PATH=/usr/local/cargo/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH=/usr/local/cargo/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+    $tailArgs = @(
         "-w",
         "/work",
         "rust:1.94",
@@ -136,6 +203,8 @@ function Get-DockerRunArgs {
         "-c",
         $CommandText
     )
+
+    return $baseArgs + $forwardedEnvArgs + $tailArgs
 }
 
 function Invoke-DockerPhase {
@@ -188,8 +257,8 @@ function Invoke-PerfReportDocker {
     Write-Host "Retrying performance report in Docker fallback..."
     $reportArgs = Get-ReportArgs
     $quotedArgs = $reportArgs | ForEach-Object { Convert-ToBashSingleQuoted $_ }
-    $buildCommand = "cargo build --package gitgraph-lab-core --release --locked --bin perf-report"
-    $runCommand = "/cargo-target/release/perf-report " + ($quotedArgs -join " ")
+    $buildCommand = "export PATH=/usr/local/cargo/bin:`$PATH; cargo build --package gitgraph-lab-core --release --locked --bin perf-report"
+    $runCommand = "export PATH=/usr/local/cargo/bin:`$PATH; /cargo-target/release/perf-report " + ($quotedArgs -join " ")
 
     $buildResult = Invoke-DockerPhase `
         -RepoRootPath $RepoRootPath `
@@ -227,6 +296,11 @@ try {
         return
     }
 
+    if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
+        Invoke-PerfReportDocker -RepoRootPath $repoRootPath
+        return
+    }
+
     $reportArgs = Get-ReportArgs
     $hostBuildArgs = @(
         "build",
@@ -237,6 +311,7 @@ try {
         "--bin",
         "perf-report"
     )
+    $repoLocalTargetRoot = Join-Path $repoRootPath "target"
 
     $buildResult = Invoke-ExternalPhase `
         -Executable "cargo" `
@@ -244,6 +319,23 @@ try {
         -PhaseLabel "Host build phase (perf-report binary)..."
 
     $combinedOutputText = $buildResult.OutputText
+    if ($buildResult.ExitCode -ne 0 -and -not $cargoTargetRootWasExplicit) {
+        $currentTargetNormalized = Normalize-AbsolutePath $CargoTargetRoot
+        $repoTargetNormalized = Normalize-AbsolutePath $repoLocalTargetRoot
+        if ($currentTargetNormalized -ne $repoTargetNormalized) {
+            Write-Host (
+                "Host build failed with cargo target '" + $CargoTargetRoot +
+                "'. Retrying with repo-local cargo target '" + $repoLocalTargetRoot + "'..."
+            )
+            Set-CargoTargetRoot -NextCargoTargetRoot $repoLocalTargetRoot
+            $buildResult = Invoke-ExternalPhase `
+                -Executable "cargo" `
+                -Arguments $hostBuildArgs `
+                -PhaseLabel "Host build phase retry (repo-local target)..."
+            $combinedOutputText = $buildResult.OutputText
+        }
+    }
+
     if ($buildResult.ExitCode -ne 0) {
         if ((Test-IsPolicyBlocked $combinedOutputText) -and (Test-DockerReady)) {
             Invoke-PerfReportDocker -RepoRootPath $repoRootPath

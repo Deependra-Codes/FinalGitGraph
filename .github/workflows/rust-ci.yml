@@ -65,3 +65,70 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: pwsh
         run: ./scripts/perf-budget.ps1
+
+  ingestion-budget-fast:
+    name: Ingestion Budget Fast (90k cold)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.94.0
+        run: rustup toolchain install 1.94.0 --profile default
+
+      - name: Set Default Rust
+        run: rustup default 1.94.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ingestion-fast-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ingestion-fast-cargo-
+
+      - name: Ingestion Budget Fast Lane
+        shell: pwsh
+        run: ./scripts/perf-ingestion-budget.ps1 -Profile 90k -Lane cold -FastMode -PreconditionCommitGraph
+
+  perf-smoke-pr:
+    name: Perf Smoke (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.94.0
+        run: rustup toolchain install 1.94.0 --profile default
+
+      - name: Set Default Rust
+        run: rustup default 1.94.0
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-perf-smoke-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-perf-smoke-cargo-
+
+      - name: Perf Smoke Report
+        shell: pwsh
+        run: ./scripts/perf-report.ps1 -Cycles 80 -FeatureCommits 4 -IncrementalCommits 20 -QueryRuns 10 -WindowLimit 200 -MaxNodes 2000 -OutputPath tmp/perf-report-smoke-ci.txt
