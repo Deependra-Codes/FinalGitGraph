@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use rusqlite::Transaction;
 
 use crate::adapters::db::{
-    delete_file_changes_for_commits, enqueue_file_changes_for_enrichment, upsert_file_changes,
+    delete_file_changes_for_commits, enqueue_file_changes_for_enrichment, insert_file_changes_batch,
 };
 use crate::adapters::git::{FileChangeBatchSequentialExtractor, FileDiffTelemetry};
+use crate::application::ingest_store::should_inline_enqueue_file_change_enrichment;
 use crate::domain::models::{IndexingMode, ParsedFileChange};
 use crate::support::error::{AppError, AppResult};
 
@@ -545,10 +546,11 @@ fn apply_extracted_file_change_batch(
         pending_file_changes.push(change);
         if pending_file_changes.len() >= file_change_db_batch_size {
             let upsert_started = Instant::now();
-            stats.file_changes_indexed = stats
-                .file_changes_indexed
-                .saturating_add(upsert_file_changes(tx, repo_id, pending_file_changes)?);
-            enqueue_file_changes_for_enrichment(tx, repo_id, pending_file_changes)?;
+            let indexed = insert_file_changes_batch(tx, repo_id, pending_file_changes)?;
+            stats.file_changes_indexed = stats.file_changes_indexed.saturating_add(indexed);
+            if should_inline_enqueue_file_change_enrichment() {
+                enqueue_file_changes_for_enrichment(tx, repo_id, pending_file_changes)?;
+            }
             stats.file_change_upsert = stats
                 .file_change_upsert
                 .saturating_add(upsert_started.elapsed());

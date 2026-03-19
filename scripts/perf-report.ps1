@@ -12,6 +12,8 @@ param(
     [switch]$WarmFixture,
     [switch]$PreconditionCommitGraph,
     [switch]$KeepFixture,
+    [switch]$EnableLsmRocksdb,
+    [string]$LibclangPath = "",
     [switch]$ProbeOnly
 )
 
@@ -34,8 +36,25 @@ $cargoBin = Join-Path $userHome ".cargo/bin"
 if (Test-Path $cargoBin) {
     $env:Path = "$cargoBin$pathSeparator$env:Path"
 }
+
+if ($env:OS -eq "Windows_NT") {
+    if (-not (Test-Path "D:\")) {
+        throw "D: drive is required on Windows for this script."
+    }
+    $preferredTempRoot = "D:\temp\gitgraph-lab"
+    if (-not (Test-Path $preferredTempRoot)) {
+        New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
+    }
+    $env:TEMP = $preferredTempRoot
+    $env:TMP = $preferredTempRoot
+}
+
 if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
-    $CargoTargetRoot = Join-Path $userHome ".cargo-target/gitgraph-lab"
+    if ($env:OS -eq "Windows_NT") {
+        $CargoTargetRoot = "D:\cargo-target\gitgraph-lab"
+    } else {
+        $CargoTargetRoot = Join-Path $userHome ".cargo-target/gitgraph-lab"
+    }
 }
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null
@@ -251,13 +270,25 @@ function Get-ReportArgs {
     return $args
 }
 
+function Get-CargoFeatureArgs {
+    if ($EnableLsmRocksdb) {
+        return @("--features", "lsm-rocksdb")
+    }
+    return @()
+}
+
 function Invoke-PerfReportDocker {
     param([string]$RepoRootPath)
+
+    if ($EnableLsmRocksdb) {
+        throw "Docker fallback is disabled for -EnableLsmRocksdb. Run on host with -LibclangPath and ensure LLVM is installed."
+    }
 
     Write-Host "Retrying performance report in Docker fallback..."
     $reportArgs = Get-ReportArgs
     $quotedArgs = $reportArgs | ForEach-Object { Convert-ToBashSingleQuoted $_ }
-    $buildCommand = "export PATH=/usr/local/cargo/bin:`$PATH; cargo build --package gitgraph-lab-core --release --locked --bin perf-report"
+    $featureArgs = if ($EnableLsmRocksdb) { " --features lsm-rocksdb" } else { "" }
+    $buildCommand = "export PATH=/usr/local/cargo/bin:`$PATH; cargo build --package gitgraph-lab-core --release --locked --bin perf-report$featureArgs"
     $runCommand = "export PATH=/usr/local/cargo/bin:`$PATH; /cargo-target/release/perf-report " + ($quotedArgs -join " ")
 
     $buildResult = Invoke-DockerPhase `
@@ -285,6 +316,15 @@ function Invoke-PerfReportDocker {
 
 Push-Location $repoRoot
 try {
+    $previousIngestPrimary = $env:GITGRAPH_INGEST_PRIMARY
+    if ($EnableLsmRocksdb) {
+        $env:GITGRAPH_INGEST_PRIMARY = "rocksdb"
+    }
+
+    if ($EnableLsmRocksdb -and -not [string]::IsNullOrWhiteSpace($LibclangPath)) {
+        $env:LIBCLANG_PATH = $LibclangPath
+    }
+
     if ($ProbeOnly) {
         $cargoCommand = Get-Command "cargo" -ErrorAction SilentlyContinue
         if ($null -eq $cargoCommand) {
@@ -297,6 +337,9 @@ try {
     }
 
     if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
+        if ($EnableLsmRocksdb) {
+            throw "GITGRAPH_PERF_REPORT_DOCKER_ONLY is incompatible with -EnableLsmRocksdb. Use host execution with -LibclangPath."
+        }
         Invoke-PerfReportDocker -RepoRootPath $repoRootPath
         return
     }
@@ -311,6 +354,7 @@ try {
         "--bin",
         "perf-report"
     )
+    $hostBuildArgs += Get-CargoFeatureArgs
     $repoLocalTargetRoot = Join-Path $repoRootPath "target"
 
     $buildResult = Invoke-ExternalPhase `
@@ -337,9 +381,12 @@ try {
     }
 
     if ($buildResult.ExitCode -ne 0) {
-        if ((Test-IsPolicyBlocked $combinedOutputText) -and (Test-DockerReady)) {
+        if ((Test-IsPolicyBlocked $combinedOutputText) -and (Test-DockerReady) -and -not $EnableLsmRocksdb) {
             Invoke-PerfReportDocker -RepoRootPath $repoRootPath
             return
+        }
+        if ((Test-IsPolicyBlocked $combinedOutputText) -and $EnableLsmRocksdb) {
+            throw "Performance report build is policy-blocked on host, and Docker fallback is unavailable for -EnableLsmRocksdb."
         }
         throw "Performance report build failed."
     }
@@ -356,9 +403,12 @@ try {
         -PhaseLabel "Host execute phase (perf-report workload)..."
     $combinedOutputText = ($combinedOutputText + [Environment]::NewLine + $executeResult.OutputText).Trim()
     if ($executeResult.ExitCode -ne 0) {
-        if ((Test-IsPolicyBlocked $combinedOutputText) -and (Test-DockerReady)) {
+        if ((Test-IsPolicyBlocked $combinedOutputText) -and (Test-DockerReady) -and -not $EnableLsmRocksdb) {
             Invoke-PerfReportDocker -RepoRootPath $repoRootPath
             return
+        }
+        if ((Test-IsPolicyBlocked $combinedOutputText) -and $EnableLsmRocksdb) {
+            throw "Performance report execution is policy-blocked on host, and Docker fallback is unavailable for -EnableLsmRocksdb."
         }
         throw "Performance report execution failed."
     }
@@ -370,5 +420,10 @@ try {
     Write-Host "Performance report completed."
 }
 finally {
+    if ($null -eq $previousIngestPrimary) {
+        Remove-Item Env:GITGRAPH_INGEST_PRIMARY -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_INGEST_PRIMARY = $previousIngestPrimary
+    }
     Pop-Location
 }

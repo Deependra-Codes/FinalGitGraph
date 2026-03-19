@@ -23,8 +23,23 @@ $cargoBin = Join-Path $userHome ".cargo/bin"
 if (Test-Path $cargoBin) {
     $env:Path = "$cargoBin$pathSeparator$env:Path"
 }
+if ($env:OS -eq "Windows_NT") {
+    if (-not (Test-Path "D:\")) {
+        throw "D: drive is required on Windows for this script."
+    }
+    $preferredTempRoot = "D:\temp\gitgraph-lab"
+    if (-not (Test-Path $preferredTempRoot)) {
+        New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
+    }
+    $env:TEMP = $preferredTempRoot
+    $env:TMP = $preferredTempRoot
+}
 if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
-    $CargoTargetRoot = Join-Path $userHome ".cargo-target/gitgraph-lab"
+    if ($env:OS -eq "Windows_NT") {
+        $CargoTargetRoot = "D:\cargo-target\gitgraph-lab"
+    } else {
+        $CargoTargetRoot = Join-Path $userHome ".cargo-target/gitgraph-lab"
+    }
 }
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null

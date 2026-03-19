@@ -8,32 +8,43 @@ use crate::adapters::db::{
     clear_repository_index_data, delete_file_changes_for_commits,
     enqueue_commits_for_file_change_extraction, enqueue_file_changes_for_enrichment,
     enqueue_file_changes_for_enrichment_from_drain_stage, load_commit_rowid, load_commit_window,
-    load_file_change_extraction_queue_metrics, load_index_checkpoint,
+    load_file_change_extraction_queue_metrics, load_latest_planner_session,
     load_pending_file_change_enrichment, load_pending_file_change_enrichment_for_commits,
-    load_pending_file_change_extraction_commits, load_repository_id_by_path,
-    mark_file_change_enrichment_failed, mark_file_change_extraction_failed,
-    merge_file_changes_from_drain_stage, open_database, prepare_file_change_drain_stage,
-    run_migrations, set_repository_indexed_at, stage_file_change_for_drain, synchronize_refs,
-    upsert_commits_batch, upsert_file_changes, upsert_index_checkpoint, upsert_repository,
+    load_pending_file_change_extraction_commits, load_recent_planner_sessions,
+    load_repository_id_by_path, mark_file_change_enrichment_failed,
+    mark_file_change_extraction_failed, merge_file_changes_from_drain_stage, open_database,
+    prepare_file_change_drain_stage, run_migrations, set_repository_indexed_at,
+    stage_file_change_for_drain, synchronize_refs, upsert_index_checkpoint, upsert_repository,
 };
 use crate::adapters::git::{
+    configured_file_change_drain_channel_capacity,
+    configured_file_change_drain_parallel_chunk_size, configured_file_change_parallel_worker_count,
     load_file_change_line_stats_for_targets, load_refs, stream_commits, stream_commits_with_hide,
     stream_file_changes_for_commits_drain, validate_repository, FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
 use crate::application::graph_queries;
+use crate::application::index_session_planner::{
+    plan_index_session, plan_scan_session, resolve_repository_context,
+};
 use crate::application::indexer_pipeline::{
     dispatch_pending_commit_batch, drain_all_file_change_batches, drain_ready_file_change_batches,
     resolve_file_change_pipeline_config, FileChangeExtractionPipeline, FileChangeFlushStats,
+};
+use crate::application::ingest_store::{
+    ensure_lsm_materializer_started, lsm_shadow_metrics_snapshot, reset_lsm_shadow_metrics,
+    should_inline_enqueue_file_change_enrichment, IngestStore, SqliteIngestStore,
 };
 use crate::application::limits::normalize_window_limit;
 use crate::application::query_graph_cache::{
     invalidate_query_graph_cache, load_or_hydrate_query_graph,
 };
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowResponse, FileChangeExtractionDrainBatchStats,
-    FileChangeExtractionDrainPhaseTimingMs, FileChangeExtractionDrainStats, GraphDirection,
-    GraphTraversalResponse, GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats,
-    IngestionPhaseTimingMs, ParsedCommit, PendingFileChangeEnrichment, RepositorySummary,
+    CheckpointRepositoryState, CommitWindowCursor, CommitWindowResponse,
+    FileChangeExtractionDrainBatchStats, FileChangeExtractionDrainPhaseTimingMs,
+    FileChangeExtractionDrainStats, GraphDirection, GraphTraversalResponse, GraphTraversalStrategy,
+    IndexCheckpoint, IndexingMode, IndexingStats, IngestionGeometry, IngestionPhaseTimingMs,
+    ParsedCommit, ParsedFileChange, PendingFileChangeEnrichment, PlannerSessionRecord,
+    RepositoryCapabilities, RepositoryIdentity, RepositorySummary, ScanRepositoryResponse,
     ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
@@ -42,6 +53,7 @@ use crate::support::error::{AppError, AppResult};
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
 const FILE_CHANGE_JIT_ENRICH_BATCH_SIZE: usize = 1_024;
+const FILE_CHANGE_COMMIT_BATCH_SIZE_ENV: &str = "GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE";
 const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_DEFAULT: usize = 512;
 const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_ENV: &str =
     "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL";
@@ -89,6 +101,33 @@ impl IngestionPhaseTiming {
             file_change_delete: duration_ms(self.file_change_delete),
             file_change_upsert: duration_ms(self.file_change_upsert),
             tx_commit: duration_ms(self.tx_commit),
+            lsm_shadow_write_attempts: 0.0,
+            lsm_shadow_write_success: 0.0,
+            lsm_shadow_write_errors: 0.0,
+            lsm_shadow_commit_batches: 0.0,
+            lsm_shadow_file_change_batches: 0.0,
+            lsm_shadow_disabled_batches: 0.0,
+            lsm_shadow_bytes_written: 0.0,
+            lsm_shadow_write_ms: 0.0,
+            lsm_materialization_batches: 0.0,
+            lsm_materialization_rows: 0.0,
+            lsm_materialization_errors: 0.0,
+            lsm_materialization_ms: 0.0,
+            lsm_materialization_queue_fetch_ms: 0.0,
+            lsm_materialization_decode_ms: 0.0,
+            lsm_materialization_group_ms: 0.0,
+            lsm_materialization_sqlite_write_ms: 0.0,
+            lsm_materialization_queue_cleanup_ms: 0.0,
+            lsm_materialization_checkpoint_update_ms: 0.0,
+            lsm_materialization_empty_check_ms: 0.0,
+            lsm_materialization_keys_scanned: 0.0,
+            lsm_materialization_rows_decoded: 0.0,
+            lsm_materialization_invalid_rows: 0.0,
+            lsm_materialization_rows_applied: 0.0,
+            lsm_materialization_rows_unresolved: 0.0,
+            lsm_materialization_commit_edges_immediate: 0.0,
+            lsm_materialization_commit_edges_resolved: 0.0,
+            lsm_materialization_commit_edges_unresolved_staged: 0.0,
         }
     }
 }
@@ -106,54 +145,39 @@ impl Indexer {
         PathBuf::from(".gitgraph-lab/gitgraph-lab.db")
     }
 
-    pub fn scan_repository(&self, path: &Path) -> AppResult<RepositorySummary> {
-        let canonical_repo = validate_repository(path)?;
+    pub fn scan_repository(&self, path: &Path) -> AppResult<ScanRepositoryResponse> {
         let mut conn = open_database(&self.db_path)?;
         run_migrations(&mut conn)?;
-        upsert_repository(
-            &conn,
-            &canonical_repo.root.display().to_string(),
-            &canonical_repo.name,
-            &canonical_repo.git_dir.display().to_string(),
-        )?;
-
-        Ok(RepositorySummary {
-            path: canonical_repo.root.display().to_string(),
-            git_dir: canonical_repo.git_dir.display().to_string(),
-            name: canonical_repo.name,
+        let planned_session = plan_scan_session(&conn, path)?;
+        let session_plan = planned_session.plan;
+        let repository = RepositorySummary {
+            path: session_plan.repository.path.clone(),
+            git_dir: session_plan.repository.git_dir.clone(),
+            name: session_plan.repository.name.clone(),
             is_valid: true,
+        };
+
+        Ok(ScanRepositoryResponse {
+            repository,
+            session_plan,
         })
     }
 
     pub fn index_repository(&self, path: &Path, mode: IndexingMode) -> AppResult<IndexingStats> {
-        let canonical_repo = validate_repository(path)?;
+        reset_lsm_shadow_metrics();
         let mut conn = open_database(&self.db_path)?;
         run_migrations(&mut conn)?;
-
-        let repo_id = upsert_repository(
-            &conn,
-            &canonical_repo.root.display().to_string(),
-            &canonical_repo.name,
-            &canonical_repo.git_dir.display().to_string(),
-        )?;
-
-        let checkpoint = load_index_checkpoint(&conn, repo_id)?;
-        let mut effective_mode = mode;
-        let since_epoch = match mode {
-            IndexingMode::Full => None,
-            IndexingMode::Incremental => {
-                if let Some(checkpoint) = &checkpoint {
-                    Some(
-                        checkpoint
-                            .last_committer_time
-                            .saturating_sub(INCREMENTAL_LOOKBACK_SECONDS),
-                    )
-                } else {
-                    effective_mode = IndexingMode::Full;
-                    None
-                }
-            }
-        };
+        let planned_session = plan_index_session(&conn, path, mode)?;
+        let repo_id = planned_session.repo_id;
+        let canonical_repo = planned_session.canonical_repo;
+        let session_plan = planned_session.plan.clone();
+        let repository_identity = session_plan.repository.clone();
+        let repository_capabilities = session_plan.capabilities.clone();
+        let effective_mode = session_plan.effective_mode;
+        let checkpoint_assessment = session_plan.checkpoint.clone();
+        let since_epoch = checkpoint_assessment
+            .resume_from_committer_time
+            .map(|committer_time| committer_time.saturating_sub(INCREMENTAL_LOOKBACK_SECONDS));
 
         let refs = load_refs(&canonical_repo.root)?;
         let indexed_at_epoch = now_epoch_seconds();
@@ -169,13 +193,17 @@ impl Indexer {
         let mut file_changes_indexed = 0usize;
         let mut ingestion_timing = IngestionPhaseTiming::default();
         let mut checkpoint_candidate: Option<(i64, String)> = None;
+        let resolved_file_change_commit_batch_size = resolve_file_change_commit_batch_size();
         let pipeline_config = (!fast_mode).then(|| {
-            resolve_file_change_pipeline_config(effective_mode, FILE_CHANGE_COMMIT_BATCH_SIZE)
+            resolve_file_change_pipeline_config(
+                effective_mode,
+                resolved_file_change_commit_batch_size,
+            )
         });
         let file_change_commit_batch_size = pipeline_config
             .as_ref()
             .map(|config| config.commit_batch_size)
-            .unwrap_or(FILE_CHANGE_COMMIT_BATCH_SIZE)
+            .unwrap_or(resolved_file_change_commit_batch_size)
             .max(1);
         let fast_mode_commit_batch_size = resolve_fast_mode_commit_batch_size();
         let commit_upsert_buffer_size = if fast_mode {
@@ -208,10 +236,10 @@ impl Indexer {
 
             let commit_walk_started = Instant::now();
             let mut commit_callback_elapsed = Duration::default();
-            let hide_ancestor_sha = checkpoint
-                .as_ref()
-                .filter(|_| effective_mode == IndexingMode::Incremental)
-                .map(|checkpoint| checkpoint.last_commit_sha.as_str());
+            let hide_ancestor_sha = checkpoint_assessment
+                .hide_ancestor_sha
+                .as_deref()
+                .filter(|_| effective_mode == IndexingMode::Incremental);
             let mut on_streamed_commit = |commit: ParsedCommit| -> AppResult<()> {
                 let callback_started = Instant::now();
 
@@ -270,9 +298,10 @@ impl Indexer {
                 pending_commits.push(commit);
                 if pending_commits.len() >= commit_upsert_buffer_size {
                     let commit_upsert_started = Instant::now();
-                    commits_inserted = commits_inserted.saturating_add(upsert_commits_batch(
+                    commits_inserted = commits_inserted.saturating_add(persist_commits_batch(
                         &tx,
                         repo_id,
+                        effective_mode,
                         &pending_commits,
                     )?);
                     pending_commits.clear();
@@ -298,9 +327,10 @@ impl Indexer {
                 .saturating_sub(commit_callback_elapsed);
             if !pending_commits.is_empty() {
                 let commit_upsert_started = Instant::now();
-                commits_inserted = commits_inserted.saturating_add(upsert_commits_batch(
+                commits_inserted = commits_inserted.saturating_add(persist_commits_batch(
                     &tx,
                     repo_id,
+                    effective_mode,
                     &pending_commits,
                 )?);
                 pending_commits.clear();
@@ -377,12 +407,16 @@ impl Indexer {
                 .saturating_add(pipeline_metrics.worker_aborts);
             if !pending_file_changes.is_empty() {
                 let file_change_upsert_started = Instant::now();
-                file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
-                    &tx,
-                    repo_id,
-                    &pending_file_changes,
-                )?);
-                enqueue_file_changes_for_enrichment(&tx, repo_id, &pending_file_changes)?;
+                file_changes_indexed =
+                    file_changes_indexed.saturating_add(persist_file_changes_batch(
+                        &tx,
+                        repo_id,
+                        effective_mode,
+                        &pending_file_changes,
+                    )?);
+                if should_inline_enqueue_file_change_enrichment() {
+                    enqueue_file_changes_for_enrichment(&tx, repo_id, &pending_file_changes)?;
+                }
                 ingestion_timing.file_change_upsert += file_change_upsert_started.elapsed();
                 pending_file_changes.clear();
             }
@@ -391,14 +425,74 @@ impl Indexer {
         let refs_indexed = synchronize_refs(&tx, repo_id, &refs)?;
         set_repository_indexed_at(&tx, repo_id, indexed_at_epoch)?;
 
-        if let Some(checkpoint) = build_checkpoint(checkpoint_candidate, indexed_at_epoch) {
+        if let Some(checkpoint) = build_checkpoint(
+            checkpoint_candidate,
+            indexed_at_epoch,
+            &repository_identity,
+            &repository_capabilities,
+        ) {
             upsert_index_checkpoint(&tx, repo_id, &checkpoint)?;
         }
 
         let tx_commit_started = Instant::now();
         tx.commit()?;
         ingestion_timing.tx_commit += tx_commit_started.elapsed();
+        ensure_lsm_materializer_started(&self.db_path);
         invalidate_query_graph_cache(&self.db_path);
+
+        let shadow = lsm_shadow_metrics_snapshot();
+        let mut ingestion_phase_timing_ms = ingestion_timing.into_ms();
+        ingestion_phase_timing_ms.lsm_shadow_write_attempts = shadow.write_attempts as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_success = shadow.write_success as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_errors = shadow.write_errors as f64;
+        ingestion_phase_timing_ms.lsm_shadow_commit_batches = shadow.commit_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_file_change_batches =
+            shadow.file_change_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_disabled_batches = shadow.disabled_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_bytes_written = shadow.bytes_written as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_ms = shadow.write_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_batches =
+            shadow.materialization_batches as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows = shadow.materialization_rows as f64;
+        ingestion_phase_timing_ms.lsm_materialization_errors = shadow.materialization_errors as f64;
+        ingestion_phase_timing_ms.lsm_materialization_ms =
+            shadow.materialization_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_queue_fetch_ms =
+            shadow.materialization_queue_fetch_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_decode_ms =
+            shadow.materialization_decode_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_group_ms =
+            shadow.materialization_group_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_sqlite_write_ms =
+            shadow.materialization_sqlite_write_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_queue_cleanup_ms =
+            shadow.materialization_queue_cleanup_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_checkpoint_update_ms =
+            shadow.materialization_checkpoint_update_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_empty_check_ms =
+            shadow.materialization_empty_check_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_keys_scanned =
+            shadow.materialization_keys_scanned as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_decoded =
+            shadow.materialization_rows_decoded as f64;
+        ingestion_phase_timing_ms.lsm_materialization_invalid_rows =
+            shadow.materialization_invalid_rows as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_applied =
+            shadow.materialization_rows_applied as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_unresolved =
+            shadow.materialization_rows_unresolved as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_immediate =
+            shadow.materialization_commit_edges_immediate as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_resolved =
+            shadow.materialization_commit_edges_resolved as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_unresolved_staged =
+            shadow.materialization_commit_edges_unresolved_staged as f64;
+        let ingestion_geometry = build_ingestion_geometry(
+            fast_mode,
+            pipeline_config.as_ref(),
+            fast_mode_commit_batch_size,
+            resolve_drain_commit_batch_size(),
+        );
 
         Ok(IndexingStats {
             repo_id,
@@ -408,8 +502,32 @@ impl Indexer {
             file_changes_indexed,
             refs_indexed,
             indexed_at_epoch,
-            ingestion_phase_timing_ms: ingestion_timing.into_ms(),
+            ingestion_phase_timing_ms,
+            ingestion_geometry,
+            session_plan,
         })
+    }
+
+    pub fn latest_planner_session(&self, path: &Path) -> AppResult<Option<PlannerSessionRecord>> {
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+        let Some(repo_id) = load_planner_repo_id(&conn, path)? else {
+            return Ok(None);
+        };
+        load_latest_planner_session(&conn, repo_id)
+    }
+
+    pub fn recent_planner_sessions(
+        &self,
+        path: &Path,
+        limit: Option<usize>,
+    ) -> AppResult<Vec<PlannerSessionRecord>> {
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+        let Some(repo_id) = load_planner_repo_id(&conn, path)? else {
+            return Ok(Vec::new());
+        };
+        load_recent_planner_sessions(&conn, repo_id, limit.unwrap_or(10))
     }
 
     pub fn drain_file_change_extraction_queue(
@@ -756,6 +874,12 @@ fn index_fast_mode_enabled() -> bool {
     parse_env_bool_enabled(INDEX_FAST_MODE_ENV)
 }
 
+fn resolve_file_change_commit_batch_size() -> usize {
+    parse_positive_env_usize(FILE_CHANGE_COMMIT_BATCH_SIZE_ENV)
+        .unwrap_or(FILE_CHANGE_COMMIT_BATCH_SIZE)
+        .max(1)
+}
+
 fn resolve_fast_mode_commit_batch_size() -> usize {
     parse_positive_env_usize(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_ENV)
         .unwrap_or(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_DEFAULT)
@@ -766,6 +890,32 @@ fn resolve_drain_commit_batch_size() -> usize {
     parse_positive_env_usize(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_ENV)
         .unwrap_or(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_DEFAULT)
         .max(1)
+}
+
+fn build_ingestion_geometry(
+    fast_mode: bool,
+    pipeline_config: Option<&crate::application::indexer_pipeline::FileChangePipelineConfig>,
+    fast_mode_commit_batch_size: usize,
+    drain_commit_batch_size: usize,
+) -> IngestionGeometry {
+    IngestionGeometry {
+        file_change_pipeline_active: !fast_mode,
+        file_change_pipeline_workers: pipeline_config
+            .map(|config| config.worker_count)
+            .unwrap_or(0),
+        file_change_pipeline_commit_batch_size: pipeline_config
+            .map(|config| config.commit_batch_size)
+            .unwrap_or(0),
+        file_change_pipeline_result_channel_capacity: pipeline_config
+            .map(|config| config.result_channel_capacity)
+            .unwrap_or(0),
+        file_change_fast_commit_batch_size: fast_mode_commit_batch_size,
+        file_change_drain_commit_batch_size: drain_commit_batch_size,
+        file_change_db_batch_size: FILE_CHANGE_DB_BATCH_SIZE,
+        file_change_diff_worker_threads: configured_file_change_parallel_worker_count(),
+        file_change_drain_parallel_chunk_size: configured_file_change_drain_parallel_chunk_size(),
+        file_change_drain_channel_capacity: configured_file_change_drain_channel_capacity(),
+    }
 }
 
 fn query_runtime_cache_enabled() -> bool {
@@ -788,6 +938,31 @@ fn resolve_repository_id_for_read(
     }
 
     upsert_repository(conn, repo_path, repo_name, repo_git_dir)
+}
+
+fn load_planner_repo_id(conn: &rusqlite::Connection, path: &Path) -> AppResult<Option<i64>> {
+    let context = resolve_repository_context(path)?;
+    load_repository_id_by_path(conn, context.identity.path.as_str())
+}
+
+fn persist_commits_batch(
+    tx: &rusqlite::Connection,
+    repo_id: i64,
+    mode: IndexingMode,
+    commits: &[ParsedCommit],
+) -> AppResult<usize> {
+    let store = SqliteIngestStore;
+    store.persist_commits(tx, repo_id, mode, commits)
+}
+
+fn persist_file_changes_batch(
+    tx: &rusqlite::Connection,
+    repo_id: i64,
+    mode: IndexingMode,
+    file_changes: &[ParsedFileChange],
+) -> AppResult<usize> {
+    let store = SqliteIngestStore;
+    store.persist_file_changes(tx, repo_id, mode, file_changes)
 }
 
 fn accumulate_flush_stats(
@@ -868,11 +1043,23 @@ fn update_checkpoint_candidate(
 fn build_checkpoint(
     checkpoint_candidate: Option<(i64, String)>,
     indexed_at_epoch: i64,
+    repository_identity: &RepositoryIdentity,
+    repository_capabilities: &RepositoryCapabilities,
 ) -> Option<IndexCheckpoint> {
     checkpoint_candidate.map(|(last_committer_time, last_commit_sha)| IndexCheckpoint {
         last_committer_time,
         last_commit_sha,
         indexed_at_epoch,
+        repository_state: Some(CheckpointRepositoryState {
+            identity_fingerprint: repository_identity.identity_fingerprint.clone(),
+            topology: repository_identity.topology,
+            is_bare: repository_identity.is_bare,
+            is_shallow: repository_identity.is_shallow,
+            object_hash: repository_capabilities.object_hash.clone(),
+            ref_storage: repository_capabilities.ref_storage,
+            has_sparse_checkout: repository_capabilities.has_sparse_checkout,
+            has_partial_clone: repository_capabilities.has_partial_clone,
+        }),
     })
 }
 

@@ -3,13 +3,19 @@ use std::env;
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
 
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowItem, FileChangeExtractionQueueMetrics,
+    CheckpointRepositoryState, CheckpointTrustClass, CommitWindowCursor, CommitWindowItem,
+    DegradedModeDecision, DegradedModePolicy, FileChangeExtractionQueueMetrics,
     FileChangeLineStatsUpdate, FileChangeStatsState, FileChangeStatsStateCounts, GraphDirection,
-    IndexCheckpoint, ParsedCommit, ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
+    IndexCheckpoint, IndexSessionPlan, IndexingMode, MaintenanceFreshness, ParsedCommit,
+    ParsedFileChange, ParsedRef, PendingFileChangeEnrichment, PlannerCheckpointSnapshot,
+    PlannerEntrypoint, PlannerFeatureGate, PlannerHealth, PlannerRiskLevel, PlannerSessionRecord,
+    PlannerSessionRepositorySnapshot, PlannerTraceEntry, RepositoryCapabilities,
+    RepositoryRefStorage, RepositoryTopology,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
@@ -20,6 +26,9 @@ const MIGRATION_0003: &str = include_str!("../../migrations/0003_indexing_checkp
 const MIGRATION_0004: &str = include_str!("../../migrations/0004_integer_commit_edges.sql");
 const MIGRATION_0005: &str = include_str!("../../migrations/0005_file_change_enrichment_queue.sql");
 const MIGRATION_0006: &str = include_str!("../../migrations/0006_file_change_extraction_queue.sql");
+const MIGRATION_0007: &str = include_str!("../../migrations/0007_checkpoint_repository_state.sql");
+const MIGRATION_0008: &str = include_str!("../../migrations/0008_planner_sessions.sql");
+const MIGRATION_0009: &str = include_str!("../../migrations/0009_planner_session_health.sql");
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, MIGRATION_0001),
     (2, MIGRATION_0002),
@@ -27,6 +36,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (4, MIGRATION_0004),
     (5, MIGRATION_0005),
     (6, MIGRATION_0006),
+    (7, MIGRATION_0007),
+    (8, MIGRATION_0008),
+    (9, MIGRATION_0009),
 ];
 
 const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 400;
@@ -49,6 +61,9 @@ const COMMIT_UPSERT_COLUMNS: usize = 8;
 const FILE_CHANGE_UPSERT_ROWS_PER_CHUNK: usize =
     SQLITE_MAX_BIND_PARAMETERS_FALLBACK / FILE_CHANGE_UPSERT_COLUMNS;
 #[cfg(test)]
+const COMMIT_UPSERT_ROWS_PER_CHUNK: usize =
+    SQLITE_MAX_BIND_PARAMETERS_FALLBACK / COMMIT_UPSERT_COLUMNS;
+#[cfg(test)]
 const FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK: usize =
     SQLITE_MAX_BIND_PARAMETERS_FALLBACK / FILE_CHANGE_ENQUEUE_COLUMNS;
 
@@ -70,6 +85,48 @@ struct ExtractionRetryDecision {
 enum SqliteWriteProfile {
     Balanced,
     Throughput,
+}
+
+struct CheckpointRepositoryStateRow {
+    identity_fingerprint: Option<String>,
+    repository_topology: Option<String>,
+    repository_is_bare: Option<i64>,
+    repository_is_shallow: Option<i64>,
+    repository_object_hash: Option<String>,
+    repository_ref_storage: Option<String>,
+    repository_has_sparse_checkout: Option<i64>,
+    repository_has_partial_clone: Option<i64>,
+}
+
+struct PlannerSessionRow {
+    session_id: i64,
+    repo_id: i64,
+    repo_path: String,
+    repo_name: String,
+    repo_git_dir: String,
+    entrypoint: String,
+    requested_mode: String,
+    effective_mode: String,
+    degraded_policy: String,
+    checkpoint_trust_class: String,
+    risk_level: String,
+    maintenance_freshness: String,
+    planned_at_epoch: i64,
+    identity_fingerprint: String,
+    repository_topology: String,
+    repository_is_bare: i64,
+    repository_is_shallow: i64,
+    repository_object_hash: String,
+    repository_ref_storage: String,
+    acceleration_readiness: String,
+    has_commit_graph: i64,
+    has_changed_path_bloom_filters: i64,
+    has_multi_pack_index: i64,
+    has_sparse_checkout: i64,
+    has_partial_clone: i64,
+    has_alternates: i64,
+    has_split_index: i64,
+    has_worktree_config: i64,
 }
 
 fn sqlite_write_profile() -> SqliteWriteProfile {
@@ -191,6 +248,61 @@ pub fn clear_repository_index_data(conn: &Connection, repo_id: i64) -> AppResult
     conn.execute("DELETE FROM refs WHERE repo_id = ?1", [repo_id])?;
     conn.execute("DELETE FROM file_changes WHERE repo_id = ?1", [repo_id])?;
     Ok(())
+}
+
+pub fn upsert_commit_edges_from_commit_shas(
+    conn: &Connection,
+    repo_id: i64,
+    edges: &[(String, String)],
+) -> AppResult<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS current_materialization_commit_edges (
+          child_commit_sha TEXT NOT NULL,
+          parent_commit_sha TEXT NOT NULL,
+          PRIMARY KEY(child_commit_sha, parent_commit_sha)
+        );
+        DELETE FROM current_materialization_commit_edges;
+    "#,
+    )?;
+
+    {
+        let mut insert_stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO current_materialization_commit_edges (child_commit_sha, parent_commit_sha)
+            VALUES (?1, ?2)
+            ON CONFLICT(child_commit_sha, parent_commit_sha) DO NOTHING
+        "#,
+        )?;
+        for (child_commit_sha, parent_commit_sha) in edges {
+            insert_stmt.execute(params![child_commit_sha, parent_commit_sha])?;
+        }
+    }
+
+    let inserted = conn.execute(
+        r#"
+        INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
+        SELECT
+          ?1 AS repo_id,
+          child.commit_id AS child_commit_id,
+          parent.commit_id AS parent_commit_id
+        FROM current_materialization_commit_edges edge
+        JOIN commits child
+          ON child.repo_id = ?1
+         AND child.sha = edge.child_commit_sha
+        JOIN commits parent
+          ON parent.repo_id = ?1
+         AND parent.sha = edge.parent_commit_sha
+        ON CONFLICT(repo_id, child_commit_id, parent_commit_id) DO NOTHING
+    "#,
+        [repo_id],
+    )?;
+
+    Ok(inserted)
 }
 
 pub fn delete_file_changes_for_commits(
@@ -354,13 +466,16 @@ pub fn enqueue_file_changes_for_enrichment_from_drain_stage(
 }
 
 fn sqlite_max_bind_parameters(conn: &Connection) -> usize {
-    conn.query_row("PRAGMA max_variable_number", [], |row| row.get::<_, i64>(0))
-        .optional()
-        .ok()
-        .flatten()
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(SQLITE_MAX_BIND_PARAMETERS_FALLBACK)
+    static SQLITE_MAX_BIND_PARAMETERS: OnceLock<usize> = OnceLock::new();
+    *SQLITE_MAX_BIND_PARAMETERS.get_or_init(|| {
+        conn.query_row("PRAGMA max_variable_number", [], |row| row.get::<_, i64>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(SQLITE_MAX_BIND_PARAMETERS_FALLBACK)
+    })
 }
 
 fn rows_per_chunk(conn: &Connection, columns_per_row: usize) -> usize {
@@ -372,6 +487,66 @@ fn rows_per_chunk(conn: &Connection, columns_per_row: usize) -> usize {
         .checked_div(columns_per_row)
         .unwrap_or(1)
         .max(1)
+}
+
+fn cached_file_change_upsert_sql(row_count: usize) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = guard.get(&row_count) {
+        return Arc::clone(cached);
+    }
+    let sql: Arc<str> = build_file_change_upsert_sql(row_count).into();
+    guard.insert(row_count, Arc::clone(&sql));
+    sql
+}
+
+fn cached_commit_upsert_sql(row_count: usize) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = guard.get(&row_count) {
+        return Arc::clone(cached);
+    }
+    let sql: Arc<str> = build_commit_upsert_sql(row_count).into();
+    guard.insert(row_count, Arc::clone(&sql));
+    sql
+}
+
+fn cached_file_change_insert_sql(row_count: usize) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = guard.get(&row_count) {
+        return Arc::clone(cached);
+    }
+    let sql: Arc<str> = build_file_change_insert_sql(row_count).into();
+    guard.insert(row_count, Arc::clone(&sql));
+    sql
+}
+
+fn cached_commit_insert_sql(row_count: usize) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = guard.get(&row_count) {
+        return Arc::clone(cached);
+    }
+    let sql: Arc<str> = build_commit_insert_sql(row_count).into();
+    guard.insert(row_count, Arc::clone(&sql));
+    sql
+}
+
+fn cached_file_change_enrichment_enqueue_sql(row_count: usize) -> Arc<str> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<str>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(cached) = guard.get(&row_count) {
+        return Arc::clone(cached);
+    }
+    let sql: Arc<str> = build_file_change_enrichment_enqueue_sql(row_count).into();
+    guard.insert(row_count, Arc::clone(&sql));
+    sql
 }
 
 pub fn upsert_file_changes(
@@ -387,10 +562,11 @@ pub fn upsert_file_changes(
     let chunk_size = rows_per_chunk(conn, FILE_CHANGE_UPSERT_COLUMNS);
     let mut chunks = file_changes.chunks_exact(chunk_size);
     if file_changes.len() >= chunk_size {
-        let full_sql = build_file_change_upsert_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
+        let full_sql = cached_file_change_upsert_sql(chunk_size);
+        let mut full_stmt = conn.prepare_cached(full_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(chunk_size * FILE_CHANGE_UPSERT_COLUMNS);
         for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * FILE_CHANGE_UPSERT_COLUMNS);
+            bind_values.clear();
             for change in chunk {
                 bind_values.push(Value::Integer(repo_id));
                 bind_values.push(Value::Text(change.commit_sha.clone()));
@@ -414,8 +590,8 @@ pub fn upsert_file_changes(
 
     let remainder = chunks.remainder();
     if !remainder.is_empty() {
-        let remainder_sql = build_file_change_upsert_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
+        let remainder_sql = cached_file_change_upsert_sql(remainder.len());
+        let mut remainder_stmt = conn.prepare_cached(remainder_sql.as_ref())?;
         let mut bind_values = Vec::with_capacity(remainder.len() * FILE_CHANGE_UPSERT_COLUMNS);
         for change in remainder {
             bind_values.push(Value::Integer(repo_id));
@@ -439,6 +615,72 @@ pub fn upsert_file_changes(
     Ok(inserted)
 }
 
+pub fn insert_file_changes_batch(
+    conn: &Connection,
+    repo_id: i64,
+    file_changes: &[ParsedFileChange],
+) -> AppResult<usize> {
+    if file_changes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0usize;
+    let chunk_size = rows_per_chunk(conn, FILE_CHANGE_UPSERT_COLUMNS);
+    let mut chunks = file_changes.chunks_exact(chunk_size);
+    if file_changes.len() >= chunk_size {
+        let full_sql = cached_file_change_insert_sql(chunk_size);
+        let mut full_stmt = conn.prepare_cached(full_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(chunk_size * FILE_CHANGE_UPSERT_COLUMNS);
+        for chunk in &mut chunks {
+            bind_values.clear();
+            for change in chunk {
+                bind_values.push(Value::Integer(repo_id));
+                bind_values.push(Value::Text(change.commit_sha.clone()));
+                bind_values.push(Value::Text(change.file_path.clone()));
+                bind_values.push(match change.additions {
+                    Some(number) => Value::Integer(number),
+                    None => Value::Null,
+                });
+                bind_values.push(match change.deletions {
+                    Some(number) => Value::Integer(number),
+                    None => Value::Null,
+                });
+                bind_values.push(Value::Text(change.change_type.clone()));
+                bind_values.push(Value::Text(change.stats_state.as_str().to_string()));
+            }
+
+            let applied = full_stmt.execute(params_from_iter(bind_values.iter()))?;
+            inserted = inserted.saturating_add(applied);
+        }
+    }
+
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let remainder_sql = cached_file_change_insert_sql(remainder.len());
+        let mut remainder_stmt = conn.prepare_cached(remainder_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(remainder.len() * FILE_CHANGE_UPSERT_COLUMNS);
+        for change in remainder {
+            bind_values.push(Value::Integer(repo_id));
+            bind_values.push(Value::Text(change.commit_sha.clone()));
+            bind_values.push(Value::Text(change.file_path.clone()));
+            bind_values.push(match change.additions {
+                Some(number) => Value::Integer(number),
+                None => Value::Null,
+            });
+            bind_values.push(match change.deletions {
+                Some(number) => Value::Integer(number),
+                None => Value::Null,
+            });
+            bind_values.push(Value::Text(change.change_type.clone()));
+            bind_values.push(Value::Text(change.stats_state.as_str().to_string()));
+        }
+        let applied = remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
+        inserted = inserted.saturating_add(applied);
+    }
+
+    Ok(inserted)
+}
+
 pub fn upsert_commits_batch(
     conn: &Connection,
     repo_id: i64,
@@ -452,10 +694,11 @@ pub fn upsert_commits_batch(
     let chunk_size = rows_per_chunk(conn, COMMIT_UPSERT_COLUMNS);
     let mut chunks = commits.chunks_exact(chunk_size);
     if commits.len() >= chunk_size {
-        let full_sql = build_commit_upsert_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
+        let full_sql = cached_commit_upsert_sql(chunk_size);
+        let mut full_stmt = conn.prepare_cached(full_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(chunk_size * COMMIT_UPSERT_COLUMNS);
         for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * COMMIT_UPSERT_COLUMNS);
+            bind_values.clear();
             for commit in chunk {
                 bind_values.push(Value::Text(commit.sha.clone()));
                 bind_values.push(Value::Integer(repo_id));
@@ -474,8 +717,8 @@ pub fn upsert_commits_batch(
 
     let remainder = chunks.remainder();
     if !remainder.is_empty() {
-        let remainder_sql = build_commit_upsert_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
+        let remainder_sql = cached_commit_upsert_sql(remainder.len());
+        let mut remainder_stmt = conn.prepare_cached(remainder_sql.as_ref())?;
         let mut bind_values = Vec::with_capacity(remainder.len() * COMMIT_UPSERT_COLUMNS);
         for commit in remainder {
             bind_values.push(Value::Text(commit.sha.clone()));
@@ -489,6 +732,62 @@ pub fn upsert_commits_batch(
         }
         remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
         inserted = inserted.saturating_add(remainder.len());
+    }
+
+    Ok(inserted)
+}
+
+pub fn insert_commits_batch(
+    conn: &Connection,
+    repo_id: i64,
+    commits: &[ParsedCommit],
+) -> AppResult<usize> {
+    if commits.is_empty() {
+        return Ok(0);
+    }
+
+    let mut inserted = 0usize;
+    let chunk_size = rows_per_chunk(conn, COMMIT_UPSERT_COLUMNS);
+    let mut chunks = commits.chunks_exact(chunk_size);
+    if commits.len() >= chunk_size {
+        let full_sql = cached_commit_insert_sql(chunk_size);
+        let mut full_stmt = conn.prepare_cached(full_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(chunk_size * COMMIT_UPSERT_COLUMNS);
+        for chunk in &mut chunks {
+            bind_values.clear();
+            for commit in chunk {
+                bind_values.push(Value::Text(commit.sha.clone()));
+                bind_values.push(Value::Integer(repo_id));
+                bind_values.push(Value::Text(commit.author_name.clone()));
+                bind_values.push(Value::Text(commit.author_email.clone()));
+                bind_values.push(Value::Integer(commit.author_time));
+                bind_values.push(Value::Integer(commit.committer_time));
+                bind_values.push(Value::Text(commit.subject.clone()));
+                bind_values.push(Value::Text(commit.tree_sha.clone()));
+            }
+
+            let applied = full_stmt.execute(params_from_iter(bind_values.iter()))?;
+            inserted = inserted.saturating_add(applied);
+        }
+    }
+
+    let remainder = chunks.remainder();
+    if !remainder.is_empty() {
+        let remainder_sql = cached_commit_insert_sql(remainder.len());
+        let mut remainder_stmt = conn.prepare_cached(remainder_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(remainder.len() * COMMIT_UPSERT_COLUMNS);
+        for commit in remainder {
+            bind_values.push(Value::Text(commit.sha.clone()));
+            bind_values.push(Value::Integer(repo_id));
+            bind_values.push(Value::Text(commit.author_name.clone()));
+            bind_values.push(Value::Text(commit.author_email.clone()));
+            bind_values.push(Value::Integer(commit.author_time));
+            bind_values.push(Value::Integer(commit.committer_time));
+            bind_values.push(Value::Text(commit.subject.clone()));
+            bind_values.push(Value::Text(commit.tree_sha.clone()));
+        }
+        let applied = remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
+        inserted = inserted.saturating_add(applied);
     }
 
     Ok(inserted)
@@ -518,10 +817,11 @@ pub fn enqueue_file_changes_for_enrichment(
     let chunk_size = rows_per_chunk(conn, FILE_CHANGE_ENQUEUE_COLUMNS);
     let mut chunks = eligible.chunks_exact(chunk_size);
     if eligible.len() >= chunk_size {
-        let full_sql = build_file_change_enrichment_enqueue_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
+        let full_sql = cached_file_change_enrichment_enqueue_sql(chunk_size);
+        let mut full_stmt = conn.prepare_cached(full_sql.as_ref())?;
+        let mut bind_values = Vec::with_capacity(chunk_size * FILE_CHANGE_ENQUEUE_COLUMNS);
         for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * FILE_CHANGE_ENQUEUE_COLUMNS);
+            bind_values.clear();
             for change in chunk {
                 bind_values.push(Value::Integer(repo_id));
                 bind_values.push(Value::Text(change.commit_sha.clone()));
@@ -536,8 +836,8 @@ pub fn enqueue_file_changes_for_enrichment(
 
     let remainder = chunks.remainder();
     if !remainder.is_empty() {
-        let remainder_sql = build_file_change_enrichment_enqueue_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
+        let remainder_sql = cached_file_change_enrichment_enqueue_sql(remainder.len());
+        let mut remainder_stmt = conn.prepare_cached(remainder_sql.as_ref())?;
         let mut bind_values = Vec::with_capacity(remainder.len() * FILE_CHANGE_ENQUEUE_COLUMNS);
         for change in remainder {
             bind_values.push(Value::Integer(repo_id));
@@ -796,6 +1096,23 @@ fn build_file_change_upsert_sql(row_count: usize) -> String {
     sql
 }
 
+fn build_file_change_insert_sql(row_count: usize) -> String {
+    let mut sql = String::from(
+        r#"
+        INSERT INTO file_changes (
+          repo_id, commit_sha, file_path, additions, deletions, change_type, stats_state
+        ) VALUES
+    "#,
+    );
+    append_values_placeholders(&mut sql, row_count, FILE_CHANGE_UPSERT_COLUMNS);
+    sql.push_str(
+        r#"
+        ON CONFLICT(repo_id, commit_sha, file_path) DO NOTHING
+    "#,
+    );
+    sql
+}
+
 fn build_commit_upsert_sql(row_count: usize) -> String {
     let mut sql = String::from(
         r#"
@@ -814,6 +1131,23 @@ fn build_commit_upsert_sql(row_count: usize) -> String {
           committer_time = excluded.committer_time,
           subject = excluded.subject,
           tree_sha = excluded.tree_sha
+    "#,
+    );
+    sql
+}
+
+fn build_commit_insert_sql(row_count: usize) -> String {
+    let mut sql = String::from(
+        r#"
+        INSERT INTO commits (
+          sha, repo_id, author_name, author_email, author_time, committer_time, subject, tree_sha
+        ) VALUES
+    "#,
+    );
+    append_values_placeholders(&mut sql, row_count, COMMIT_UPSERT_COLUMNS);
+    sql.push_str(
+        r#"
+        ON CONFLICT(repo_id, sha) DO NOTHING
     "#,
     );
     sql
@@ -1276,16 +1610,39 @@ pub fn load_index_checkpoint(
     let checkpoint = conn
         .query_row(
             r#"
-            SELECT last_committer_time, last_commit_sha, indexed_at_epoch
+            SELECT
+              last_committer_time,
+              last_commit_sha,
+              indexed_at_epoch,
+              identity_fingerprint,
+              repository_topology,
+              repository_is_bare,
+              repository_is_shallow,
+              repository_object_hash,
+              repository_ref_storage,
+              repository_has_sparse_checkout,
+              repository_has_partial_clone
             FROM indexing_checkpoints
             WHERE repo_id = ?1
         "#,
             [repo_id],
             |row| {
+                let repository_state_row = CheckpointRepositoryStateRow {
+                    identity_fingerprint: row.get(3)?,
+                    repository_topology: row.get(4)?,
+                    repository_is_bare: row.get(5)?,
+                    repository_is_shallow: row.get(6)?,
+                    repository_object_hash: row.get(7)?,
+                    repository_ref_storage: row.get(8)?,
+                    repository_has_sparse_checkout: row.get(9)?,
+                    repository_has_partial_clone: row.get(10)?,
+                };
+
                 Ok(IndexCheckpoint {
                     last_committer_time: row.get(0)?,
                     last_commit_sha: row.get(1)?,
                     indexed_at_epoch: row.get(2)?,
+                    repository_state: load_checkpoint_repository_state(repository_state_row),
                 })
             },
         )
@@ -1298,27 +1655,630 @@ pub fn upsert_index_checkpoint(
     repo_id: i64,
     checkpoint: &IndexCheckpoint,
 ) -> AppResult<()> {
+    let repository_state = checkpoint.repository_state.as_ref();
     conn.execute(
         r#"
         INSERT INTO indexing_checkpoints (
           repo_id,
           last_committer_time,
           last_commit_sha,
-          indexed_at_epoch
-        ) VALUES (?1, ?2, ?3, ?4)
+          indexed_at_epoch,
+          identity_fingerprint,
+          repository_topology,
+          repository_is_bare,
+          repository_is_shallow,
+          repository_object_hash,
+          repository_ref_storage,
+          repository_has_sparse_checkout,
+          repository_has_partial_clone
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
         ON CONFLICT(repo_id) DO UPDATE SET
           last_committer_time = excluded.last_committer_time,
           last_commit_sha = excluded.last_commit_sha,
-          indexed_at_epoch = excluded.indexed_at_epoch
+          indexed_at_epoch = excluded.indexed_at_epoch,
+          identity_fingerprint = excluded.identity_fingerprint,
+          repository_topology = excluded.repository_topology,
+          repository_is_bare = excluded.repository_is_bare,
+          repository_is_shallow = excluded.repository_is_shallow,
+          repository_object_hash = excluded.repository_object_hash,
+          repository_ref_storage = excluded.repository_ref_storage,
+          repository_has_sparse_checkout = excluded.repository_has_sparse_checkout,
+          repository_has_partial_clone = excluded.repository_has_partial_clone
     "#,
         params![
             repo_id,
             checkpoint.last_committer_time,
             checkpoint.last_commit_sha.as_str(),
             checkpoint.indexed_at_epoch,
+            repository_state.map(|state| state.identity_fingerprint.as_str()),
+            repository_state.map(|state| state.topology.as_str()),
+            repository_state.map(|state| if state.is_bare { 1_i64 } else { 0_i64 }),
+            repository_state.map(|state| if state.is_shallow { 1_i64 } else { 0_i64 }),
+            repository_state.map(|state| state.object_hash.as_str()),
+            repository_state.map(|state| state.ref_storage.as_str()),
+            repository_state.map(|state| {
+                if state.has_sparse_checkout {
+                    1_i64
+                } else {
+                    0_i64
+                }
+            }),
+            repository_state.map(|state| {
+                if state.has_partial_clone {
+                    1_i64
+                } else {
+                    0_i64
+                }
+            }),
         ],
     )?;
     Ok(())
+}
+
+pub fn persist_planner_session(
+    conn: &Connection,
+    repo_id: i64,
+    plan: &IndexSessionPlan,
+    planned_at_epoch: i64,
+) -> AppResult<i64> {
+    conn.execute(
+        r#"
+        INSERT INTO planner_sessions (
+          repo_id,
+          entrypoint,
+          requested_mode,
+          effective_mode,
+          degraded_policy,
+          checkpoint_trust_class,
+          risk_level,
+          maintenance_freshness,
+          planned_at_epoch,
+          identity_fingerprint,
+          repository_topology,
+          repository_is_bare,
+          repository_is_shallow,
+          repository_object_hash,
+          repository_ref_storage,
+          acceleration_readiness,
+          has_commit_graph,
+          has_changed_path_bloom_filters,
+          has_multi_pack_index,
+          has_sparse_checkout,
+          has_partial_clone,
+          has_alternates,
+          has_split_index,
+          has_worktree_config
+        ) VALUES (
+          ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+          ?20, ?21, ?22, ?23, ?24
+        )
+    "#,
+        params![
+            repo_id,
+            plan.entrypoint.as_str(),
+            match plan.requested_mode {
+                crate::domain::models::IndexingMode::Full => "full",
+                crate::domain::models::IndexingMode::Incremental => "incremental",
+            },
+            match plan.effective_mode {
+                crate::domain::models::IndexingMode::Full => "full",
+                crate::domain::models::IndexingMode::Incremental => "incremental",
+            },
+            plan.degraded_mode.policy.as_str(),
+            plan.checkpoint.trust_class.as_str(),
+            plan.health.risk_level.as_str(),
+            plan.health.maintenance_freshness.as_str(),
+            planned_at_epoch,
+            plan.repository.identity_fingerprint.as_str(),
+            plan.repository.topology.as_str(),
+            bool_to_sqlite(plan.repository.is_bare),
+            bool_to_sqlite(plan.repository.is_shallow),
+            plan.capabilities.object_hash.as_str(),
+            plan.capabilities.ref_storage.as_str(),
+            plan.capabilities.acceleration_readiness.as_str(),
+            bool_to_sqlite(plan.capabilities.has_commit_graph),
+            bool_to_sqlite(plan.capabilities.has_changed_path_bloom_filters),
+            bool_to_sqlite(plan.capabilities.has_multi_pack_index),
+            bool_to_sqlite(plan.capabilities.has_sparse_checkout),
+            bool_to_sqlite(plan.capabilities.has_partial_clone),
+            bool_to_sqlite(plan.capabilities.has_alternates),
+            bool_to_sqlite(plan.capabilities.has_split_index),
+            bool_to_sqlite(plan.capabilities.has_worktree_config),
+        ],
+    )?;
+    let session_id = conn.last_insert_rowid();
+    persist_planner_session_reasons(
+        conn,
+        session_id,
+        "checkpoint_invalidation",
+        &plan.checkpoint.invalidation_reasons,
+    )?;
+    persist_planner_session_reasons(
+        conn,
+        session_id,
+        "degraded_mode",
+        &plan.degraded_mode.reasons,
+    )?;
+    persist_planner_session_reasons(conn, session_id, "health", &plan.health.findings)?;
+    persist_planner_session_reasons(
+        conn,
+        session_id,
+        "recommendation",
+        &plan.health.recommended_actions,
+    )?;
+    persist_planner_session_feature_gates(conn, session_id, &plan.degraded_mode.disabled_features)?;
+    persist_planner_trace_entries(conn, session_id, &plan.planner_trace)?;
+    Ok(session_id)
+}
+
+fn persist_planner_session_reasons(
+    conn: &Connection,
+    session_id: i64,
+    reason_kind: &str,
+    reasons: &[String],
+) -> AppResult<()> {
+    if reasons.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare_cached(
+        r#"
+        INSERT INTO planner_session_reasons (session_id, reason_kind, ordinal, reason)
+        VALUES (?1, ?2, ?3, ?4)
+    "#,
+    )?;
+    for (ordinal, reason) in reasons.iter().enumerate() {
+        stmt.execute(params![
+            session_id,
+            reason_kind,
+            ordinal as i64,
+            reason.as_str()
+        ])?;
+    }
+    Ok(())
+}
+
+fn persist_planner_session_feature_gates(
+    conn: &Connection,
+    session_id: i64,
+    disabled_features: &[crate::domain::models::PlannerFeatureGate],
+) -> AppResult<()> {
+    if disabled_features.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare_cached(
+        r#"
+        INSERT INTO planner_session_feature_gates (session_id, ordinal, feature_gate)
+        VALUES (?1, ?2, ?3)
+    "#,
+    )?;
+    for (ordinal, feature) in disabled_features.iter().enumerate() {
+        stmt.execute(params![session_id, ordinal as i64, feature.as_str()])?;
+    }
+    Ok(())
+}
+
+fn persist_planner_trace_entries(
+    conn: &Connection,
+    session_id: i64,
+    planner_trace: &[PlannerTraceEntry],
+) -> AppResult<()> {
+    if planner_trace.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare_cached(
+        r#"
+        INSERT INTO planner_trace_entries (session_id, ordinal, code, message)
+        VALUES (?1, ?2, ?3, ?4)
+    "#,
+    )?;
+    for (ordinal, entry) in planner_trace.iter().enumerate() {
+        stmt.execute(params![
+            session_id,
+            ordinal as i64,
+            entry.code.as_str(),
+            entry.message.as_str()
+        ])?;
+    }
+    Ok(())
+}
+
+pub fn load_latest_planner_session(
+    conn: &Connection,
+    repo_id: i64,
+) -> AppResult<Option<PlannerSessionRecord>> {
+    let session_row = conn
+        .query_row(
+            r#"
+            SELECT
+              session.id,
+              session.repo_id,
+              repo.path,
+              repo.name,
+              repo.git_dir,
+              session.entrypoint,
+              session.requested_mode,
+              session.effective_mode,
+              session.degraded_policy,
+              session.checkpoint_trust_class,
+              session.risk_level,
+              session.maintenance_freshness,
+              session.planned_at_epoch,
+              session.identity_fingerprint,
+              session.repository_topology,
+              session.repository_is_bare,
+              session.repository_is_shallow,
+              session.repository_object_hash,
+              session.repository_ref_storage,
+              session.acceleration_readiness,
+              session.has_commit_graph,
+              session.has_changed_path_bloom_filters,
+              session.has_multi_pack_index,
+              session.has_sparse_checkout,
+              session.has_partial_clone,
+              session.has_alternates,
+              session.has_split_index,
+              session.has_worktree_config
+            FROM planner_sessions session
+            JOIN repositories repo
+              ON repo.id = session.repo_id
+            WHERE session.repo_id = ?1
+            ORDER BY session.planned_at_epoch DESC, session.id DESC
+            LIMIT 1
+        "#,
+            [repo_id],
+            map_planner_session_row,
+        )
+        .optional()?;
+    session_row
+        .map(|row| hydrate_planner_session_record(conn, row))
+        .transpose()
+}
+
+pub fn load_recent_planner_sessions(
+    conn: &Connection,
+    repo_id: i64,
+    limit: usize,
+) -> AppResult<Vec<PlannerSessionRecord>> {
+    let normalized_limit = limit.clamp(1, 100);
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT
+          session.id,
+          session.repo_id,
+          repo.path,
+          repo.name,
+          repo.git_dir,
+          session.entrypoint,
+          session.requested_mode,
+          session.effective_mode,
+          session.degraded_policy,
+          session.checkpoint_trust_class,
+          session.risk_level,
+          session.maintenance_freshness,
+          session.planned_at_epoch,
+          session.identity_fingerprint,
+          session.repository_topology,
+          session.repository_is_bare,
+          session.repository_is_shallow,
+          session.repository_object_hash,
+          session.repository_ref_storage,
+          session.acceleration_readiness,
+          session.has_commit_graph,
+          session.has_changed_path_bloom_filters,
+          session.has_multi_pack_index,
+          session.has_sparse_checkout,
+          session.has_partial_clone,
+          session.has_alternates,
+          session.has_split_index,
+          session.has_worktree_config
+        FROM planner_sessions session
+        JOIN repositories repo
+          ON repo.id = session.repo_id
+        WHERE session.repo_id = ?1
+        ORDER BY session.planned_at_epoch DESC, session.id DESC
+        LIMIT ?2
+    "#,
+    )?;
+    let rows = stmt
+        .query_map(
+            params![repo_id, normalized_limit as i64],
+            map_planner_session_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|row| hydrate_planner_session_record(conn, row))
+        .collect()
+}
+
+fn hydrate_planner_session_record(
+    conn: &Connection,
+    row: PlannerSessionRow,
+) -> AppResult<PlannerSessionRecord> {
+    let checkpoint_invalidation_reasons =
+        load_planner_session_reason_list(conn, row.session_id, "checkpoint_invalidation")?;
+    let degraded_reasons = load_planner_session_reason_list(conn, row.session_id, "degraded_mode")?;
+    let health_findings = load_planner_session_reason_list(conn, row.session_id, "health")?;
+    let recommendations = load_planner_session_reason_list(conn, row.session_id, "recommendation")?;
+    let disabled_features = load_planner_session_feature_gates(conn, row.session_id)?;
+    let planner_trace = load_planner_trace_entries(conn, row.session_id)?;
+
+    let entrypoint = PlannerEntrypoint::parse_db(row.entrypoint.as_str()).ok_or_else(|| {
+        AppError::Parse(format!("invalid planner entrypoint '{}'", row.entrypoint))
+    })?;
+    let requested_mode = IndexingMode::parse(row.requested_mode.as_str()).ok_or_else(|| {
+        AppError::Parse(format!(
+            "invalid planner requested_mode '{}'",
+            row.requested_mode
+        ))
+    })?;
+    let effective_mode = IndexingMode::parse(row.effective_mode.as_str()).ok_or_else(|| {
+        AppError::Parse(format!(
+            "invalid planner effective_mode '{}'",
+            row.effective_mode
+        ))
+    })?;
+    let degraded_policy =
+        DegradedModePolicy::parse_db(row.degraded_policy.as_str()).ok_or_else(|| {
+            AppError::Parse(format!(
+                "invalid planner degraded_policy '{}'",
+                row.degraded_policy
+            ))
+        })?;
+    let checkpoint_trust_class =
+        CheckpointTrustClass::parse_db(row.checkpoint_trust_class.as_str()).ok_or_else(|| {
+            AppError::Parse(format!(
+                "invalid checkpoint trust class '{}'",
+                row.checkpoint_trust_class
+            ))
+        })?;
+    let risk_level = PlannerRiskLevel::parse_db(row.risk_level.as_str()).ok_or_else(|| {
+        AppError::Parse(format!("invalid planner risk level '{}'", row.risk_level))
+    })?;
+    let maintenance_freshness = MaintenanceFreshness::parse_db(row.maintenance_freshness.as_str())
+        .ok_or_else(|| {
+            AppError::Parse(format!(
+                "invalid maintenance freshness '{}'",
+                row.maintenance_freshness
+            ))
+        })?;
+    let repository_topology = RepositoryTopology::parse_db(row.repository_topology.as_str())
+        .ok_or_else(|| {
+            AppError::Parse(format!(
+                "invalid repository topology '{}'",
+                row.repository_topology
+            ))
+        })?;
+    let repository_ref_storage =
+        RepositoryRefStorage::parse_db(row.repository_ref_storage.as_str()).ok_or_else(|| {
+            AppError::Parse(format!(
+                "invalid repository ref storage '{}'",
+                row.repository_ref_storage
+            ))
+        })?;
+    let acceleration_readiness =
+        crate::domain::models::AccelerationReadiness::parse_db(row.acceleration_readiness.as_str())
+            .ok_or_else(|| {
+                AppError::Parse(format!(
+                    "invalid acceleration readiness '{}'",
+                    row.acceleration_readiness
+                ))
+            })?;
+
+    let capabilities = RepositoryCapabilities {
+        object_hash: row.repository_object_hash,
+        ref_storage: repository_ref_storage,
+        has_commit_graph: row.has_commit_graph != 0,
+        has_changed_path_bloom_filters: row.has_changed_path_bloom_filters != 0,
+        has_multi_pack_index: row.has_multi_pack_index != 0,
+        has_sparse_checkout: row.has_sparse_checkout != 0,
+        has_partial_clone: row.has_partial_clone != 0,
+        has_alternates: row.has_alternates != 0,
+        has_split_index: row.has_split_index != 0,
+        has_worktree_config: row.has_worktree_config != 0,
+        acceleration_readiness,
+    };
+    let degraded_mode = DegradedModeDecision {
+        policy: degraded_policy,
+        reasons: degraded_reasons,
+        disabled_features,
+    };
+    let health = PlannerHealth {
+        maintenance_freshness,
+        risk_level,
+        findings: health_findings,
+        recommended_actions: recommendations,
+    };
+    let repository = PlannerSessionRepositorySnapshot {
+        path: row.repo_path,
+        git_dir: row.repo_git_dir,
+        name: row.repo_name,
+        identity_fingerprint: row.identity_fingerprint.clone(),
+        topology: repository_topology,
+        is_bare: row.repository_is_bare != 0,
+        is_shallow: row.repository_is_shallow != 0,
+    };
+    let checkpoint = PlannerCheckpointSnapshot {
+        trust_class: checkpoint_trust_class,
+        invalidation_reasons: checkpoint_invalidation_reasons,
+    };
+
+    Ok(PlannerSessionRecord {
+        session_id: row.session_id,
+        repo_id: row.repo_id,
+        planned_at_epoch: row.planned_at_epoch,
+        plan_signature: build_planner_session_signature(
+            entrypoint,
+            requested_mode,
+            effective_mode,
+            degraded_mode.policy,
+            checkpoint.trust_class,
+            capabilities.acceleration_readiness,
+            health.risk_level,
+        ),
+        repository,
+        entrypoint,
+        requested_mode,
+        effective_mode,
+        capabilities,
+        checkpoint,
+        degraded_mode,
+        health,
+        planner_trace,
+    })
+}
+
+fn load_planner_session_reason_list(
+    conn: &Connection,
+    session_id: i64,
+    reason_kind: &str,
+) -> AppResult<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT reason
+        FROM planner_session_reasons
+        WHERE session_id = ?1
+          AND reason_kind = ?2
+        ORDER BY ordinal ASC
+    "#,
+    )?;
+    let rows = stmt
+        .query_map(params![session_id, reason_kind], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(rows)
+}
+
+fn load_planner_session_feature_gates(
+    conn: &Connection,
+    session_id: i64,
+) -> AppResult<Vec<PlannerFeatureGate>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT feature_gate
+        FROM planner_session_feature_gates
+        WHERE session_id = ?1
+        ORDER BY ordinal ASC
+    "#,
+    )?;
+    let rows = stmt
+        .query_map([session_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|raw| {
+            PlannerFeatureGate::parse_db(raw.as_str())
+                .ok_or_else(|| AppError::Parse(format!("invalid planner feature gate '{raw}'")))
+        })
+        .collect()
+}
+
+fn load_planner_trace_entries(
+    conn: &Connection,
+    session_id: i64,
+) -> AppResult<Vec<PlannerTraceEntry>> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+        SELECT code, message
+        FROM planner_trace_entries
+        WHERE session_id = ?1
+        ORDER BY ordinal ASC
+    "#,
+    )?;
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok(PlannerTraceEntry {
+                code: row.get(0)?,
+                message: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn map_planner_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlannerSessionRow> {
+    Ok(PlannerSessionRow {
+        session_id: row.get(0)?,
+        repo_id: row.get(1)?,
+        repo_path: row.get(2)?,
+        repo_name: row.get(3)?,
+        repo_git_dir: row.get(4)?,
+        entrypoint: row.get(5)?,
+        requested_mode: row.get(6)?,
+        effective_mode: row.get(7)?,
+        degraded_policy: row.get(8)?,
+        checkpoint_trust_class: row.get(9)?,
+        risk_level: row.get(10)?,
+        maintenance_freshness: row.get(11)?,
+        planned_at_epoch: row.get(12)?,
+        identity_fingerprint: row.get(13)?,
+        repository_topology: row.get(14)?,
+        repository_is_bare: row.get(15)?,
+        repository_is_shallow: row.get(16)?,
+        repository_object_hash: row.get(17)?,
+        repository_ref_storage: row.get(18)?,
+        acceleration_readiness: row.get(19)?,
+        has_commit_graph: row.get(20)?,
+        has_changed_path_bloom_filters: row.get(21)?,
+        has_multi_pack_index: row.get(22)?,
+        has_sparse_checkout: row.get(23)?,
+        has_partial_clone: row.get(24)?,
+        has_alternates: row.get(25)?,
+        has_split_index: row.get(26)?,
+        has_worktree_config: row.get(27)?,
+    })
+}
+
+fn build_planner_session_signature(
+    entrypoint: PlannerEntrypoint,
+    requested_mode: IndexingMode,
+    effective_mode: IndexingMode,
+    degraded_policy: DegradedModePolicy,
+    checkpoint_trust_class: CheckpointTrustClass,
+    acceleration_readiness: crate::domain::models::AccelerationReadiness,
+    risk_level: PlannerRiskLevel,
+) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        entrypoint.as_str(),
+        match requested_mode {
+            IndexingMode::Full => "full",
+            IndexingMode::Incremental => "incremental",
+        },
+        match effective_mode {
+            IndexingMode::Full => "full",
+            IndexingMode::Incremental => "incremental",
+        },
+        degraded_policy.as_str(),
+        checkpoint_trust_class.as_str(),
+        acceleration_readiness.as_str(),
+        risk_level.as_str()
+    )
+}
+
+fn bool_to_sqlite(value: bool) -> i64 {
+    if value {
+        1
+    } else {
+        0
+    }
+}
+
+fn load_checkpoint_repository_state(
+    row: CheckpointRepositoryStateRow,
+) -> Option<CheckpointRepositoryState> {
+    let topology = RepositoryTopology::parse_db(row.repository_topology.as_deref()?)?;
+    let ref_storage = RepositoryRefStorage::parse_db(row.repository_ref_storage.as_deref()?)?;
+    Some(CheckpointRepositoryState {
+        identity_fingerprint: row.identity_fingerprint?,
+        topology,
+        is_bare: row.repository_is_bare? != 0,
+        is_shallow: row.repository_is_shallow? != 0,
+        object_hash: row.repository_object_hash?,
+        ref_storage,
+        has_sparse_checkout: row.repository_has_sparse_checkout? != 0,
+        has_partial_clone: row.repository_has_partial_clone? != 0,
+    })
 }
 
 pub fn load_commit_window(
@@ -2237,22 +3197,29 @@ mod tests {
         clear_file_change_extraction_queue_for_commits, count_commits,
         delete_file_changes_for_commits, enqueue_commits_for_file_change_extraction,
         enqueue_file_changes_for_enrichment, enqueue_file_changes_for_enrichment_from_drain_stage,
-        load_commit_shas_by_rowids, load_commit_shas_for_rowids,
-        load_file_change_extraction_queue_metrics, load_index_checkpoint,
-        load_neighbor_rowids_batch, load_neighbor_rowids_for_sources, load_neighbor_shas_batch,
+        insert_commits_batch, insert_file_changes_batch, load_commit_shas_by_rowids,
+        load_commit_shas_for_rowids, load_file_change_extraction_queue_metrics,
+        load_index_checkpoint, load_latest_planner_session, load_neighbor_rowids_batch,
+        load_neighbor_rowids_for_sources, load_neighbor_shas_batch,
         load_pending_file_change_enrichment, load_pending_file_change_extraction_commits,
-        load_pull_neighbor_rowids, load_repository_id_by_path, mark_file_change_enrichment_failed,
-        mark_file_change_extraction_failed, merge_file_changes_from_drain_stage,
+        load_pull_neighbor_rowids, load_recent_planner_sessions, load_repository_id_by_path,
+        mark_file_change_enrichment_failed, mark_file_change_extraction_failed,
+        merge_file_changes_from_drain_stage, persist_planner_session,
         prepare_file_change_drain_stage, run_migrations, stage_file_change_for_drain,
         upsert_commits_batch, upsert_file_changes, upsert_index_checkpoint,
-        verify_sqlite_graph_query_plan_guards, FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK,
-        FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS, FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS,
-        FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, FILE_CHANGE_UPSERT_ROWS_PER_CHUNK,
-        FRONTIER_PULL_QUERY_CHUNK_SIZE, FRONTIER_PULL_STAGE_THRESHOLD,
-        ORDERED_NEIGHBOR_STAGE_THRESHOLD,
+        verify_sqlite_graph_query_plan_guards, COMMIT_UPSERT_ROWS_PER_CHUNK,
+        FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK, FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS,
+        FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS, FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS,
+        FILE_CHANGE_UPSERT_ROWS_PER_CHUNK, FRONTIER_PULL_QUERY_CHUNK_SIZE,
+        FRONTIER_PULL_STAGE_THRESHOLD, ORDERED_NEIGHBOR_STAGE_THRESHOLD,
     };
     use crate::domain::models::{
-        FileChangeStatsState, GraphDirection, IndexCheckpoint, ParsedCommit, ParsedFileChange,
+        AccelerationReadiness, CheckpointAssessment, CheckpointRepositoryState,
+        CheckpointTrustClass, DegradedModeDecision, DegradedModePolicy, FileChangeStatsState,
+        GraphDirection, IndexCheckpoint, IndexSessionPlan, IndexingMode, MaintenanceFreshness,
+        ParsedCommit, ParsedFileChange, PlannerEntrypoint, PlannerFeatureGate, PlannerHealth,
+        PlannerRiskLevel, PlannerTraceEntry, RepositoryCapabilities, RepositoryIdentity,
+        RepositoryRefStorage, RepositoryTopology,
     };
     use crate::support::clock::now_epoch_seconds;
 
@@ -2305,6 +3272,16 @@ mod tests {
             last_committer_time: 123,
             last_commit_sha: "abc123".to_string(),
             indexed_at_epoch: 456,
+            repository_state: Some(CheckpointRepositoryState {
+                identity_fingerprint: "/tmp/repo/.git::/tmp/repo".to_string(),
+                topology: RepositoryTopology::Common,
+                is_bare: false,
+                is_shallow: false,
+                object_hash: "sha1".to_string(),
+                ref_storage: RepositoryRefStorage::Files,
+                has_sparse_checkout: false,
+                has_partial_clone: false,
+            }),
         };
         upsert_index_checkpoint(&conn, repo_id, &checkpoint).expect("insert checkpoint");
 
@@ -2314,6 +3291,315 @@ mod tests {
         assert_eq!(loaded.last_committer_time, 123);
         assert_eq!(loaded.last_commit_sha, "abc123");
         assert_eq!(loaded.indexed_at_epoch, 456);
+        assert_eq!(loaded.repository_state, checkpoint.repository_state);
+    }
+
+    #[test]
+    fn indexing_checkpoint_without_state_snapshot_loads_as_none() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            ["/tmp/repo-legacy", "repo-legacy", "/tmp/repo-legacy/.git"],
+        )
+        .expect("insert repo");
+
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/repo-legacy"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        conn.execute(
+            r#"
+            INSERT INTO indexing_checkpoints (
+              repo_id, last_committer_time, last_commit_sha, indexed_at_epoch
+            ) VALUES (?1, ?2, ?3, ?4)
+        "#,
+            params![repo_id, 123_i64, "legacy-sha", 456_i64],
+        )
+        .expect("insert legacy checkpoint");
+
+        let loaded = load_index_checkpoint(&conn, repo_id)
+            .expect("load checkpoint")
+            .expect("checkpoint should exist");
+        assert!(loaded.repository_state.is_none());
+    }
+
+    #[test]
+    fn planner_session_persistence_records_trace_reasons_and_feature_gates() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            [
+                "/tmp/planner-repo",
+                "planner-repo",
+                "/tmp/planner-repo/.git",
+            ],
+        )
+        .expect("insert repo");
+
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/planner-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let session_plan = IndexSessionPlan {
+            planner_session_id: None,
+            entrypoint: PlannerEntrypoint::Index,
+            repository: RepositoryIdentity {
+                path: "/tmp/planner-repo".to_string(),
+                git_dir: "/tmp/planner-repo/.git".to_string(),
+                git_common_dir: "/tmp/planner-repo/.git".to_string(),
+                object_dir: "/tmp/planner-repo/.git/objects".to_string(),
+                name: "planner-repo".to_string(),
+                topology: RepositoryTopology::Common,
+                is_bare: false,
+                is_shallow: false,
+                superproject_root: None,
+                identity_fingerprint: "/tmp/planner-repo/.git::/tmp/planner-repo".to_string(),
+            },
+            capabilities: RepositoryCapabilities {
+                object_hash: "sha1".to_string(),
+                ref_storage: RepositoryRefStorage::Files,
+                has_commit_graph: true,
+                has_changed_path_bloom_filters: false,
+                has_multi_pack_index: false,
+                has_sparse_checkout: false,
+                has_partial_clone: false,
+                has_alternates: false,
+                has_split_index: false,
+                has_worktree_config: false,
+                acceleration_readiness: AccelerationReadiness::Partial,
+            },
+            requested_mode: IndexingMode::Incremental,
+            effective_mode: IndexingMode::Full,
+            checkpoint: CheckpointAssessment {
+                present: true,
+                trust_class: CheckpointTrustClass::Invalidated,
+                invalidation_reasons: vec!["repository_shallow_state_changed".to_string()],
+                resume_from_committer_time: None,
+                hide_ancestor_sha: None,
+            },
+            degraded_mode: DegradedModeDecision {
+                policy: DegradedModePolicy::FallbackToFull,
+                reasons: vec!["repository_shallow_state_changed".to_string()],
+                disabled_features: vec![
+                    PlannerFeatureGate::IncrementalResume,
+                    PlannerFeatureGate::ChangedPathBloomFilters,
+                ],
+            },
+            health: PlannerHealth {
+                maintenance_freshness: MaintenanceFreshness::Stale,
+                risk_level: PlannerRiskLevel::Critical,
+                findings: vec![
+                    "repository_shallow_state_changed".to_string(),
+                    "commit_graph_behind_packfiles".to_string(),
+                ],
+                recommended_actions: vec![
+                    "treat the next run as a full publish barrier before trusting incremental resume again"
+                        .to_string(),
+                    "refresh commit-graph metadata with `git maintenance run --task=commit-graph`"
+                        .to_string(),
+                ],
+            },
+            planner_trace: vec![PlannerTraceEntry {
+                code: "planner_test".to_string(),
+                message: "planner trace persisted".to_string(),
+            }],
+        };
+
+        let session_id =
+            persist_planner_session(&conn, repo_id, &session_plan, 123).expect("persist plan");
+        assert!(session_id > 0);
+
+        let trace_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM planner_trace_entries WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("count planner trace entries");
+        assert_eq!(trace_count, 1);
+
+        let reason_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM planner_session_reasons WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("count planner reasons");
+        assert_eq!(reason_count, 6);
+
+        let feature_gate_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM planner_session_feature_gates WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .expect("count planner feature gates");
+        assert_eq!(feature_gate_count, 2);
+    }
+
+    #[test]
+    fn planner_session_roundtrip_loads_latest_and_recent_history() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            [
+                "/tmp/history-repo",
+                "history-repo",
+                "/tmp/history-repo/.git",
+            ],
+        )
+        .expect("insert repo");
+
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/history-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let mut degraded_plan = IndexSessionPlan {
+            planner_session_id: None,
+            entrypoint: PlannerEntrypoint::Scan,
+            repository: RepositoryIdentity {
+                path: "/tmp/history-repo".to_string(),
+                git_dir: "/tmp/history-repo/.git".to_string(),
+                git_common_dir: "/tmp/history-repo/.git".to_string(),
+                object_dir: "/tmp/history-repo/.git/objects".to_string(),
+                name: "history-repo".to_string(),
+                topology: RepositoryTopology::Common,
+                is_bare: false,
+                is_shallow: false,
+                superproject_root: None,
+                identity_fingerprint: "/tmp/history-repo/.git::/tmp/history-repo".to_string(),
+            },
+            capabilities: RepositoryCapabilities {
+                object_hash: "sha1".to_string(),
+                ref_storage: RepositoryRefStorage::Files,
+                has_commit_graph: false,
+                has_changed_path_bloom_filters: false,
+                has_multi_pack_index: false,
+                has_sparse_checkout: false,
+                has_partial_clone: false,
+                has_alternates: false,
+                has_split_index: false,
+                has_worktree_config: false,
+                acceleration_readiness: AccelerationReadiness::Unavailable,
+            },
+            requested_mode: IndexingMode::Incremental,
+            effective_mode: IndexingMode::Full,
+            checkpoint: CheckpointAssessment {
+                present: false,
+                trust_class: CheckpointTrustClass::Missing,
+                invalidation_reasons: vec!["missing_checkpoint".to_string()],
+                resume_from_committer_time: None,
+                hide_ancestor_sha: None,
+            },
+            degraded_mode: DegradedModeDecision {
+                policy: DegradedModePolicy::FallbackToFull,
+                reasons: vec!["missing_checkpoint".to_string()],
+                disabled_features: vec![PlannerFeatureGate::IncrementalResume],
+            },
+            health: PlannerHealth {
+                maintenance_freshness: MaintenanceFreshness::Unknown,
+                risk_level: PlannerRiskLevel::Critical,
+                findings: vec!["missing_checkpoint".to_string()],
+                recommended_actions: vec![
+                    "treat the next run as a full publish barrier before trusting incremental resume again"
+                        .to_string(),
+                ],
+            },
+            planner_trace: vec![PlannerTraceEntry {
+                code: "history_1".to_string(),
+                message: "degraded scan".to_string(),
+            }],
+        };
+        let nominal_plan = IndexSessionPlan {
+            planner_session_id: None,
+            entrypoint: PlannerEntrypoint::Index,
+            repository: degraded_plan.repository.clone(),
+            capabilities: RepositoryCapabilities {
+                object_hash: "sha1".to_string(),
+                ref_storage: RepositoryRefStorage::Files,
+                has_commit_graph: true,
+                has_changed_path_bloom_filters: true,
+                has_multi_pack_index: true,
+                has_sparse_checkout: false,
+                has_partial_clone: false,
+                has_alternates: false,
+                has_split_index: false,
+                has_worktree_config: false,
+                acceleration_readiness: AccelerationReadiness::Ready,
+            },
+            requested_mode: IndexingMode::Full,
+            effective_mode: IndexingMode::Full,
+            checkpoint: CheckpointAssessment {
+                present: true,
+                trust_class: CheckpointTrustClass::Trusted,
+                invalidation_reasons: Vec::new(),
+                resume_from_committer_time: None,
+                hide_ancestor_sha: None,
+            },
+            degraded_mode: DegradedModeDecision {
+                policy: DegradedModePolicy::Nominal,
+                reasons: Vec::new(),
+                disabled_features: Vec::new(),
+            },
+            health: PlannerHealth {
+                maintenance_freshness: MaintenanceFreshness::Fresh,
+                risk_level: PlannerRiskLevel::Nominal,
+                findings: Vec::new(),
+                recommended_actions: Vec::new(),
+            },
+            planner_trace: vec![PlannerTraceEntry {
+                code: "history_2".to_string(),
+                message: "nominal index".to_string(),
+            }],
+        };
+
+        let first_session_id =
+            persist_planner_session(&conn, repo_id, &degraded_plan, 100).expect("persist first");
+        degraded_plan.planner_session_id = Some(first_session_id);
+        let second_session_id =
+            persist_planner_session(&conn, repo_id, &nominal_plan, 200).expect("persist second");
+
+        let latest = load_latest_planner_session(&conn, repo_id)
+            .expect("load latest")
+            .expect("latest session");
+        assert_eq!(latest.session_id, second_session_id);
+        assert_eq!(latest.health.risk_level, PlannerRiskLevel::Nominal);
+        assert_eq!(
+            latest.capabilities.acceleration_readiness,
+            AccelerationReadiness::Ready
+        );
+        assert_eq!(
+            latest.plan_signature,
+            "index|full|full|nominal|trusted|ready|nominal"
+        );
+
+        let history = load_recent_planner_sessions(&conn, repo_id, 10).expect("load history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].session_id, second_session_id);
+        assert_eq!(history[1].session_id, first_session_id);
+        assert_eq!(
+            history[1].degraded_mode.policy,
+            DegradedModePolicy::FallbackToFull
+        );
+        assert_eq!(history[1].health.risk_level, PlannerRiskLevel::Critical);
     }
 
     #[test]
@@ -2482,7 +3768,7 @@ mod tests {
             )
             .expect("fetch repo id");
 
-        let commit_count = FILE_CHANGE_UPSERT_ROWS_PER_CHUNK + 53;
+        let commit_count = COMMIT_UPSERT_ROWS_PER_CHUNK + 53;
         let commits: Vec<ParsedCommit> = (0..commit_count)
             .map(|index| ParsedCommit {
                 sha: format!("commit-{index:05}"),
@@ -2498,6 +3784,104 @@ mod tests {
 
         let inserted = upsert_commits_batch(&conn, repo_id, &commits)
             .expect("bulk commit upsert with chunk boundaries");
+        assert_eq!(inserted, commit_count);
+
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commits WHERE repo_id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .expect("count persisted commits");
+        assert_eq!(persisted, commit_count as i64);
+    }
+
+    #[test]
+    fn insert_file_changes_batch_handles_parameter_chunk_boundaries() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            [
+                "/tmp/chunked-insert-repo",
+                "chunked-insert-repo",
+                "/tmp/chunked/.git",
+            ],
+        )
+        .expect("insert repo");
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/chunked-insert-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let change_count = FILE_CHANGE_UPSERT_ROWS_PER_CHUNK + 17;
+        let file_changes: Vec<ParsedFileChange> = (0..change_count)
+            .map(|index| ParsedFileChange {
+                commit_sha: format!("insert-sha-{index:04}"),
+                file_path: format!("src/insert-{index:04}.rs"),
+                additions: Some(index as i64),
+                deletions: Some((index % 11) as i64),
+                change_type: "modify".to_string(),
+                stats_state: FileChangeStatsState::Ready,
+                requires_line_stats: false,
+            })
+            .collect();
+
+        let inserted =
+            insert_file_changes_batch(&conn, repo_id, &file_changes).expect("bulk insert changes");
+        assert_eq!(inserted, change_count);
+
+        let persisted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
+                [repo_id],
+                |row| row.get(0),
+            )
+            .expect("count persisted file changes");
+        assert_eq!(persisted, change_count as i64);
+    }
+
+    #[test]
+    fn insert_commits_batch_handles_parameter_chunk_boundaries() {
+        let mut conn = Connection::open_in_memory().expect("open memory db");
+        run_migrations(&mut conn).expect("migration run");
+
+        conn.execute(
+            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
+            [
+                "/tmp/chunked-commit-insert-repo",
+                "chunked-commit-insert-repo",
+                "/tmp/chunked/.git",
+            ],
+        )
+        .expect("insert repo");
+        let repo_id: i64 = conn
+            .query_row(
+                "SELECT id FROM repositories WHERE path = ?1",
+                ["/tmp/chunked-commit-insert-repo"],
+                |row| row.get(0),
+            )
+            .expect("fetch repo id");
+
+        let commit_count = COMMIT_UPSERT_ROWS_PER_CHUNK + 29;
+        let commits: Vec<ParsedCommit> = (0..commit_count)
+            .map(|index| ParsedCommit {
+                sha: format!("insert-commit-{index:05}"),
+                parents: Vec::new(),
+                tree_sha: format!("{index:040x}"),
+                author_name: "GitGraph".to_string(),
+                author_email: "gitgraph@example.com".to_string(),
+                author_time: index as i64,
+                committer_time: index as i64,
+                subject: format!("insert-subject-{index}"),
+            })
+            .collect();
+
+        let inserted = insert_commits_batch(&conn, repo_id, &commits).expect("bulk insert commits");
         assert_eq!(inserted, commit_count);
 
         let persisted: i64 = conn

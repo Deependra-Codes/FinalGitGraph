@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, ensure_file_change_stats_for_commits, get_commit_window,
-    get_graph_traversal, get_shortest_path, index_commits, index_commits_with_mode,
-    scan_repository,
+    get_graph_traversal, get_latest_planner_session, get_recent_planner_sessions,
+    get_shortest_path, index_commits, index_commits_with_mode, scan_repository,
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 use rusqlite::{params, Connection};
@@ -68,8 +68,10 @@ fn scan_and_index_repository_smoke_test() {
 
     let summary = scan_repository(&repo_str, Some(&db_str))
         .unwrap_or_else(|error| panic!("scan repository: {error}"));
-    assert!(summary.is_valid);
-    assert_eq!(summary.name, "repo");
+    assert!(summary.repository.is_valid);
+    assert_eq!(summary.repository.name, "repo");
+    assert_eq!(summary.session_plan.entrypoint.as_str(), "scan");
+    assert!(summary.session_plan.planner_session_id.is_some());
 
     let stats = index_commits(&repo_str, Some(&db_str))
         .unwrap_or_else(|error| panic!("index commits: {error}"));
@@ -77,12 +79,31 @@ fn scan_and_index_repository_smoke_test() {
     assert!(stats.edges_indexed >= 1);
     assert!(stats.file_changes_indexed >= 2);
     assert!(stats.refs_indexed >= 1);
+    assert_eq!(stats.session_plan.entrypoint.as_str(), "index");
+    assert!(stats.session_plan.planner_session_id.is_some());
 
     let conn = Connection::open(db_path).unwrap_or_else(|error| panic!("open db: {error}"));
     let commit_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM commits", [], |row| row.get(0))
         .unwrap_or_else(|error| panic!("query commit count: {error}"));
     assert!(commit_count >= 2);
+    let planner_session_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM planner_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("query planner session count: {error}"));
+    assert!(planner_session_count >= 2);
+
+    let latest_planner = get_latest_planner_session(&repo_str, Some(&db_str))
+        .unwrap_or_else(|error| panic!("latest planner session: {error}"))
+        .unwrap_or_else(|| panic!("expected latest planner session"));
+    assert_eq!(latest_planner.entrypoint.as_str(), "index");
+    assert!(latest_planner.plan_signature.contains("index|"));
+
+    let history = get_recent_planner_sessions(&repo_str, Some(&db_str), Some(10))
+        .unwrap_or_else(|error| panic!("recent planner sessions: {error}"));
+    assert!(history.len() >= 2);
+    assert_eq!(history[0].session_id, latest_planner.session_id);
 }
 
 #[test]

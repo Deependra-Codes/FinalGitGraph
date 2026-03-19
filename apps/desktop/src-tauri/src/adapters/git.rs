@@ -47,6 +47,11 @@ const FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES: u64 = 64 * 1024;
 const FILE_CHANGE_RENAME_LARGE_FILE_BYTES: u64 = 256 * 1024;
 const FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS: usize = 512;
 const FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES: u64 = 1_024 * 1_024;
+const FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT: usize = 200;
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT: usize = 100;
+const FILE_CHANGE_RENAME_LIMIT_LARGE_ENV: &str = "GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE";
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_ENV: &str = "GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE";
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS: usize = 2_048;
 const PATCH_FROM_DIFF_GUARDRAIL_MARKER: &str = "Patch::from_diff";
 const MIN_OBJECT_ID_HEX_LEN: usize = 40;
 const GIX_OBJECT_CACHE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
@@ -885,11 +890,27 @@ fn rename_detection_policy(
 
     let rename_threshold = rename_threshold_for_bins(delta_count, max_file_size_bytes);
     Some(RenameDetectionPolicy {
-        rename_limit: delta_count.clamp(1, FILE_CHANGE_RENAME_LIMIT),
+        rename_limit: delta_count.clamp(1, rename_limit_for_bins(delta_count)),
         rename_threshold,
         exact_match_only: delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
             || max_file_size_bytes >= FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES,
     })
+}
+
+fn rename_limit_for_bins(delta_count: usize) -> usize {
+    if delta_count >= FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS {
+        return parse_positive_env_usize(FILE_CHANGE_RENAME_LIMIT_XLARGE_ENV)
+            .unwrap_or(FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT)
+            .clamp(1, FILE_CHANGE_RENAME_LIMIT);
+    }
+
+    if delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS {
+        return parse_positive_env_usize(FILE_CHANGE_RENAME_LIMIT_LARGE_ENV)
+            .unwrap_or(FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT)
+            .clamp(1, FILE_CHANGE_RENAME_LIMIT);
+    }
+
+    FILE_CHANGE_RENAME_LIMIT
 }
 
 fn rename_threshold_for_bins(delta_count: usize, max_file_size_bytes: u64) -> u16 {
@@ -936,6 +957,18 @@ fn drain_parallel_channel_capacity() -> usize {
     parse_positive_env_usize(FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_ENV)
         .unwrap_or(FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT)
         .clamp(1, FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_MAX)
+}
+
+pub fn configured_file_change_parallel_worker_count() -> usize {
+    configured_parallel_worker_count()
+}
+
+pub fn configured_file_change_drain_parallel_chunk_size() -> usize {
+    drain_parallel_chunk_size()
+}
+
+pub fn configured_file_change_drain_channel_capacity() -> usize {
+    drain_parallel_channel_capacity()
 }
 
 fn parallel_file_change_plan(
@@ -1580,14 +1613,16 @@ mod tests {
     use super::{
         object_cache_bytes_for_workers, parallel_file_change_plan,
         parallel_min_commits_threshold_for_workers, parse_hex_object_id, rename_detection_policy,
-        rename_threshold_for_bins, resolve_parallel_worker_count, should_probe_max_file_size,
-        should_run_rename_detection, should_use_parallel_file_change_extraction,
-        validate_repository, FileChangeExtractionMode, FileChangeParallelProfile,
-        FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT, FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT,
-        FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS, FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
-        FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX, FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE,
-        FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE, FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX,
-        FILE_CHANGE_RENAME_LARGE_FILE_BYTES, FILE_CHANGE_RENAME_LIMIT,
+        rename_limit_for_bins, rename_threshold_for_bins, resolve_parallel_worker_count,
+        should_probe_max_file_size, should_run_rename_detection,
+        should_use_parallel_file_change_extraction, validate_repository, FileChangeExtractionMode,
+        FileChangeParallelProfile, FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT,
+        FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT, FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
+        FILE_CHANGE_PARSE_CHANNEL_CAPACITY, FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
+        FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE, FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+        FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX, FILE_CHANGE_RENAME_LARGE_FILE_BYTES,
+        FILE_CHANGE_RENAME_LIMIT, FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT,
+        FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT, FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS,
         FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES, FILE_CHANGE_RENAME_THRESHOLD_LARGE,
         FILE_CHANGE_RENAME_THRESHOLD_MEDIUM, FILE_CHANGE_RENAME_THRESHOLD_SMALL,
         GIX_OBJECT_CACHE_BYTES_DEFAULT, GIX_OBJECT_CACHE_BYTES_MAX, GIX_OBJECT_CACHE_BYTES_MIN,
@@ -1635,12 +1670,36 @@ mod tests {
         let bounded_large =
             rename_detection_policy(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS + 1, 1024)
                 .expect("policy for large delta set");
-        assert_eq!(bounded_large.rename_limit, FILE_CHANGE_RENAME_LIMIT);
+        assert_eq!(
+            bounded_large.rename_limit,
+            FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT
+        );
         assert_eq!(
             bounded_large.rename_threshold,
             FILE_CHANGE_RENAME_THRESHOLD_LARGE
         );
         assert!(bounded_large.exact_match_only);
+
+        let bounded_xlarge =
+            rename_detection_policy(FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS, 1024)
+                .expect("policy for very large delta set");
+        assert_eq!(
+            bounded_xlarge.rename_limit,
+            FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn rename_limit_is_scale_aware_for_large_delta_sets() {
+        assert_eq!(rename_limit_for_bins(16), FILE_CHANGE_RENAME_LIMIT);
+        assert_eq!(
+            rename_limit_for_bins(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS),
+            FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT
+        );
+        assert_eq!(
+            rename_limit_for_bins(FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS),
+            FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT
+        );
     }
 
     #[test]

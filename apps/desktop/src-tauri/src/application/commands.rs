@@ -4,14 +4,15 @@ use crate::application::indexer::Indexer;
 use crate::domain::models::{
     CommandError, CommitWindowCursor, CommitWindowRequest, CommitWindowResponse,
     FileChangeExtractionDrainStats, GraphDirection, GraphTraversalRequest, GraphTraversalResponse,
-    GraphTraversalStrategy, IndexRepositoryRequest, IndexingMode, IndexingStats, RepositorySummary,
-    ScanRepositoryRequest, ShortestPathRequest, ShortestPathResponse,
+    GraphTraversalStrategy, IndexRepositoryRequest, IndexingMode, IndexingStats,
+    PlannerSessionRecord, ScanRepositoryRequest, ScanRepositoryResponse, ShortestPathRequest,
+    ShortestPathResponse,
 };
 
 pub fn scan_repository(
     path: &str,
     db_path: Option<&str>,
-) -> Result<RepositorySummary, CommandError> {
+) -> Result<ScanRepositoryResponse, CommandError> {
     scan_repository_with_request(ScanRepositoryRequest {
         path: path.to_string(),
         db_path: db_path.map(ToString::to_string),
@@ -20,7 +21,7 @@ pub fn scan_repository(
 
 pub fn scan_repository_with_request(
     request: ScanRepositoryRequest,
-) -> Result<RepositorySummary, CommandError> {
+) -> Result<ScanRepositoryResponse, CommandError> {
     let indexer = build_indexer(request.db_path.as_deref());
     indexer
         .scan_repository(Path::new(&request.path))
@@ -49,6 +50,27 @@ pub fn index_repository_with_request(
     let indexer = build_indexer(request.db_path.as_deref());
     indexer
         .index_repository(Path::new(&request.path), request.mode)
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn get_latest_planner_session(
+    path: &str,
+    db_path: Option<&str>,
+) -> Result<Option<PlannerSessionRecord>, CommandError> {
+    let indexer = build_indexer(db_path);
+    indexer
+        .latest_planner_session(Path::new(path))
+        .map_err(|error| error.into_command_error())
+}
+
+pub fn get_recent_planner_sessions(
+    path: &str,
+    db_path: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<PlannerSessionRecord>, CommandError> {
+    let indexer = build_indexer(db_path);
+    indexer
+        .recent_planner_sessions(Path::new(path), limit)
         .map_err(|error| error.into_command_error())
 }
 
