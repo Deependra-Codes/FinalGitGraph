@@ -54,8 +54,19 @@ foreach ($line in $envLines) {
     Set-Item -Path ("Env:" + $name) -Value $value
 }
 
+if (-not (Test-Path "D:\")) {
+    throw "D: drive is required on Windows for this script."
+}
+
+$preferredTempRoot = "D:\temp\gitgraph-lab"
+if (-not (Test-Path $preferredTempRoot)) {
+    New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
+}
+$env:TEMP = $preferredTempRoot
+$env:TMP = $preferredTempRoot
+
 if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
-    $CargoTargetRoot = Join-Path $env:USERPROFILE ".cargo-target\gitgraph-lab"
+    $CargoTargetRoot = "D:\cargo-target\gitgraph-lab"
 }
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null

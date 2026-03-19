@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gitgraph_lab_core::adapters::db::verify_sqlite_graph_query_plan_guards;
@@ -11,6 +12,8 @@ use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, ensure_file_change_stats_for_commits, get_commit_window,
     get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
 };
+use gitgraph_lab_core::application::invalidate_query_graph_cache_for_db_path;
+use gitgraph_lab_core::application::{lsm_shadow_metrics_snapshot, LsmShadowMetricsSnapshot};
 use gitgraph_lab_core::domain::models::{
     FileChangeExtractionDrainStats, FileChangeExtractionQueueMetrics, FileChangeStatsStateCounts,
     GraphDirection, GraphTraversalStrategy, IndexingMode,
@@ -22,6 +25,10 @@ use rusqlite::{params, Connection};
 type PerfResult<T> = Result<T, String>;
 const FIXTURE_BASELINE_HEAD_FILENAME: &str = ".gitgraph-lab-baseline-head";
 const PERF_JIT_WINDOW_LIMIT_MAX: usize = 5_000;
+const COMMIT_ROWID_RETRY_COUNT_DEFAULT: usize = 120;
+const COMMIT_ROWID_RETRY_SLEEP_MS_DEFAULT: u64 = 50;
+const MATERIALIZATION_READINESS_RETRY_COUNT_DEFAULT: usize = 240;
+const MATERIALIZATION_READINESS_RETRY_SLEEP_MS_DEFAULT: u64 = 50;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -175,6 +182,7 @@ struct ReportInput<'a> {
     phase_timing: &'a PhaseTimingSummary,
     phase_memory: &'a PhaseMemorySummary,
     estimated_git_process_spawns: usize,
+    lsm_metrics_snapshot: Option<LsmShadowMetricsSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -550,6 +558,15 @@ fn run_with_fixture(
     verify_sqlite_graph_query_plan_guards(&plan_guard_conn, plan_guard_repo_id)
         .map_err(|error| error.to_string())?;
 
+    if ingest_primary_rocksdb_enabled() {
+        wait_for_query_materialization_readiness(
+            repo_str.as_str(),
+            db_str.as_str(),
+            db_path,
+            &fixture,
+        )?;
+    }
+
     log_phase_start("query_benchmark");
     let query_started = Instant::now();
     let commit_window = measure_latencies(config.query_runs, || {
@@ -677,6 +694,7 @@ fn run_with_fixture(
     let (counts, file_change_stats_state_counts, file_change_extraction_queue) =
         load_repo_counts(db_path)?;
 
+    invalidate_query_graph_cache_for_db_path(db_path);
     log_phase_start("in_memory_graph_hydration");
     let in_memory_graph_hydration_started = Instant::now();
     let in_memory_context = load_in_memory_graph_context(db_path, &fixture)?;
@@ -761,6 +779,11 @@ fn run_with_fixture(
         final_rss_bytes: memory_tracker.sample_rss(),
         peak_observed_rss_bytes: memory_tracker.peak_observed_rss(),
     };
+    let lsm_metrics_snapshot = if ingest_primary_rocksdb_enabled() {
+        Some(lsm_shadow_metrics_snapshot())
+    } else {
+        None
+    };
 
     let report = format_report(&ReportInput {
         config,
@@ -788,6 +811,7 @@ fn run_with_fixture(
         phase_timing: &phase_timing,
         phase_memory: &phase_memory,
         estimated_git_process_spawns: estimate_git_process_spawns(config),
+        lsm_metrics_snapshot,
     });
 
     println!("{report}");
@@ -926,7 +950,18 @@ fn create_fixture_root() -> PerfResult<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    let root = env::temp_dir().join(format!("gitgraph-lab-perf-{now}"));
+    let root = if cfg!(windows) {
+        let base = PathBuf::from(r"D:\temp\gitgraph-lab");
+        fs::create_dir_all(&base).map_err(|error| {
+            format!(
+                "create fixture temp base {}: {error}",
+                base.to_string_lossy()
+            )
+        })?;
+        base.join(format!("gitgraph-lab-perf-{now}"))
+    } else {
+        env::temp_dir().join(format!("gitgraph-lab-perf-{now}"))
+    };
     fs::create_dir_all(&root)
         .map_err(|error| format!("create fixture root {}: {error}", root.to_string_lossy()))?;
     Ok(root)
@@ -1454,18 +1489,163 @@ fn load_repo_id(conn: &Connection) -> PerfResult<i64> {
     .map_err(|error| format!("resolve repository id: {error}"))
 }
 
+#[cfg(feature = "lsm-rocksdb")]
+fn ingest_primary_rocksdb_enabled() -> bool {
+    true
+}
+
+#[cfg(not(feature = "lsm-rocksdb"))]
+fn ingest_primary_rocksdb_enabled() -> bool {
+    false
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn wait_for_query_materialization_readiness(
+    repo_path: &str,
+    db_path_str: &str,
+    db_path: &Path,
+    fixture: &FixtureSummary,
+) -> PerfResult<()> {
+    log_phase_start("materialization_readiness");
+    let started = Instant::now();
+    let conn = Connection::open(db_path)
+        .map_err(|error| format!("open database {}: {error}", db_path.to_string_lossy()))?;
+    let repo_id = load_repo_id(&conn)?;
+    let retry_count = parse_env_usize(
+        "GITGRAPH_MATERIALIZATION_READINESS_RETRY_COUNT",
+        MATERIALIZATION_READINESS_RETRY_COUNT_DEFAULT,
+    );
+    let retry_sleep_ms = parse_env_u64(
+        "GITGRAPH_MATERIALIZATION_READINESS_RETRY_SLEEP_MS",
+        MATERIALIZATION_READINESS_RETRY_SLEEP_MS_DEFAULT,
+    );
+
+    for sha in [
+        fixture.head_sha.as_str(),
+        fixture.root_sha.as_str(),
+        fixture.pre_merge_main_sha.as_str(),
+        fixture.feature_tip_sha.as_str(),
+    ] {
+        load_commit_rowid_for_sha_with_retry(&conn, repo_id, sha, retry_count, retry_sleep_ms)?;
+    }
+
+    wait_for_shortest_path_readiness(
+        repo_path,
+        db_path_str,
+        fixture.head_sha.as_str(),
+        fixture.root_sha.as_str(),
+        GraphDirection::Parents,
+        "parents(head->root)",
+    )?;
+    wait_for_shortest_path_readiness(
+        repo_path,
+        db_path_str,
+        fixture.pre_merge_main_sha.as_str(),
+        fixture.feature_tip_sha.as_str(),
+        GraphDirection::Both,
+        "both(pre-merge-main->feature-tip)",
+    )?;
+
+    log_phase_done("materialization_readiness", started.elapsed());
+    Ok(())
+}
+
+fn wait_for_shortest_path_readiness(
+    repo_path: &str,
+    db_path_str: &str,
+    start_sha: &str,
+    end_sha: &str,
+    direction: GraphDirection,
+    label: &str,
+) -> PerfResult<()> {
+    let retry_count = parse_env_usize(
+        "GITGRAPH_MATERIALIZATION_READINESS_RETRY_COUNT",
+        MATERIALIZATION_READINESS_RETRY_COUNT_DEFAULT,
+    );
+    let retry_sleep_ms = parse_env_u64(
+        "GITGRAPH_MATERIALIZATION_READINESS_RETRY_SLEEP_MS",
+        MATERIALIZATION_READINESS_RETRY_SLEEP_MS_DEFAULT,
+    );
+
+    for attempt in 0..retry_count {
+        let response =
+            get_shortest_path(repo_path, Some(db_path_str), start_sha, end_sha, direction)
+                .map_err(|error| {
+                    format!("materialization readiness shortest-path probe ({label}): {error}")
+                })?;
+
+        if response.found && !response.path.is_empty() {
+            return Ok(());
+        }
+
+        if attempt + 1 < retry_count {
+            thread::sleep(Duration::from_millis(retry_sleep_ms));
+        }
+    }
+
+    Err(format!(
+        "materialization readiness timeout: shortest path not available for {label}"
+    ))
+}
+
 fn load_commit_rowid_for_sha(conn: &Connection, repo_id: i64, sha: &str) -> PerfResult<i64> {
-    conn.query_row(
-        r#"
-        SELECT commit_id
-        FROM commits
-        WHERE repo_id = ?1 AND sha = ?2
-        LIMIT 1
-    "#,
-        params![repo_id, sha],
-        |row| row.get(0),
+    load_commit_rowid_for_sha_with_retry(
+        conn,
+        repo_id,
+        sha,
+        COMMIT_ROWID_RETRY_COUNT_DEFAULT,
+        COMMIT_ROWID_RETRY_SLEEP_MS_DEFAULT,
     )
-    .map_err(|error| format!("resolve commit rowid for sha {sha}: {error}"))
+}
+
+fn load_commit_rowid_for_sha_with_retry(
+    conn: &Connection,
+    repo_id: i64,
+    sha: &str,
+    retry_count: usize,
+    retry_sleep_ms: u64,
+) -> PerfResult<i64> {
+    for attempt in 0..retry_count {
+        let result = conn.query_row(
+            r#"
+            SELECT commit_id
+            FROM commits
+            WHERE repo_id = ?1 AND sha = ?2
+            LIMIT 1
+        "#,
+            params![repo_id, sha],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(commit_id) => return Ok(commit_id),
+            Err(rusqlite::Error::QueryReturnedNoRows) if attempt + 1 < retry_count => {
+                thread::sleep(Duration::from_millis(retry_sleep_ms));
+            }
+            Err(error) => {
+                return Err(format!("resolve commit rowid for sha {sha}: {error}"));
+            }
+        }
+    }
+
+    Err(format!(
+        "resolve commit rowid for sha {sha}: commit did not materialize in time"
+    ))
 }
 
 fn measure_latencies(
@@ -1541,9 +1721,168 @@ fn format_report(input: &ReportInput<'_>) -> String {
         full_ingestion.extraction_worker_errors + incremental_ingestion.extraction_worker_errors;
     let ingest_extraction_worker_aborts =
         full_ingestion.extraction_worker_aborts + incremental_ingestion.extraction_worker_aborts;
+    let ingest_commit_upsert_ms =
+        full_ingestion.commit_upsert + incremental_ingestion.commit_upsert;
+    let ingest_edge_materialize_ms =
+        full_ingestion.edge_materialize + incremental_ingestion.edge_materialize;
     let ingest_file_change_upsert_ms =
         full_ingestion.file_change_upsert + incremental_ingestion.file_change_upsert;
     let ingest_tx_commit_ms = full_ingestion.tx_commit + incremental_ingestion.tx_commit;
+    let (lsm_shadow_write_attempts, lsm_shadow_write_success, lsm_shadow_write_errors) =
+        if let Some(snapshot) = input.lsm_metrics_snapshot {
+            (
+                full_ingestion.lsm_shadow_write_attempts + snapshot.write_attempts as f64,
+                full_ingestion.lsm_shadow_write_success + snapshot.write_success as f64,
+                full_ingestion.lsm_shadow_write_errors + snapshot.write_errors as f64,
+            )
+        } else {
+            (
+                full_ingestion.lsm_shadow_write_attempts
+                    + incremental_ingestion.lsm_shadow_write_attempts,
+                full_ingestion.lsm_shadow_write_success
+                    + incremental_ingestion.lsm_shadow_write_success,
+                full_ingestion.lsm_shadow_write_errors
+                    + incremental_ingestion.lsm_shadow_write_errors,
+            )
+        };
+    let (lsm_shadow_commit_batches, lsm_shadow_file_change_batches, lsm_shadow_disabled_batches) =
+        if let Some(snapshot) = input.lsm_metrics_snapshot {
+            (
+                full_ingestion.lsm_shadow_commit_batches + snapshot.commit_batches as f64,
+                full_ingestion.lsm_shadow_file_change_batches + snapshot.file_change_batches as f64,
+                full_ingestion.lsm_shadow_disabled_batches + snapshot.disabled_batches as f64,
+            )
+        } else {
+            (
+                full_ingestion.lsm_shadow_commit_batches
+                    + incremental_ingestion.lsm_shadow_commit_batches,
+                full_ingestion.lsm_shadow_file_change_batches
+                    + incremental_ingestion.lsm_shadow_file_change_batches,
+                full_ingestion.lsm_shadow_disabled_batches
+                    + incremental_ingestion.lsm_shadow_disabled_batches,
+            )
+        };
+    let (lsm_shadow_bytes_written, lsm_shadow_write_ms) =
+        if let Some(snapshot) = input.lsm_metrics_snapshot {
+            (
+                full_ingestion.lsm_shadow_bytes_written + snapshot.bytes_written as f64,
+                full_ingestion.lsm_shadow_write_ms + snapshot.write_micros as f64 / 1_000.0,
+            )
+        } else {
+            (
+                full_ingestion.lsm_shadow_bytes_written
+                    + incremental_ingestion.lsm_shadow_bytes_written,
+                full_ingestion.lsm_shadow_write_ms + incremental_ingestion.lsm_shadow_write_ms,
+            )
+        };
+    let (lsm_materialization_batches, lsm_materialization_rows, lsm_materialization_errors) =
+        if let Some(snapshot) = input.lsm_metrics_snapshot {
+            (
+                full_ingestion.lsm_materialization_batches
+                    + snapshot.materialization_batches as f64,
+                full_ingestion.lsm_materialization_rows + snapshot.materialization_rows as f64,
+                full_ingestion.lsm_materialization_errors + snapshot.materialization_errors as f64,
+            )
+        } else {
+            (
+                full_ingestion.lsm_materialization_batches
+                    + incremental_ingestion.lsm_materialization_batches,
+                full_ingestion.lsm_materialization_rows
+                    + incremental_ingestion.lsm_materialization_rows,
+                full_ingestion.lsm_materialization_errors
+                    + incremental_ingestion.lsm_materialization_errors,
+            )
+        };
+    let lsm_materialization_ms = if let Some(snapshot) = input.lsm_metrics_snapshot {
+        full_ingestion.lsm_materialization_ms + snapshot.materialization_micros as f64 / 1_000.0
+    } else {
+        full_ingestion.lsm_materialization_ms + incremental_ingestion.lsm_materialization_ms
+    };
+    let (
+        lsm_materialization_queue_fetch_ms,
+        lsm_materialization_decode_ms,
+        lsm_materialization_group_ms,
+        lsm_materialization_sqlite_write_ms,
+        lsm_materialization_queue_cleanup_ms,
+        lsm_materialization_checkpoint_update_ms,
+        lsm_materialization_empty_check_ms,
+        lsm_materialization_keys_scanned,
+        lsm_materialization_rows_decoded,
+        lsm_materialization_invalid_rows,
+        lsm_materialization_rows_applied,
+        lsm_materialization_rows_unresolved,
+        lsm_materialization_commit_edges_immediate,
+        lsm_materialization_commit_edges_resolved,
+        lsm_materialization_commit_edges_unresolved_staged,
+    ) = if let Some(snapshot) = input.lsm_metrics_snapshot {
+        (
+            full_ingestion.lsm_materialization_queue_fetch_ms
+                + snapshot.materialization_queue_fetch_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_decode_ms
+                + snapshot.materialization_decode_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_group_ms
+                + snapshot.materialization_group_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_sqlite_write_ms
+                + snapshot.materialization_sqlite_write_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_queue_cleanup_ms
+                + snapshot.materialization_queue_cleanup_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_checkpoint_update_ms
+                + snapshot.materialization_checkpoint_update_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_empty_check_ms
+                + snapshot.materialization_empty_check_micros as f64 / 1_000.0,
+            full_ingestion.lsm_materialization_keys_scanned
+                + snapshot.materialization_keys_scanned as f64,
+            full_ingestion.lsm_materialization_rows_decoded
+                + snapshot.materialization_rows_decoded as f64,
+            full_ingestion.lsm_materialization_invalid_rows
+                + snapshot.materialization_invalid_rows as f64,
+            full_ingestion.lsm_materialization_rows_applied
+                + snapshot.materialization_rows_applied as f64,
+            full_ingestion.lsm_materialization_rows_unresolved
+                + snapshot.materialization_rows_unresolved as f64,
+            full_ingestion.lsm_materialization_commit_edges_immediate
+                + snapshot.materialization_commit_edges_immediate as f64,
+            full_ingestion.lsm_materialization_commit_edges_resolved
+                + snapshot.materialization_commit_edges_resolved as f64,
+            full_ingestion.lsm_materialization_commit_edges_unresolved_staged
+                + snapshot.materialization_commit_edges_unresolved_staged as f64,
+        )
+    } else {
+        (
+            full_ingestion.lsm_materialization_queue_fetch_ms
+                + incremental_ingestion.lsm_materialization_queue_fetch_ms,
+            full_ingestion.lsm_materialization_decode_ms
+                + incremental_ingestion.lsm_materialization_decode_ms,
+            full_ingestion.lsm_materialization_group_ms
+                + incremental_ingestion.lsm_materialization_group_ms,
+            full_ingestion.lsm_materialization_sqlite_write_ms
+                + incremental_ingestion.lsm_materialization_sqlite_write_ms,
+            full_ingestion.lsm_materialization_queue_cleanup_ms
+                + incremental_ingestion.lsm_materialization_queue_cleanup_ms,
+            full_ingestion.lsm_materialization_checkpoint_update_ms
+                + incremental_ingestion.lsm_materialization_checkpoint_update_ms,
+            full_ingestion.lsm_materialization_empty_check_ms
+                + incremental_ingestion.lsm_materialization_empty_check_ms,
+            full_ingestion.lsm_materialization_keys_scanned
+                + incremental_ingestion.lsm_materialization_keys_scanned,
+            full_ingestion.lsm_materialization_rows_decoded
+                + incremental_ingestion.lsm_materialization_rows_decoded,
+            full_ingestion.lsm_materialization_invalid_rows
+                + incremental_ingestion.lsm_materialization_invalid_rows,
+            full_ingestion.lsm_materialization_rows_applied
+                + incremental_ingestion.lsm_materialization_rows_applied,
+            full_ingestion.lsm_materialization_rows_unresolved
+                + incremental_ingestion.lsm_materialization_rows_unresolved,
+            full_ingestion.lsm_materialization_commit_edges_immediate
+                + incremental_ingestion.lsm_materialization_commit_edges_immediate,
+            full_ingestion.lsm_materialization_commit_edges_resolved
+                + incremental_ingestion.lsm_materialization_commit_edges_resolved,
+            full_ingestion.lsm_materialization_commit_edges_unresolved_staged
+                + incremental_ingestion.lsm_materialization_commit_edges_unresolved_staged,
+        )
+    };
+    let full_geometry = &input.full_stats.ingestion_geometry;
+    let incremental_geometry = &input.incremental_stats.ingestion_geometry;
     let full_seconds = input.phase_timing.full_index.as_secs_f64();
     let incremental_seconds = input.phase_timing.incremental_index.as_secs_f64();
     let full_commit_rate = safe_rate(input.full_stats.commits_indexed as f64, full_seconds);
@@ -1578,6 +1917,34 @@ fn format_report(input: &ReportInput<'_>) -> String {
     let drain_phase_timing = &input.file_change_extraction_drain.phase_timing_ms;
     let drain_batch_stats = &input.file_change_extraction_drain.batch_stats;
 
+    let combined_commits_indexed =
+        input.full_stats.commits_indexed + input.incremental_stats.commits_indexed;
+    let combined_index_seconds = full_seconds + incremental_seconds;
+    let core_end_to_end_seconds = input.phase_timing.core_end_to_end.as_secs_f64();
+    let drain_seconds = input
+        .phase_timing
+        .file_change_extraction_drain
+        .as_secs_f64();
+    let combined_commit_rate = safe_rate(combined_commits_indexed as f64, combined_index_seconds);
+    let effective_commit_rate_with_drain = safe_rate(
+        combined_commits_indexed as f64,
+        combined_index_seconds + drain_seconds,
+    );
+    let end_to_end_commit_rate =
+        safe_rate(combined_commits_indexed as f64, core_end_to_end_seconds);
+    let lsm_materialization_scan_to_apply_ratio = safe_ratio(
+        lsm_materialization_keys_scanned,
+        lsm_materialization_rows_applied,
+    );
+    let lsm_materialization_decode_to_apply_ratio = safe_ratio(
+        lsm_materialization_rows_decoded,
+        lsm_materialization_rows_applied,
+    );
+    let lsm_materialization_queue_fetch_share =
+        safe_ratio(lsm_materialization_queue_fetch_ms, lsm_materialization_ms);
+    let lsm_materialization_empty_check_share =
+        safe_ratio(lsm_materialization_empty_check_ms, lsm_materialization_ms);
+
     let attributed_core = input.phase_timing.fixture_generation.as_secs_f64()
         + input.phase_timing.fixture_summary.as_secs_f64()
         + input.phase_timing.repository_preconditioning.as_secs_f64()
@@ -1596,7 +1963,7 @@ fn format_report(input: &ReportInput<'_>) -> String {
     let unattributed_core =
         (input.phase_timing.core_end_to_end.as_secs_f64() - attributed_core).max(0.0);
 
-    format!(
+    let mut report = format!(
         "=== GitGraph Lab Performance Report ===
 fixture_root: {}
 config:
@@ -1730,6 +2097,55 @@ ingestion_phase_timing_ms:
   ingest_extraction_worker_aborts: {:.3}
   ingest_file_change_upsert_ms: {:.3}
   ingest_tx_commit_ms: {:.3}
+    lsm_shadow_write_attempts: {:.3}
+    lsm_shadow_write_success: {:.3}
+    lsm_shadow_write_errors: {:.3}
+    lsm_shadow_commit_batches: {:.3}
+    lsm_shadow_file_change_batches: {:.3}
+    lsm_shadow_disabled_batches: {:.3}
+    lsm_shadow_bytes_written: {:.3}
+    lsm_shadow_write_ms: {:.3}
+    lsm_materialization_batches: {:.3}
+    lsm_materialization_rows: {:.3}
+    lsm_materialization_errors: {:.3}
+    lsm_materialization_ms: {:.3}
+    lsm_materialization_queue_fetch_ms: {:.3}
+    lsm_materialization_decode_ms: {:.3}
+    lsm_materialization_group_ms: {:.3}
+    lsm_materialization_sqlite_write_ms: {:.3}
+    lsm_materialization_queue_cleanup_ms: {:.3}
+    lsm_materialization_checkpoint_update_ms: {:.3}
+    lsm_materialization_empty_check_ms: {:.3}
+    lsm_materialization_keys_scanned: {:.3}
+    lsm_materialization_rows_decoded: {:.3}
+    lsm_materialization_invalid_rows: {:.3}
+    lsm_materialization_rows_applied: {:.3}
+    lsm_materialization_rows_unresolved: {:.3}
+    lsm_materialization_commit_edges_immediate: {:.3}
+    lsm_materialization_commit_edges_resolved: {:.3}
+    lsm_materialization_commit_edges_unresolved_staged: {:.3}
+
+ingestion_geometry:
+  full_pipeline_active: {}
+  full_file_change_pipeline_workers: {}
+  full_file_change_pipeline_commit_batch_size: {}
+  full_file_change_pipeline_result_channel_capacity: {}
+  full_file_change_fast_commit_batch_size: {}
+  full_file_change_drain_commit_batch_size: {}
+  full_file_change_db_batch_size: {}
+  full_file_change_diff_worker_threads: {}
+  full_file_change_drain_parallel_chunk_size: {}
+  full_file_change_drain_channel_capacity: {}
+  incremental_pipeline_active: {}
+  incremental_file_change_pipeline_workers: {}
+  incremental_file_change_pipeline_commit_batch_size: {}
+  incremental_file_change_pipeline_result_channel_capacity: {}
+  incremental_file_change_fast_commit_batch_size: {}
+  incremental_file_change_drain_commit_batch_size: {}
+  incremental_file_change_db_batch_size: {}
+  incremental_file_change_diff_worker_threads: {}
+  incremental_file_change_drain_parallel_chunk_size: {}
+  incremental_file_change_drain_channel_capacity: {}
 
 query_latency_ms:
   commit_window: {}
@@ -1866,6 +2282,53 @@ in_memory_vs_sqlite_median_speedup:
         ingest_extraction_worker_aborts,
         ingest_file_change_upsert_ms,
         ingest_tx_commit_ms,
+        lsm_shadow_write_attempts,
+        lsm_shadow_write_success,
+        lsm_shadow_write_errors,
+        lsm_shadow_commit_batches,
+        lsm_shadow_file_change_batches,
+        lsm_shadow_disabled_batches,
+        lsm_shadow_bytes_written,
+        lsm_shadow_write_ms,
+        lsm_materialization_batches,
+        lsm_materialization_rows,
+        lsm_materialization_errors,
+        lsm_materialization_ms,
+        lsm_materialization_queue_fetch_ms,
+        lsm_materialization_decode_ms,
+        lsm_materialization_group_ms,
+        lsm_materialization_sqlite_write_ms,
+        lsm_materialization_queue_cleanup_ms,
+        lsm_materialization_checkpoint_update_ms,
+        lsm_materialization_empty_check_ms,
+        lsm_materialization_keys_scanned,
+        lsm_materialization_rows_decoded,
+        lsm_materialization_invalid_rows,
+        lsm_materialization_rows_applied,
+        lsm_materialization_rows_unresolved,
+        lsm_materialization_commit_edges_immediate,
+        lsm_materialization_commit_edges_resolved,
+        lsm_materialization_commit_edges_unresolved_staged,
+        full_geometry.file_change_pipeline_active,
+        full_geometry.file_change_pipeline_workers,
+        full_geometry.file_change_pipeline_commit_batch_size,
+        full_geometry.file_change_pipeline_result_channel_capacity,
+        full_geometry.file_change_fast_commit_batch_size,
+        full_geometry.file_change_drain_commit_batch_size,
+        full_geometry.file_change_db_batch_size,
+        full_geometry.file_change_diff_worker_threads,
+        full_geometry.file_change_drain_parallel_chunk_size,
+        full_geometry.file_change_drain_channel_capacity,
+        incremental_geometry.file_change_pipeline_active,
+        incremental_geometry.file_change_pipeline_workers,
+        incremental_geometry.file_change_pipeline_commit_batch_size,
+        incremental_geometry.file_change_pipeline_result_channel_capacity,
+        incremental_geometry.file_change_fast_commit_batch_size,
+        incremental_geometry.file_change_drain_commit_batch_size,
+        incremental_geometry.file_change_db_batch_size,
+        incremental_geometry.file_change_diff_worker_threads,
+        incremental_geometry.file_change_drain_parallel_chunk_size,
+        incremental_geometry.file_change_drain_channel_capacity,
         format_latency(input.query.commit_window),
         format_latency(input.query.bfs),
         format_latency(input.query.dfs),
@@ -1880,7 +2343,62 @@ in_memory_vs_sqlite_median_speedup:
         in_memory_bfs_speedup,
         in_memory_shortest_parents_speedup,
         in_memory_shortest_both_speedup
-    )
+    );
+
+    report.push_str(
+        format!(
+            "
+commit_throughput_diagnostics:
+  combined_commits_indexed: {}
+  combined_index_duration_ms: {:.3}
+  combined_commit_throughput_per_sec: {:.3}
+  effective_commit_throughput_with_drain_per_sec: {:.3}
+  end_to_end_commit_throughput_per_sec: {:.3}
+",
+            combined_commits_indexed,
+            combined_index_seconds * 1_000.0,
+            combined_commit_rate,
+            effective_commit_rate_with_drain,
+            end_to_end_commit_rate,
+        )
+        .as_str(),
+    );
+    report.push_str(
+        format!(
+            "
+commit_materializer_diagnostics:
+  ingest_commit_walk_ms: {:.3}
+  ingest_commit_upsert_ms: {:.3}
+  ingest_edge_materialize_ms: {:.3}
+  lsm_materialization_ms: {:.3}
+  lsm_materialization_queue_fetch_share: {:.4}
+  lsm_materialization_empty_check_share: {:.4}
+  lsm_materialization_scan_to_apply_ratio: {:.4}
+  lsm_materialization_decode_to_apply_ratio: {:.4}
+  lsm_materialization_rows_applied: {:.3}
+  lsm_materialization_rows_unresolved: {:.3}
+  lsm_materialization_commit_edges_immediate: {:.3}
+  lsm_materialization_commit_edges_resolved: {:.3}
+  lsm_materialization_commit_edges_unresolved_staged: {:.3}
+",
+            ingest_commit_walk_ms,
+            ingest_commit_upsert_ms,
+            ingest_edge_materialize_ms,
+            lsm_materialization_ms,
+            lsm_materialization_queue_fetch_share,
+            lsm_materialization_empty_check_share,
+            lsm_materialization_scan_to_apply_ratio,
+            lsm_materialization_decode_to_apply_ratio,
+            lsm_materialization_rows_applied,
+            lsm_materialization_rows_unresolved,
+            lsm_materialization_commit_edges_immediate,
+            lsm_materialization_commit_edges_resolved,
+            lsm_materialization_commit_edges_unresolved_staged,
+        )
+        .as_str(),
+    );
+
+    report
 }
 
 fn format_latency(summary: &LatencySummary) -> String {
