@@ -28,8 +28,9 @@ Use `NNNN-short-title.md`, for example:
 12. `0012-gitoxide-ingestion-adapter-migration.md`
 13. `0013-quality-perf-workflow-hardening.md`
 14. `0014-runtime-query-graph-cache.md`
-15. `0015-lmdb-csr-delta-storage-no-sql.md`
-16. `0016-overlay-adjacency-and-lmdb-map-flooring.md`
+15. `0015-level-1-index-session-planner.md`
+16. `0015-lmdb-csr-delta-storage-no-sql.md`
+17. `0016-overlay-adjacency-and-lmdb-map-flooring.md`
 
 ## Template
 
