@@ -2,8 +2,7 @@ use std::env;
 
 use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, enrich_pending_file_change_stats, get_commit_window,
-    get_graph_traversal, get_latest_planner_session, get_recent_planner_sessions,
-    get_shortest_path, index_commits_with_mode, scan_repository,
+    get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 
@@ -11,7 +10,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- planner-latest <repo_path> [db_path]\n  cargo run -- planner-history <repo_path> [limit] [db_path]\n  cargo run -- enrich <repo_path> [max_items] [db_path]\n  cargo run -- drain <repo_path> [max_commits] [db_path]\n  cargo run -- window <repo_path> [limit] [db_path]\n  cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]\n  cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
+            "Usage:\n  cargo run -- scan <repo_path> [db_path]\n  cargo run -- index <repo_path> [db_path] [full|incremental]\n  cargo run -- enrich <repo_path> [max_items] [db_path]\n  cargo run -- drain <repo_path> [max_commits] [db_path]\n  cargo run -- window <repo_path> [limit] [db_path]\n  cargo run -- traverse <repo_path> <start_sha> [bfs|dfs|topological] [parents|children|both] [max_nodes] [db_path]\n  cargo run -- path <repo_path> <from_sha> <to_sha> [parents|children|both] [db_path]"
         );
         std::process::exit(1);
     }
@@ -22,8 +21,6 @@ fn main() {
     match action.as_str() {
         "scan" => run_scan(repo_path, args.get(3).map(String::as_str)),
         "index" => run_index(repo_path, &args[3..]),
-        "planner-latest" => run_planner_latest(repo_path, args.get(3).map(String::as_str)),
-        "planner-history" => run_planner_history(repo_path, &args[3..]),
         "enrich" => run_enrich(repo_path, &args[3..]),
         "drain" => run_drain(repo_path, &args[3..]),
         "window" => run_window(repo_path, &args[3..]),
@@ -31,7 +28,7 @@ fn main() {
         "path" => run_path(repo_path, &args[3..]),
         _ => {
             eprintln!(
-                "Unknown command: {action}. Use 'scan', 'index', 'planner-latest', 'planner-history', 'enrich', 'drain', 'window', 'traverse', or 'path'."
+                "Unknown command: {action}. Use 'scan', 'index', 'enrich', 'drain', 'window', 'traverse', or 'path'."
             );
             std::process::exit(1);
         }
@@ -40,13 +37,9 @@ fn main() {
 
 fn run_scan(repo_path: &str, db_path: Option<&str>) {
     match scan_repository(repo_path, db_path) {
-        Ok(response) => println!(
-            "Scanned repo '{}' at {} (git dir: {}, degraded_policy: {}, planner_session_id: {:?})",
-            response.repository.name,
-            response.repository.path,
-            response.repository.git_dir,
-            response.session_plan.degraded_mode.policy.as_str(),
-            response.session_plan.planner_session_id
+        Ok(summary) => println!(
+            "Scanned repo '{}' at {} (git dir: {})",
+            summary.name, summary.path, summary.git_dir
         ),
         Err(error) => {
             eprintln!("scan failed: {error}");
@@ -115,62 +108,6 @@ fn run_index(repo_path: &str, tail_args: &[String]) {
         }
         Err(error) => {
             eprintln!("index failed: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn run_planner_latest(repo_path: &str, db_path: Option<&str>) {
-    match get_latest_planner_session(repo_path, db_path) {
-        Ok(Some(session)) => println!(
-            "Planner session id={} entrypoint={} requested={} effective={} degraded_policy={} risk={} freshness={} signature={}",
-            session.session_id,
-            session.entrypoint.as_str(),
-            session.requested_mode.as_str(),
-            session.effective_mode.as_str(),
-            session.degraded_mode.policy.as_str(),
-            session.health.risk_level.as_str(),
-            session.health.maintenance_freshness.as_str(),
-            session.plan_signature
-        ),
-        Ok(None) => println!("No planner session persisted for this repository yet."),
-        Err(error) => {
-            eprintln!("planner-latest failed: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn run_planner_history(repo_path: &str, tail_args: &[String]) {
-    let mut limit = 10usize;
-    let mut db_path = None;
-
-    if let Some(arg1) = tail_args.first() {
-        if let Ok(parsed_limit) = arg1.parse::<usize>() {
-            limit = parsed_limit;
-            db_path = tail_args.get(1).map(String::as_str);
-        } else {
-            db_path = Some(arg1.as_str());
-        }
-    }
-
-    match get_recent_planner_sessions(repo_path, db_path, Some(limit)) {
-        Ok(sessions) => {
-            println!("Planner history sessions={}", sessions.len());
-            for session in sessions {
-                println!(
-                    "{} {} {} {} {} {}",
-                    session.session_id,
-                    session.entrypoint.as_str(),
-                    session.requested_mode.as_str(),
-                    session.effective_mode.as_str(),
-                    session.degraded_mode.policy.as_str(),
-                    session.health.risk_level.as_str()
-                );
-            }
-        }
-        Err(error) => {
-            eprintln!("planner-history failed: {error}");
             std::process::exit(1);
         }
     }
