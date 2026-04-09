@@ -1,7 +1,7 @@
 # ADR 0009: In-Memory Adjacency Graph from SQLite for Perf Harness
 
 Date: 2026-03-07
-Status: Accepted
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-sql.md`)
 
 ## Context
 

@@ -1,3337 +1,2788 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fmt::Write;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use lmdb::{
+    Cursor, Database, DatabaseFlags, Environment, EnvironmentFlags, RoTransaction, RwTransaction,
+    Transaction, WriteFlags,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::models::{
     CommitWindowCursor, CommitWindowItem, FileChangeExtractionQueueMetrics,
-    FileChangeLineStatsUpdate, FileChangeStatsState, FileChangeStatsStateCounts, GraphDirection,
-    IndexCheckpoint, ParsedCommit, ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
+    FileChangeLineStatsUpdate, FileChangeStatsState, FileChangeStatsStateCounts, IndexCheckpoint,
+    ParsedCommit, ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
 
-const MIGRATION_0001: &str = include_str!("../../migrations/0001_initial.sql");
-const MIGRATION_0002: &str = include_str!("../../migrations/0002_repo_scoped_commit_keys.sql");
-const MIGRATION_0003: &str = include_str!("../../migrations/0003_indexing_checkpoints.sql");
-const MIGRATION_0004: &str = include_str!("../../migrations/0004_integer_commit_edges.sql");
-const MIGRATION_0005: &str = include_str!("../../migrations/0005_file_change_enrichment_queue.sql");
-const MIGRATION_0006: &str = include_str!("../../migrations/0006_file_change_extraction_queue.sql");
-const MIGRATIONS: &[(i64, &str)] = &[
-    (1, MIGRATION_0001),
-    (2, MIGRATION_0002),
-    (3, MIGRATION_0003),
-    (4, MIGRATION_0004),
-    (5, MIGRATION_0005),
-    (6, MIGRATION_0006),
-];
-
-const ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE: usize = 400;
-const FRONTIER_PULL_QUERY_CHUNK_SIZE: usize = 800;
-const ORDERED_NEIGHBOR_STAGE_THRESHOLD: usize = ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE;
-const FRONTIER_PULL_STAGE_THRESHOLD: usize = FRONTIER_PULL_QUERY_CHUNK_SIZE;
-const MAX_COMMIT_WINDOW_LIMIT: usize = 5_000;
-const MAX_COMMIT_WINDOW_FETCH_LIMIT: usize = MAX_COMMIT_WINDOW_LIMIT + 1;
+const LMDB_DEFAULT_MAP_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const LMDB_MIN_MAP_SIZE_BYTES: usize = 512 * 1024 * 1024;
+const LMDB_MAX_DBS: u32 = 16;
+const LMDB_NO_READAHEAD_ENV: &str = "GITGRAPH_LMDB_NO_READAHEAD";
+const LMDB_WRITE_MAP_ENV: &str = "GITGRAPH_LMDB_WRITE_MAP";
+const LMDB_MAP_ASYNC_ENV: &str = "GITGRAPH_LMDB_MAP_ASYNC";
+const LMDB_NO_MEM_INIT_ENV: &str = "GITGRAPH_LMDB_NO_MEM_INIT";
+const GRAPH_OVERLAY_MAX_COMMITS_ENV: &str = "GITGRAPH_GRAPH_OVERLAY_MAX_COMMITS";
+const GRAPH_OVERLAY_MAX_EDGES_ENV: &str = "GITGRAPH_GRAPH_OVERLAY_MAX_EDGES";
+const REPO_KEY_WIDTH: usize = 20;
 const FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS: i64 = 5;
 const FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS: i64 = 5;
 const FILE_CHANGE_ENRICHMENT_RETRY_MAX_DELAY_SECONDS: i64 = 300;
 const FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS: i64 = 5;
 const FILE_CHANGE_EXTRACTION_RETRY_BASE_DELAY_SECONDS: i64 = 5;
 const FILE_CHANGE_EXTRACTION_RETRY_MAX_DELAY_SECONDS: i64 = 300;
-const SQLITE_MAX_BIND_PARAMETERS_FALLBACK: usize = 999;
-const FILE_CHANGE_UPSERT_COLUMNS: usize = 7;
-const FILE_CHANGE_ENQUEUE_COLUMNS: usize = 4;
-const COMMIT_UPSERT_COLUMNS: usize = 8;
-#[cfg(test)]
-const FILE_CHANGE_UPSERT_ROWS_PER_CHUNK: usize =
-    SQLITE_MAX_BIND_PARAMETERS_FALLBACK / FILE_CHANGE_UPSERT_COLUMNS;
-#[cfg(test)]
-const FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK: usize =
-    SQLITE_MAX_BIND_PARAMETERS_FALLBACK / FILE_CHANGE_ENQUEUE_COLUMNS;
+const GRAPH_OVERLAY_MAX_COMMITS_DEFAULT: usize = 512;
+const GRAPH_OVERLAY_MAX_EDGES_DEFAULT: usize = 2_048;
 
-#[derive(Debug, Clone, Copy)]
-struct EnrichmentRetryDecision {
-    next_attempt: i64,
-    is_terminal: bool,
-    next_enqueued_epoch: i64,
+const META_NEXT_REPOSITORY_ID: &str = "next_repository_id";
+const META_NEXT_DELTA_SEQUENCE: &str = "next_delta_sequence";
+const DELTA_LOG_RETENTION_DEFAULT_EVENTS: u64 = 200_000;
+const COMMIT_WINDOW_TIME_COMPONENT_WIDTH: usize = 20;
+const DUE_TIME_COMPONENT_WIDTH: usize = 20;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LmdbRuntimeOptions {
+    no_readahead: bool,
+    write_map: bool,
+    map_async: bool,
+    no_mem_init: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExtractionRetryDecision {
-    next_attempt: i64,
-    is_terminal: bool,
-    next_retry_epoch: i64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SqliteWriteProfile {
-    Balanced,
-    Throughput,
-}
-
-fn sqlite_write_profile() -> SqliteWriteProfile {
-    let raw = env::var("GITGRAPH_SQLITE_WRITE_PROFILE")
-        .unwrap_or_else(|_| "balanced".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    if raw == "throughput" {
-        SqliteWriteProfile::Throughput
-    } else {
-        SqliteWriteProfile::Balanced
-    }
-}
-
-pub fn open_database(db_path: &Path) -> AppResult<Connection> {
-    if let Some(parent) = db_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch(
-        r#"
-        PRAGMA foreign_keys=ON;
-        PRAGMA journal_mode=WAL;
-        PRAGMA synchronous=NORMAL;
-        PRAGMA temp_store=MEMORY;
-        PRAGMA busy_timeout=5000;
-    "#,
-    )?;
-    if sqlite_write_profile() == SqliteWriteProfile::Throughput {
-        conn.execute_batch(
-            r#"
-            PRAGMA cache_size=-65536;
-            PRAGMA mmap_size=268435456;
-            PRAGMA wal_autocheckpoint=4000;
-        "#,
-        )?;
-    }
-    // Hot graph query paths prepare many repeated statements.
-    conn.set_prepared_statement_cache_capacity(256);
-    Ok(conn)
-}
-
-pub fn run_migrations(conn: &mut Connection) -> AppResult<()> {
-    ensure_schema_migrations_table(conn)?;
-
-    for (version, sql) in MIGRATIONS {
-        let already_applied: i64 = conn.query_row(
-            "SELECT COUNT(1) FROM schema_migrations WHERE version = ?1",
-            params![version],
-            |row| row.get(0),
-        )?;
-
-        if already_applied == 0 {
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.execute(
-                "INSERT INTO schema_migrations (version, applied_at_epoch) VALUES (?1, ?2)",
-                params![version, now_epoch_seconds()],
-            )?;
-            tx.commit()?;
-        }
-    }
-
-    Ok(())
-}
-
-fn ensure_schema_migrations_table(conn: &Connection) -> AppResult<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-          version INTEGER PRIMARY KEY,
-          applied_at_epoch INTEGER NOT NULL
-        );
-    "#,
-    )?;
-    Ok(())
-}
-
-pub fn upsert_repository(
-    conn: &Connection,
-    path: &str,
-    name: &str,
-    git_dir: &str,
-) -> AppResult<i64> {
-    conn.execute(
-        r#"
-        INSERT INTO repositories (path, name, git_dir)
-        VALUES (?1, ?2, ?3)
-        ON CONFLICT(path) DO UPDATE SET
-          name = excluded.name,
-          git_dir = excluded.git_dir
-    "#,
-        params![path, name, git_dir],
-    )?;
-
-    let repo_id: i64 = conn.query_row(
-        "SELECT id FROM repositories WHERE path = ?1",
-        [path],
-        |row| row.get(0),
-    )?;
-    Ok(repo_id)
-}
-
-pub fn load_repository_id_by_path(conn: &Connection, path: &str) -> AppResult<Option<i64>> {
-    let repo_id = conn
-        .query_row(
-            "SELECT id FROM repositories WHERE path = ?1 LIMIT 1",
-            [path],
-            |row| row.get(0),
+impl LmdbRuntimeOptions {
+    fn from_env() -> AppResult<Self> {
+        Self::from_bools(
+            parse_env_bool_enabled(LMDB_NO_READAHEAD_ENV),
+            parse_env_bool_enabled(LMDB_WRITE_MAP_ENV),
+            parse_env_bool_enabled(LMDB_MAP_ASYNC_ENV),
+            parse_env_bool_enabled(LMDB_NO_MEM_INIT_ENV),
         )
-        .optional()?;
-    Ok(repo_id)
-}
-
-pub fn clear_repository_index_data(conn: &Connection, repo_id: i64) -> AppResult<()> {
-    conn.execute("DELETE FROM commit_edges WHERE repo_id = ?1", [repo_id])?;
-    conn.execute("DELETE FROM commits WHERE repo_id = ?1", [repo_id])?;
-    conn.execute("DELETE FROM refs WHERE repo_id = ?1", [repo_id])?;
-    conn.execute("DELETE FROM file_changes WHERE repo_id = ?1", [repo_id])?;
-    Ok(())
-}
-
-pub fn delete_file_changes_for_commits(
-    conn: &Connection,
-    repo_id: i64,
-    commit_shas: &[String],
-) -> AppResult<()> {
-    if commit_shas.is_empty() {
-        return Ok(());
     }
 
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_pending_file_change_delete_shas (
-          sha TEXT PRIMARY KEY
-        );
-        DELETE FROM current_pending_file_change_delete_shas;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_pending_file_change_delete_shas (sha)
-            VALUES (?1)
-            ON CONFLICT(sha) DO NOTHING
-        "#,
-        )?;
-        for sha in commit_shas {
-            insert_stmt.execute([sha.as_str()])?;
+    fn from_bools(
+        no_readahead: bool,
+        write_map: bool,
+        map_async: bool,
+        no_mem_init: bool,
+    ) -> AppResult<Self> {
+        if map_async && !write_map {
+            return Err(AppError::InvalidArgument(format!(
+                "{LMDB_MAP_ASYNC_ENV}=1 requires {LMDB_WRITE_MAP_ENV}=1"
+            )));
         }
-    }
 
-    conn.execute(
-        r#"
-        DELETE FROM file_changes
-        WHERE repo_id = ?1
-          AND commit_sha IN (
-            SELECT sha
-            FROM current_pending_file_change_delete_shas
-          )
-    "#,
-        [repo_id],
-    )?;
-    conn.execute(
-        r#"
-        DELETE FROM file_change_enrichment_queue
-        WHERE repo_id = ?1
-          AND commit_sha IN (
-            SELECT sha
-            FROM current_pending_file_change_delete_shas
-          )
-    "#,
-        [repo_id],
-    )?;
-
-    Ok(())
-}
-
-pub fn prepare_file_change_drain_stage(conn: &Connection) -> AppResult<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_staged_file_changes_for_drain (
-          commit_sha TEXT NOT NULL,
-          file_path TEXT NOT NULL,
-          additions INTEGER,
-          deletions INTEGER,
-          change_type TEXT NOT NULL,
-          stats_state TEXT NOT NULL,
-          requires_line_stats INTEGER NOT NULL,
-          PRIMARY KEY(commit_sha, file_path)
-        );
-        DELETE FROM current_staged_file_changes_for_drain;
-    "#,
-    )?;
-    Ok(())
-}
-
-pub fn stage_file_change_for_drain(
-    conn: &Connection,
-    change: &ParsedFileChange,
-) -> AppResult<usize> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        INSERT INTO current_staged_file_changes_for_drain (
-          commit_sha, file_path, additions, deletions, change_type, stats_state, requires_line_stats
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-        ON CONFLICT(commit_sha, file_path) DO UPDATE SET
-          additions = excluded.additions,
-          deletions = excluded.deletions,
-          change_type = excluded.change_type,
-          stats_state = excluded.stats_state,
-          requires_line_stats = excluded.requires_line_stats
-    "#,
-    )?;
-    let inserted = stmt.execute(params![
-        change.commit_sha.as_str(),
-        change.file_path.as_str(),
-        change.additions,
-        change.deletions,
-        change.change_type.as_str(),
-        change.stats_state.as_str(),
-        if change.requires_line_stats { 1 } else { 0 },
-    ])?;
-    Ok(inserted)
-}
-
-pub fn merge_file_changes_from_drain_stage(conn: &Connection, repo_id: i64) -> AppResult<usize> {
-    let merged = conn.execute(
-        r#"
-        INSERT INTO file_changes (
-          repo_id, commit_sha, file_path, additions, deletions, change_type, stats_state
-        )
-        SELECT
-          ?1,
-          stage.commit_sha,
-          stage.file_path,
-          stage.additions,
-          stage.deletions,
-          stage.change_type,
-          stage.stats_state
-        FROM current_staged_file_changes_for_drain stage
-        WHERE 1
-        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
-          additions = excluded.additions,
-          deletions = excluded.deletions,
-          change_type = excluded.change_type,
-          stats_state = excluded.stats_state
-    "#,
-        [repo_id],
-    )?;
-    Ok(merged)
-}
-
-pub fn enqueue_file_changes_for_enrichment_from_drain_stage(
-    conn: &Connection,
-    repo_id: i64,
-) -> AppResult<usize> {
-    let now_epoch = now_epoch_seconds();
-    let enqueued = conn.execute(
-        r#"
-        INSERT INTO file_change_enrichment_queue (
-          repo_id, commit_sha, file_path, enqueued_at_epoch
-        )
-        SELECT
-          ?1,
-          stage.commit_sha,
-          stage.file_path,
-          ?2
-        FROM current_staged_file_changes_for_drain stage
-        WHERE stage.stats_state = 'pending'
-          AND stage.requires_line_stats = 1
-        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
-          enqueued_at_epoch = excluded.enqueued_at_epoch,
-          attempts = 0,
-          last_error = NULL
-    "#,
-        params![repo_id, now_epoch],
-    )?;
-    Ok(enqueued)
-}
-
-fn sqlite_max_bind_parameters(conn: &Connection) -> usize {
-    conn.query_row("PRAGMA max_variable_number", [], |row| row.get::<_, i64>(0))
-        .optional()
-        .ok()
-        .flatten()
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(SQLITE_MAX_BIND_PARAMETERS_FALLBACK)
-}
-
-fn rows_per_chunk(conn: &Connection, columns_per_row: usize) -> usize {
-    if columns_per_row == 0 {
-        return 1;
-    }
-    let max_bind_parameters = sqlite_max_bind_parameters(conn);
-    max_bind_parameters
-        .checked_div(columns_per_row)
-        .unwrap_or(1)
-        .max(1)
-}
-
-pub fn upsert_file_changes(
-    conn: &Connection,
-    repo_id: i64,
-    file_changes: &[ParsedFileChange],
-) -> AppResult<usize> {
-    if file_changes.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0usize;
-    let chunk_size = rows_per_chunk(conn, FILE_CHANGE_UPSERT_COLUMNS);
-    let mut chunks = file_changes.chunks_exact(chunk_size);
-    if file_changes.len() >= chunk_size {
-        let full_sql = build_file_change_upsert_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
-        for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * FILE_CHANGE_UPSERT_COLUMNS);
-            for change in chunk {
-                bind_values.push(Value::Integer(repo_id));
-                bind_values.push(Value::Text(change.commit_sha.clone()));
-                bind_values.push(Value::Text(change.file_path.clone()));
-                bind_values.push(match change.additions {
-                    Some(number) => Value::Integer(number),
-                    None => Value::Null,
-                });
-                bind_values.push(match change.deletions {
-                    Some(number) => Value::Integer(number),
-                    None => Value::Null,
-                });
-                bind_values.push(Value::Text(change.change_type.clone()));
-                bind_values.push(Value::Text(change.stats_state.as_str().to_string()));
-            }
-
-            full_stmt.execute(params_from_iter(bind_values.iter()))?;
-            inserted = inserted.saturating_add(chunk.len());
+        if no_mem_init && write_map {
+            return Err(AppError::InvalidArgument(format!(
+                "{LMDB_NO_MEM_INIT_ENV}=1 is redundant when {LMDB_WRITE_MAP_ENV}=1; disable one"
+            )));
         }
-    }
 
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let remainder_sql = build_file_change_upsert_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
-        let mut bind_values = Vec::with_capacity(remainder.len() * FILE_CHANGE_UPSERT_COLUMNS);
-        for change in remainder {
-            bind_values.push(Value::Integer(repo_id));
-            bind_values.push(Value::Text(change.commit_sha.clone()));
-            bind_values.push(Value::Text(change.file_path.clone()));
-            bind_values.push(match change.additions {
-                Some(number) => Value::Integer(number),
-                None => Value::Null,
-            });
-            bind_values.push(match change.deletions {
-                Some(number) => Value::Integer(number),
-                None => Value::Null,
-            });
-            bind_values.push(Value::Text(change.change_type.clone()));
-            bind_values.push(Value::Text(change.stats_state.as_str().to_string()));
-        }
-        remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
-        inserted = inserted.saturating_add(remainder.len());
-    }
-
-    Ok(inserted)
-}
-
-pub fn upsert_commits_batch(
-    conn: &Connection,
-    repo_id: i64,
-    commits: &[ParsedCommit],
-) -> AppResult<usize> {
-    if commits.is_empty() {
-        return Ok(0);
-    }
-
-    let mut inserted = 0usize;
-    let chunk_size = rows_per_chunk(conn, COMMIT_UPSERT_COLUMNS);
-    let mut chunks = commits.chunks_exact(chunk_size);
-    if commits.len() >= chunk_size {
-        let full_sql = build_commit_upsert_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
-        for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * COMMIT_UPSERT_COLUMNS);
-            for commit in chunk {
-                bind_values.push(Value::Text(commit.sha.clone()));
-                bind_values.push(Value::Integer(repo_id));
-                bind_values.push(Value::Text(commit.author_name.clone()));
-                bind_values.push(Value::Text(commit.author_email.clone()));
-                bind_values.push(Value::Integer(commit.author_time));
-                bind_values.push(Value::Integer(commit.committer_time));
-                bind_values.push(Value::Text(commit.subject.clone()));
-                bind_values.push(Value::Text(commit.tree_sha.clone()));
-            }
-
-            full_stmt.execute(params_from_iter(bind_values.iter()))?;
-            inserted = inserted.saturating_add(chunk.len());
-        }
-    }
-
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let remainder_sql = build_commit_upsert_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
-        let mut bind_values = Vec::with_capacity(remainder.len() * COMMIT_UPSERT_COLUMNS);
-        for commit in remainder {
-            bind_values.push(Value::Text(commit.sha.clone()));
-            bind_values.push(Value::Integer(repo_id));
-            bind_values.push(Value::Text(commit.author_name.clone()));
-            bind_values.push(Value::Text(commit.author_email.clone()));
-            bind_values.push(Value::Integer(commit.author_time));
-            bind_values.push(Value::Integer(commit.committer_time));
-            bind_values.push(Value::Text(commit.subject.clone()));
-            bind_values.push(Value::Text(commit.tree_sha.clone()));
-        }
-        remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
-        inserted = inserted.saturating_add(remainder.len());
-    }
-
-    Ok(inserted)
-}
-
-pub fn enqueue_file_changes_for_enrichment(
-    conn: &Connection,
-    repo_id: i64,
-    file_changes: &[ParsedFileChange],
-) -> AppResult<usize> {
-    if file_changes.is_empty() {
-        return Ok(0);
-    }
-
-    let eligible: Vec<&ParsedFileChange> = file_changes
-        .iter()
-        .filter(|change| {
-            change.stats_state == FileChangeStatsState::Pending && change.requires_line_stats
+        Ok(Self {
+            no_readahead,
+            write_map,
+            map_async,
+            no_mem_init,
         })
-        .collect();
-    if eligible.is_empty() {
-        return Ok(0);
     }
 
-    let mut enqueued = 0usize;
-    let now_epoch = now_epoch_seconds();
-    let chunk_size = rows_per_chunk(conn, FILE_CHANGE_ENQUEUE_COLUMNS);
-    let mut chunks = eligible.chunks_exact(chunk_size);
-    if eligible.len() >= chunk_size {
-        let full_sql = build_file_change_enrichment_enqueue_sql(chunk_size);
-        let mut full_stmt = conn.prepare_cached(&full_sql)?;
-        for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * FILE_CHANGE_ENQUEUE_COLUMNS);
-            for change in chunk {
-                bind_values.push(Value::Integer(repo_id));
-                bind_values.push(Value::Text(change.commit_sha.clone()));
-                bind_values.push(Value::Text(change.file_path.clone()));
-                bind_values.push(Value::Integer(now_epoch));
+    fn environment_flags(self) -> EnvironmentFlags {
+        let mut flags = EnvironmentFlags::empty();
+        if self.write_map {
+            flags |= EnvironmentFlags::WRITE_MAP;
+        }
+        if self.map_async {
+            flags |= EnvironmentFlags::MAP_ASYNC;
+        }
+        if self.no_mem_init {
+            flags |= EnvironmentFlags::NO_MEM_INIT;
+        }
+        if self.no_readahead && !cfg!(windows) {
+            flags |= EnvironmentFlags::NO_READAHEAD;
+        }
+        flags
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepositoryRecord {
+    id: i64,
+    path: String,
+    name: String,
+    git_dir: String,
+    indexed_at_epoch: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitRecord {
+    pub sha: String,
+    pub parents: Vec<String>,
+    pub tree_sha: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub author_time: i64,
+    pub committer_time: i64,
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileChangeRecord {
+    commit_sha: String,
+    file_path: String,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    change_type: String,
+    stats_state: FileChangeStatsState,
+    requires_line_stats: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnrichmentQueueEntry {
+    attempts: i64,
+    last_error: Option<String>,
+    enqueued_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtractionQueueCommitEntry {
+    attempts: i64,
+    last_error: Option<String>,
+    enqueued_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeltaEvent {
+    sequence: u64,
+    repo_id: Option<i64>,
+    at_epoch: i64,
+    kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CsrSnapshot {
+    pub generated_at_epoch: i64,
+    pub shas: Vec<String>,
+    pub parents_offsets: Vec<u32>,
+    pub parents_neighbors: Vec<u32>,
+    pub children_offsets: Vec<u32>,
+    pub children_neighbors: Vec<u32>,
+    pub directed_edges: usize,
+}
+
+impl CsrSnapshot {
+    pub fn node_count(&self) -> usize {
+        self.shas.len()
+    }
+
+    pub fn parents_for(&self, node_id: usize) -> &[u32] {
+        csr_slice(&self.parents_offsets, &self.parents_neighbors, node_id)
+    }
+
+    pub fn children_for(&self, node_id: usize) -> &[u32] {
+        csr_slice(&self.children_offsets, &self.children_neighbors, node_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphSnapshotMetadata {
+    pub snapshot_version: u64,
+    pub generated_at_epoch: i64,
+    pub node_count: usize,
+    pub directed_edges: usize,
+    pub pending_overlay_commits: usize,
+    pub pending_overlay_edges: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GraphOverlayParentRow {
+    pub child_sha: String,
+    pub parent_shas: Vec<String>,
+    pub committer_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphOverlayChildRow {
+    parent_sha: String,
+    child_shas: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphSnapshotState {
+    pub metadata: GraphSnapshotMetadata,
+    pub snapshot: CsrSnapshot,
+    pub overlay_parent_rows: Vec<GraphOverlayParentRow>,
+    pub overlay_child_rows: HashMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct Databases {
+    metadata: Database,
+    repositories: Database,
+    repository_path_index: Database,
+    commits: Database,
+    commit_window_index: Database,
+    refs: Database,
+    file_changes: Database,
+    enrichment_queue: Database,
+    enrichment_due_index: Database,
+    extraction_queue: Database,
+    checkpoints: Database,
+    csr_snapshots: Database,
+    graph_snapshot_metadata: Database,
+    graph_overlay_parent_rows: Database,
+    graph_overlay_child_rows: Database,
+    delta_log: Database,
+}
+
+pub struct GraphStore {
+    env: Environment,
+    dbs: Databases,
+    store_dir: PathBuf,
+}
+
+impl GraphStore {
+    pub fn open(db_path: &Path) -> AppResult<Self> {
+        let store_dir = resolve_store_directory(db_path);
+        fs::create_dir_all(&store_dir)?;
+
+        let runtime_options = resolve_lmdb_runtime_options()?;
+        let mut builder = Environment::new();
+        builder
+            .set_max_dbs(LMDB_MAX_DBS)
+            .set_map_size(resolve_map_size_bytes(&store_dir))
+            .set_flags(runtime_options.environment_flags());
+        let env = builder.open(&store_dir)?;
+
+        let dbs = Databases {
+            metadata: env.create_db(Some("metadata"), DatabaseFlags::empty())?,
+            repositories: env.create_db(Some("repositories"), DatabaseFlags::empty())?,
+            repository_path_index: env
+                .create_db(Some("repository_path_index"), DatabaseFlags::empty())?,
+            commits: env.create_db(Some("commits"), DatabaseFlags::empty())?,
+            commit_window_index: env
+                .create_db(Some("commit_window_index"), DatabaseFlags::empty())?,
+            refs: env.create_db(Some("refs"), DatabaseFlags::empty())?,
+            file_changes: env.create_db(Some("file_changes"), DatabaseFlags::empty())?,
+            enrichment_queue: env.create_db(Some("enrichment_queue"), DatabaseFlags::empty())?,
+            enrichment_due_index: env
+                .create_db(Some("enrichment_due_index"), DatabaseFlags::empty())?,
+            extraction_queue: env.create_db(Some("extraction_queue"), DatabaseFlags::empty())?,
+            checkpoints: env.create_db(Some("checkpoints"), DatabaseFlags::empty())?,
+            csr_snapshots: env.create_db(Some("csr_snapshots"), DatabaseFlags::empty())?,
+            graph_snapshot_metadata: env
+                .create_db(Some("graph_snapshot_metadata"), DatabaseFlags::empty())?,
+            graph_overlay_parent_rows: env
+                .create_db(Some("graph_overlay_parent_rows"), DatabaseFlags::empty())?,
+            graph_overlay_child_rows: env
+                .create_db(Some("graph_overlay_child_rows"), DatabaseFlags::empty())?,
+            delta_log: env.create_db(Some("delta_log"), DatabaseFlags::empty())?,
+        };
+        {
+            let mut txn = env.begin_rw_txn()?;
+            ensure_u64_meta(&mut txn, dbs.metadata, META_NEXT_REPOSITORY_ID, 1)?;
+            ensure_u64_meta(&mut txn, dbs.metadata, META_NEXT_DELTA_SEQUENCE, 1)?;
+            txn.commit()?;
+        }
+
+        Ok(Self {
+            env,
+            dbs,
+            store_dir,
+        })
+    }
+
+    pub fn store_directory(&self) -> &Path {
+        &self.store_dir
+    }
+
+    pub fn upsert_repository(&self, path: &str, name: &str, git_dir: &str) -> AppResult<i64> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let repo_id = match txn.get(self.dbs.repository_path_index, &path) {
+            Ok(raw) => decode_u64(raw, "decode repository id from path index")? as i64,
+            Err(lmdb::Error::NotFound) => {
+                let next = read_u64_meta(&txn, self.dbs.metadata, META_NEXT_REPOSITORY_ID)?
+                    .unwrap_or(1)
+                    .max(1);
+                write_u64_meta(
+                    &mut txn,
+                    self.dbs.metadata,
+                    META_NEXT_REPOSITORY_ID,
+                    next.saturating_add(1),
+                )?;
+                let id = i64::try_from(next).map_err(|_| {
+                    AppError::Parse(
+                        "repository id exceeded i64 while upserting repository".to_string(),
+                    )
+                })?;
+                txn.put(
+                    self.dbs.repository_path_index,
+                    &path,
+                    &encode_u64(next),
+                    WriteFlags::empty(),
+                )?;
+                id
             }
-
-            full_stmt.execute(params_from_iter(bind_values.iter()))?;
-            enqueued = enqueued.saturating_add(chunk.len());
-        }
-    }
-
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let remainder_sql = build_file_change_enrichment_enqueue_sql(remainder.len());
-        let mut remainder_stmt = conn.prepare_cached(&remainder_sql)?;
-        let mut bind_values = Vec::with_capacity(remainder.len() * FILE_CHANGE_ENQUEUE_COLUMNS);
-        for change in remainder {
-            bind_values.push(Value::Integer(repo_id));
-            bind_values.push(Value::Text(change.commit_sha.clone()));
-            bind_values.push(Value::Text(change.file_path.clone()));
-            bind_values.push(Value::Integer(now_epoch));
-        }
-
-        remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
-        enqueued = enqueued.saturating_add(remainder.len());
-    }
-
-    Ok(enqueued)
-}
-
-pub fn enqueue_commits_for_file_change_extraction(
-    conn: &Connection,
-    repo_id: i64,
-    commit_shas: &[String],
-) -> AppResult<usize> {
-    if commit_shas.is_empty() {
-        return Ok(0);
-    }
-
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_pending_file_change_extraction_commits (
-          sha TEXT PRIMARY KEY
-        );
-        DELETE FROM current_pending_file_change_extraction_commits;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_pending_file_change_extraction_commits (sha)
-            VALUES (?1)
-            ON CONFLICT(sha) DO NOTHING
-        "#,
-        )?;
-        for sha in commit_shas {
-            insert_stmt.execute([sha.as_str()])?;
-        }
-    }
-
-    let now_epoch = now_epoch_seconds();
-    conn.execute(
-        r#"
-        INSERT INTO file_change_extraction_queue (
-          repo_id, commit_sha, enqueued_at_epoch, attempts, last_error, next_retry_epoch
-        )
-        SELECT ?1, pending.sha, ?2, 0, NULL, ?2
-        FROM current_pending_file_change_extraction_commits pending
-        WHERE 1
-        ON CONFLICT(repo_id, commit_sha) DO UPDATE SET
-          enqueued_at_epoch = excluded.enqueued_at_epoch,
-          attempts = 0,
-          last_error = NULL,
-          next_retry_epoch = excluded.next_retry_epoch
-    "#,
-        params![repo_id, now_epoch],
-    )?;
-
-    let enqueued: i64 = conn.query_row(
-        "SELECT COUNT(1) FROM current_pending_file_change_extraction_commits",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(enqueued.max(0) as usize)
-}
-
-pub fn load_pending_file_change_extraction_commits(
-    conn: &Connection,
-    repo_id: i64,
-    limit: usize,
-) -> AppResult<Vec<String>> {
-    let bounded_limit = limit.max(1);
-    let now_epoch = now_epoch_seconds();
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT commit_sha
-        FROM file_change_extraction_queue
-        WHERE repo_id = ?1
-          AND attempts < ?2
-          AND next_retry_epoch <= ?3
-        ORDER BY next_retry_epoch ASC, enqueued_at_epoch ASC, commit_sha ASC
-        LIMIT ?4
-    "#,
-    )?;
-    let rows = stmt.query_map(
-        params![
-            repo_id,
-            FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS,
-            now_epoch,
-            bounded_limit as i64
-        ],
-        |row| row.get::<_, String>(0),
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-pub fn clear_file_change_extraction_queue_for_commits(
-    conn: &Connection,
-    repo_id: i64,
-    commit_shas: &[String],
-) -> AppResult<()> {
-    if commit_shas.is_empty() {
-        return Ok(());
-    }
-
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_completed_file_change_extraction_commits (
-          sha TEXT PRIMARY KEY
-        );
-        DELETE FROM current_completed_file_change_extraction_commits;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_completed_file_change_extraction_commits (sha)
-            VALUES (?1)
-            ON CONFLICT(sha) DO NOTHING
-        "#,
-        )?;
-        for sha in commit_shas {
-            insert_stmt.execute([sha.as_str()])?;
-        }
-    }
-
-    conn.execute(
-        r#"
-        DELETE FROM file_change_extraction_queue
-        WHERE repo_id = ?1
-          AND commit_sha IN (
-            SELECT sha
-            FROM current_completed_file_change_extraction_commits
-          )
-    "#,
-        [repo_id],
-    )?;
-
-    Ok(())
-}
-
-pub fn mark_file_change_extraction_failed(
-    conn: &Connection,
-    repo_id: i64,
-    commit_shas: &[String],
-    error_message: &str,
-) -> AppResult<()> {
-    if commit_shas.is_empty() {
-        return Ok(());
-    }
-
-    let now_epoch = now_epoch_seconds();
-    let mut load_attempts_stmt = conn.prepare_cached(
-        r#"
-        SELECT attempts
-        FROM file_change_extraction_queue
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-        LIMIT 1
-    "#,
-    )?;
-    let mut queue_stmt = conn.prepare_cached(
-        r#"
-        INSERT INTO file_change_extraction_queue (
-          repo_id, commit_sha, enqueued_at_epoch, attempts, last_error, next_retry_epoch
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(repo_id, commit_sha) DO UPDATE SET
-          attempts = excluded.attempts,
-          last_error = excluded.last_error,
-          next_retry_epoch = excluded.next_retry_epoch
-    "#,
-    )?;
-
-    for commit_sha in commit_shas {
-        let current_attempts = load_attempts_stmt
-            .query_row(params![repo_id, commit_sha.as_str()], |row| {
-                row.get::<_, i64>(0)
-            })
-            .optional()?
-            .unwrap_or_default();
-        let retry_decision = decide_extraction_retry(current_attempts, now_epoch);
-        let final_attempts = if retry_decision.is_terminal {
-            FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS
-        } else {
-            retry_decision.next_attempt
+            Err(error) => return Err(error.into()),
         };
 
-        queue_stmt.execute(params![
+        let record = RepositoryRecord {
+            id: repo_id,
+            path: path.to_string(),
+            name: name.to_string(),
+            git_dir: git_dir.to_string(),
+            indexed_at_epoch: self
+                .load_repository_record_from_rw(&txn, repo_id)?
+                .and_then(|existing| existing.indexed_at_epoch),
+        };
+
+        let key = repo_id.to_be_bytes();
+        let value = serialize(&record, "serialize repository record")?;
+        txn.put(self.dbs.repositories, &key, &value, WriteFlags::empty())?;
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!("repository_upsert path={path}"),
+        )?;
+        txn.commit()?;
+        Ok(repo_id)
+    }
+
+    pub fn load_repository_id_by_path(&self, path: &str) -> AppResult<Option<i64>> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.dbs.repository_path_index, &path) {
+            Ok(raw) => Ok(Some(
+                i64::try_from(decode_u64(raw, "decode repository id by path")?).map_err(|_| {
+                    AppError::Parse(
+                        "repository id exceeded i64 while loading repository by path".to_string(),
+                    )
+                })?,
+            )),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn clear_repository_index_data(&self, repo_id: i64) -> AppResult<()> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let repo_prefix = repository_prefix(repo_id);
+        let deleted_commits =
+            delete_prefixed_entries(&mut txn, self.dbs.commits, repo_prefix.as_str())?;
+        let _ =
+            delete_prefixed_entries(&mut txn, self.dbs.commit_window_index, repo_prefix.as_str())?;
+        let deleted_refs = delete_prefixed_entries(&mut txn, self.dbs.refs, repo_prefix.as_str())?;
+        let deleted_file_changes =
+            delete_prefixed_entries(&mut txn, self.dbs.file_changes, repo_prefix.as_str())?;
+        let _ = delete_prefixed_entries(&mut txn, self.dbs.enrichment_queue, repo_prefix.as_str())?;
+        let _ = delete_prefixed_entries(
+            &mut txn,
+            self.dbs.enrichment_due_index,
+            repo_prefix.as_str(),
+        )?;
+        let _ = delete_prefixed_entries(&mut txn, self.dbs.extraction_queue, repo_prefix.as_str())?;
+
+        let repo_key = repo_id.to_be_bytes();
+        let _ = txn.del(self.dbs.checkpoints, &repo_key, None);
+        let _ = txn.del(self.dbs.csr_snapshots, &repo_key, None);
+        let _ = txn.del(self.dbs.graph_snapshot_metadata, &repo_key, None);
+        let _ = delete_prefixed_entries(
+            &mut txn,
+            self.dbs.graph_overlay_parent_rows,
+            repo_prefix.as_str(),
+        )?;
+        let _ = delete_prefixed_entries(
+            &mut txn,
+            self.dbs.graph_overlay_child_rows,
+            repo_prefix.as_str(),
+        )?;
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "repository_clear commits={deleted_commits} refs={deleted_refs} file_changes={deleted_file_changes}"
+            ),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn persist_commits(&self, repo_id: i64, commits: &[ParsedCommit]) -> AppResult<usize> {
+        if commits.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        for commit in commits {
+            let key = repository_commit_key(repo_id, commit.sha.as_str());
+            let value = CommitRecord {
+                sha: commit.sha.clone(),
+                parents: commit.parents.clone(),
+                tree_sha: commit.tree_sha.clone(),
+                author_name: commit.author_name.clone(),
+                author_email: commit.author_email.clone(),
+                author_time: commit.author_time,
+                committer_time: commit.committer_time,
+                subject: commit.subject.clone(),
+            };
+            let raw = serialize(&value, "serialize commit record")?;
+            txn.put(self.dbs.commits, &key, &raw, WriteFlags::empty())?;
+
+            let commit_window_key =
+                commit_window_index_key(repo_id, commit.committer_time, commit.sha.as_str())?;
+            let commit_window_item = CommitWindowItem {
+                sha: commit.sha.clone(),
+                author_name: commit.author_name.clone(),
+                author_email: commit.author_email.clone(),
+                committer_time: commit.committer_time,
+                subject: commit.subject.clone(),
+                tree_sha: commit.tree_sha.clone(),
+            };
+            let commit_window_raw =
+                serialize(&commit_window_item, "serialize commit-window index item")?;
+            txn.put(
+                self.dbs.commit_window_index,
+                &commit_window_key,
+                &commit_window_raw,
+                WriteFlags::empty(),
+            )?;
+        }
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!("commit_upsert count={}", commits.len()),
+        )?;
+        txn.commit()?;
+        Ok(commits.len())
+    }
+
+    pub fn synchronize_refs(&self, repo_id: i64, refs: &[ParsedRef]) -> AppResult<usize> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let _ = delete_prefixed_entries(&mut txn, self.dbs.refs, prefix.as_str())?;
+
+        for parsed_ref in refs {
+            let key = repository_ref_key(repo_id, parsed_ref.ref_name.as_str());
+            let raw = serialize(parsed_ref, "serialize parsed ref")?;
+            txn.put(self.dbs.refs, &key, &raw, WriteFlags::empty())?;
+        }
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!("ref_sync count={}", refs.len()),
+        )?;
+        txn.commit()?;
+        Ok(refs.len())
+    }
+
+    pub fn delete_file_changes_for_commits(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<()> {
+        if commit_shas.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut deleted = 0usize;
+        let commit_set: HashSet<&str> = commit_shas.iter().map(String::as_str).collect();
+        for sha in commit_shas {
+            let prefix = repository_commit_file_change_prefix(repo_id, sha.as_str());
+            deleted = deleted.saturating_add(delete_prefixed_entries(
+                &mut txn,
+                self.dbs.file_changes,
+                prefix.as_str(),
+            )?);
+            let _ = delete_prefixed_entries(&mut txn, self.dbs.enrichment_queue, prefix.as_str())?;
+        }
+        let _ = delete_enrichment_due_entries_for_commits(
+            &mut txn,
+            self.dbs.enrichment_due_index,
             repo_id,
-            commit_sha.as_str(),
-            now_epoch,
-            final_attempts,
-            error_message,
-            retry_decision.next_retry_epoch,
-        ])?;
+            &commit_set,
+        )?;
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "file_change_delete commits={} rows={deleted}",
+                commit_shas.len()
+            ),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn persist_file_changes(
+        &self,
+        repo_id: i64,
+        file_changes: &[ParsedFileChange],
+    ) -> AppResult<usize> {
+        let (applied, _enqueued) =
+            self.persist_file_changes_with_enrichment(repo_id, file_changes)?;
+        Ok(applied)
+    }
+
+    pub fn persist_file_changes_with_enrichment(
+        &self,
+        repo_id: i64,
+        file_changes: &[ParsedFileChange],
+    ) -> AppResult<(usize, usize)> {
+        if file_changes.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut enqueued = 0usize;
+        let now_epoch = now_epoch_seconds();
+        for change in file_changes {
+            let key = repository_file_change_key(
+                repo_id,
+                change.commit_sha.as_str(),
+                change.file_path.as_str(),
+            );
+            let value = FileChangeRecord {
+                commit_sha: change.commit_sha.clone(),
+                file_path: change.file_path.clone(),
+                additions: change.additions,
+                deletions: change.deletions,
+                change_type: change.change_type.clone(),
+                stats_state: change.stats_state,
+                requires_line_stats: change.requires_line_stats,
+            };
+            let raw = serialize(&value, "serialize file-change record")?;
+            txn.put(self.dbs.file_changes, &key, &raw, WriteFlags::empty())?;
+
+            if change.stats_state == FileChangeStatsState::Pending && change.requires_line_stats {
+                if let Ok(raw_existing) = txn.get(self.dbs.enrichment_queue, &key) {
+                    let existing: EnrichmentQueueEntry = deserialize(
+                        raw_existing,
+                        "deserialize existing enrichment queue entry before enqueue",
+                    )?;
+                    let existing_due_key = enrichment_due_index_key(
+                        repo_id,
+                        existing.enqueued_at_epoch,
+                        change.commit_sha.as_str(),
+                        change.file_path.as_str(),
+                    );
+                    let _ = txn.del(self.dbs.enrichment_due_index, &existing_due_key, None);
+                }
+
+                let queue = EnrichmentQueueEntry {
+                    attempts: 0,
+                    last_error: None,
+                    enqueued_at_epoch: now_epoch,
+                };
+                let raw_queue = serialize(&queue, "serialize enrichment queue entry")?;
+                txn.put(
+                    self.dbs.enrichment_queue,
+                    &key,
+                    &raw_queue,
+                    WriteFlags::empty(),
+                )?;
+                let due_key = enrichment_due_index_key(
+                    repo_id,
+                    queue.enqueued_at_epoch,
+                    change.commit_sha.as_str(),
+                    change.file_path.as_str(),
+                );
+                txn.put(
+                    self.dbs.enrichment_due_index,
+                    &due_key,
+                    b"",
+                    WriteFlags::empty(),
+                )?;
+                enqueued = enqueued.saturating_add(1);
+            }
+        }
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!("file_change_upsert count={}", file_changes.len()),
+        )?;
+        if enqueued > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!("enrichment_enqueue count={enqueued}"),
+            )?;
+        }
+        txn.commit()?;
+        Ok((file_changes.len(), enqueued))
+    }
+
+    pub fn enqueue_file_changes_for_enrichment(
+        &self,
+        repo_id: i64,
+        file_changes: &[ParsedFileChange],
+    ) -> AppResult<usize> {
+        if file_changes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let now_epoch = now_epoch_seconds();
+        let mut enqueued = 0usize;
+        for change in file_changes {
+            if change.stats_state != FileChangeStatsState::Pending || !change.requires_line_stats {
+                continue;
+            }
+
+            let key = repository_file_change_key(
+                repo_id,
+                change.commit_sha.as_str(),
+                change.file_path.as_str(),
+            );
+            if let Ok(raw_existing) = txn.get(self.dbs.enrichment_queue, &key) {
+                let existing: EnrichmentQueueEntry = deserialize(
+                    raw_existing,
+                    "deserialize existing enrichment queue entry before enqueue",
+                )?;
+                let existing_due_key = enrichment_due_index_key(
+                    repo_id,
+                    existing.enqueued_at_epoch,
+                    change.commit_sha.as_str(),
+                    change.file_path.as_str(),
+                );
+                let _ = txn.del(self.dbs.enrichment_due_index, &existing_due_key, None);
+            }
+
+            let queue = EnrichmentQueueEntry {
+                attempts: 0,
+                last_error: None,
+                enqueued_at_epoch: now_epoch,
+            };
+            let raw = serialize(&queue, "serialize enrichment queue entry")?;
+            txn.put(self.dbs.enrichment_queue, &key, &raw, WriteFlags::empty())?;
+            let due_key = enrichment_due_index_key(
+                repo_id,
+                queue.enqueued_at_epoch,
+                change.commit_sha.as_str(),
+                change.file_path.as_str(),
+            );
+            txn.put(
+                self.dbs.enrichment_due_index,
+                &due_key,
+                b"",
+                WriteFlags::empty(),
+            )?;
+            enqueued = enqueued.saturating_add(1);
+        }
+
+        if enqueued > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!("enrichment_enqueue count={enqueued}"),
+            )?;
+        }
+
+        txn.commit()?;
+        Ok(enqueued)
+    }
+
+    pub fn enqueue_commits_for_file_change_extraction(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<usize> {
+        if commit_shas.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let now_epoch = now_epoch_seconds();
+        let mut enqueued = 0usize;
+        let mut seen = HashSet::with_capacity(commit_shas.len());
+
+        for commit_sha in commit_shas {
+            if commit_sha.is_empty() || !seen.insert(commit_sha.as_str()) {
+                continue;
+            }
+
+            let key = repository_extraction_commit_key(repo_id, commit_sha);
+            if txn.get(self.dbs.extraction_queue, &key).is_ok() {
+                continue;
+            }
+
+            let queue = ExtractionQueueCommitEntry {
+                attempts: 0,
+                last_error: None,
+                enqueued_at_epoch: now_epoch,
+            };
+            let raw = serialize(&queue, "serialize extraction queue commit entry")?;
+            txn.put(self.dbs.extraction_queue, &key, &raw, WriteFlags::empty())?;
+            enqueued = enqueued.saturating_add(1);
+        }
+
+        if enqueued > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!("file_change_extraction_enqueue commits={enqueued}"),
+            )?;
+        }
+        txn.commit()?;
+        Ok(enqueued)
+    }
+
+    pub fn load_pending_file_change_extraction_commits(
+        &self,
+        repo_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<String>> {
+        let bounded_limit = limit.max(1);
+        let now_epoch = now_epoch_seconds();
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.extraction_queue)?;
+        let mut pending: Vec<(i64, String)> = Vec::new();
+
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |key, value| {
+            let commit_sha = parse_extraction_commit_sha_from_prefixed_key(key, prefix.as_bytes())?;
+            let queue: ExtractionQueueCommitEntry = deserialize(
+                value,
+                "deserialize file-change extraction queue commit entry",
+            )?;
+            if queue.attempts >= FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS
+                || queue.enqueued_at_epoch > now_epoch
+            {
+                return Ok(true);
+            }
+            pending.push((queue.enqueued_at_epoch, commit_sha));
+            Ok(true)
+        })?;
+
+        pending.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        Ok(pending
+            .into_iter()
+            .take(bounded_limit)
+            .map(|(_epoch, sha)| sha)
+            .collect())
+    }
+
+    pub fn remove_file_change_extraction_commits(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<usize> {
+        if commit_shas.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut removed = 0usize;
+        let mut seen = HashSet::with_capacity(commit_shas.len());
+        for commit_sha in commit_shas {
+            if commit_sha.is_empty() || !seen.insert(commit_sha.as_str()) {
+                continue;
+            }
+            let key = repository_extraction_commit_key(repo_id, commit_sha);
+            match txn.del(self.dbs.extraction_queue, &key, None) {
+                Ok(()) => removed = removed.saturating_add(1),
+                Err(lmdb::Error::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if removed > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!("file_change_extraction_dequeue commits={removed}"),
+            )?;
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    pub fn mark_file_change_extraction_commits_failed(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+        error_message: &str,
+    ) -> AppResult<usize> {
+        if commit_shas.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut terminal_failed = 0usize;
+        let mut retry_scheduled = 0usize;
+        let mut seen = HashSet::with_capacity(commit_shas.len());
+
+        for commit_sha in commit_shas {
+            if commit_sha.is_empty() || !seen.insert(commit_sha.as_str()) {
+                continue;
+            }
+
+            let key = repository_extraction_commit_key(repo_id, commit_sha);
+            let queue = match txn.get(self.dbs.extraction_queue, &key) {
+                Ok(raw) => deserialize::<ExtractionQueueCommitEntry>(
+                    raw,
+                    "deserialize extraction queue entry for failure update",
+                )?,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+
+            let next_attempt = queue.attempts.saturating_add(1);
+            if next_attempt >= FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS {
+                let _ = txn.del(self.dbs.extraction_queue, &key, None);
+                terminal_failed = terminal_failed.saturating_add(1);
+                continue;
+            }
+
+            let updated = ExtractionQueueCommitEntry {
+                attempts: next_attempt,
+                last_error: Some(error_message.to_string()),
+                enqueued_at_epoch: now_epoch_seconds()
+                    .saturating_add(extraction_backoff_delay_seconds(next_attempt)),
+            };
+            let raw = serialize(&updated, "serialize extraction retry queue entry")?;
+            txn.put(self.dbs.extraction_queue, &key, &raw, WriteFlags::empty())?;
+            retry_scheduled = retry_scheduled.saturating_add(1);
+        }
+
+        if terminal_failed > 0 || retry_scheduled > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!(
+                    "file_change_extraction_failure terminal_failed={terminal_failed} retry_scheduled={retry_scheduled}"
+                ),
+            )?;
+        }
+        txn.commit()?;
+        Ok(terminal_failed)
+    }
+
+    pub fn load_pending_file_change_enrichment(
+        &self,
+        repo_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+        self.load_pending_file_change_enrichment_internal(repo_id, limit, None)
+    }
+
+    pub fn load_pending_file_change_enrichment_for_commits(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+        limit: usize,
+    ) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+        if commit_shas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter: HashSet<String> = commit_shas.iter().cloned().collect();
+        self.load_pending_file_change_enrichment_internal(repo_id, limit, Some(&filter))
+    }
+
+    fn load_pending_file_change_enrichment_internal(
+        &self,
+        repo_id: i64,
+        limit: usize,
+        commit_filter: Option<&HashSet<String>>,
+    ) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+        let bounded_limit = limit.max(1);
+        let now_epoch = now_epoch_seconds();
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.enrichment_due_index)?;
+        let mut pending = Vec::with_capacity(bounded_limit);
+
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |key, _value| {
+            let (due_epoch, commit_sha, file_path) =
+                parse_due_index_identity_from_prefixed_key(key, prefix.as_bytes())?;
+            if due_epoch > now_epoch {
+                return Ok(false);
+            }
+            if commit_filter
+                .as_ref()
+                .is_some_and(|set| !set.contains(commit_sha.as_str()))
+            {
+                return Ok(true);
+            }
+
+            let identity_key =
+                repository_file_change_key(repo_id, commit_sha.as_str(), file_path.as_str());
+            let queue = match txn.get(self.dbs.enrichment_queue, &identity_key) {
+                Ok(raw) => deserialize::<EnrichmentQueueEntry>(
+                    raw,
+                    "deserialize enrichment queue entry from due index lookup",
+                )?,
+                Err(lmdb::Error::NotFound) => return Ok(true),
+                Err(error) => return Err(error.into()),
+            };
+            if queue.attempts >= FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS
+                || queue.enqueued_at_epoch > now_epoch
+                || queue.enqueued_at_epoch != due_epoch
+            {
+                return Ok(true);
+            }
+
+            pending.push(PendingFileChangeEnrichment {
+                commit_sha,
+                file_path,
+            });
+
+            Ok(pending.len() < bounded_limit)
+        })?;
+
+        Ok(pending)
+    }
+
+    pub fn mark_file_change_enrichment_failed(
+        &self,
+        repo_id: i64,
+        pending: &[PendingFileChangeEnrichment],
+        error_message: &str,
+    ) -> AppResult<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut terminal_failed = 0usize;
+        let mut retry_scheduled = 0usize;
+
+        for item in pending {
+            let key = repository_file_change_key(
+                repo_id,
+                item.commit_sha.as_str(),
+                item.file_path.as_str(),
+            );
+            let queue = match txn.get(self.dbs.enrichment_queue, &key) {
+                Ok(raw) => deserialize::<EnrichmentQueueEntry>(
+                    raw,
+                    "deserialize enrichment queue entry for failure update",
+                )?,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let previous_due_key = enrichment_due_index_key(
+                repo_id,
+                queue.enqueued_at_epoch,
+                item.commit_sha.as_str(),
+                item.file_path.as_str(),
+            );
+            let _ = txn.del(self.dbs.enrichment_due_index, &previous_due_key, None);
+
+            let next_attempt = queue.attempts.saturating_add(1);
+            let terminal = next_attempt >= FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS;
+            if terminal {
+                let _ = txn.del(self.dbs.enrichment_queue, &key, None);
+                update_file_change_stats_state(
+                    &mut txn,
+                    self.dbs.file_changes,
+                    key.as_bytes(),
+                    FileChangeStatsState::Failed,
+                )?;
+                terminal_failed = terminal_failed.saturating_add(1);
+            } else {
+                let delay_seconds = backoff_delay_seconds(next_attempt);
+                let updated = EnrichmentQueueEntry {
+                    attempts: next_attempt,
+                    last_error: Some(error_message.to_string()),
+                    enqueued_at_epoch: now_epoch_seconds().saturating_add(delay_seconds),
+                };
+                let raw = serialize(&updated, "serialize enrichment retry queue entry")?;
+                txn.put(self.dbs.enrichment_queue, &key, &raw, WriteFlags::empty())?;
+                let due_key = enrichment_due_index_key(
+                    repo_id,
+                    updated.enqueued_at_epoch,
+                    item.commit_sha.as_str(),
+                    item.file_path.as_str(),
+                );
+                txn.put(
+                    self.dbs.enrichment_due_index,
+                    &due_key,
+                    b"",
+                    WriteFlags::empty(),
+                )?;
+                update_file_change_stats_state(
+                    &mut txn,
+                    self.dbs.file_changes,
+                    key.as_bytes(),
+                    FileChangeStatsState::Pending,
+                )?;
+                retry_scheduled = retry_scheduled.saturating_add(1);
+            }
+        }
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "enrichment_failure terminal_failed={terminal_failed} retry_scheduled={retry_scheduled}"
+            ),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn apply_file_change_line_stats_updates(
+        &self,
+        repo_id: i64,
+        updates: &[FileChangeLineStatsUpdate],
+    ) -> AppResult<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut applied = 0usize;
+        for update in updates {
+            let key = repository_file_change_key(
+                repo_id,
+                update.commit_sha.as_str(),
+                update.file_path.as_str(),
+            );
+            let Some(mut record) =
+                load_file_change_record(&txn, self.dbs.file_changes, key.as_bytes())?
+            else {
+                continue;
+            };
+            record.additions = Some(update.additions);
+            record.deletions = Some(update.deletions);
+            record.stats_state = FileChangeStatsState::Ready;
+            record.requires_line_stats = false;
+            let raw = serialize(&record, "serialize updated file-change line stats")?;
+            txn.put(self.dbs.file_changes, &key, &raw, WriteFlags::empty())?;
+            if let Ok(raw_queue) = txn.get(self.dbs.enrichment_queue, &key) {
+                let queue: EnrichmentQueueEntry = deserialize(
+                    raw_queue,
+                    "deserialize enrichment queue entry before enrichment apply deletion",
+                )?;
+                let due_key = enrichment_due_index_key(
+                    repo_id,
+                    queue.enqueued_at_epoch,
+                    update.commit_sha.as_str(),
+                    update.file_path.as_str(),
+                );
+                let _ = txn.del(self.dbs.enrichment_due_index, &due_key, None);
+            }
+            let _ = txn.del(self.dbs.enrichment_queue, &key, None);
+            applied = applied.saturating_add(1);
+        }
+
+        if applied > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!("enrichment_apply count={applied}"),
+            )?;
+        }
+
+        txn.commit()?;
+        Ok(applied)
+    }
+
+    pub fn upsert_index_checkpoint(
+        &self,
+        repo_id: i64,
+        checkpoint: &IndexCheckpoint,
+    ) -> AppResult<()> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let key = repo_id.to_be_bytes();
+        let raw = serialize(checkpoint, "serialize index checkpoint")?;
+        txn.put(self.dbs.checkpoints, &key, &raw, WriteFlags::empty())?;
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            "index_checkpoint_upsert".to_string(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_index_checkpoint(&self, repo_id: i64) -> AppResult<Option<IndexCheckpoint>> {
+        let txn = self.env.begin_ro_txn()?;
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.checkpoints, &key) {
+            Ok(raw) => Ok(Some(deserialize(raw, "deserialize index checkpoint")?)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn set_repository_indexed_at(&self, repo_id: i64, indexed_at_epoch: i64) -> AppResult<()> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let Some(mut repository) = self.load_repository_record_from_rw(&txn, repo_id)? else {
+            return Err(AppError::Parse(format!(
+                "cannot set indexed_at for missing repository id {repo_id}"
+            )));
+        };
+
+        repository.indexed_at_epoch = Some(indexed_at_epoch);
+        let key = repo_id.to_be_bytes();
+        let raw = serialize(&repository, "serialize repository indexed_at update")?;
+        txn.put(self.dbs.repositories, &key, &raw, WriteFlags::empty())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_repository_indexed_at(&self, repo_id: i64) -> AppResult<Option<String>> {
+        let txn = self.env.begin_ro_txn()?;
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.repositories, &key) {
+            Ok(raw) => {
+                let repository: RepositoryRecord =
+                    deserialize(raw, "deserialize repository indexed_at")?;
+                Ok(repository.indexed_at_epoch.map(|value| value.to_string()))
+            }
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn load_commit_window(
+        &self,
+        repo_id: i64,
+        limit: usize,
+        cursor: Option<&CommitWindowCursor>,
+    ) -> AppResult<Vec<CommitWindowItem>> {
+        let bounded_limit = limit.max(1);
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor_db = txn.open_ro_cursor(self.dbs.commit_window_index)?;
+        let start_key = cursor
+            .map(|value| commit_window_index_key(repo_id, value.committer_time, value.sha.as_str()))
+            .transpose()?;
+        let mut skipped_cursor_row = false;
+        let mut results = Vec::with_capacity(bounded_limit);
+
+        for_each_prefixed_cursor_from(
+            &cursor_db,
+            prefix.as_bytes(),
+            start_key.as_deref(),
+            |key, value| {
+                if start_key
+                    .as_ref()
+                    .is_some_and(|candidate| !skipped_cursor_row && key == candidate.as_slice())
+                {
+                    skipped_cursor_row = true;
+                    return Ok(true);
+                }
+
+                let item: CommitWindowItem =
+                    deserialize(value, "deserialize commit-window index item")?;
+                results.push(item);
+                Ok(results.len() < bounded_limit)
+            },
+        )?;
+
+        if results.is_empty() {
+            return self.load_commit_window_legacy(repo_id, bounded_limit, cursor);
+        }
+
+        Ok(results)
+    }
+
+    fn load_commit_window_legacy(
+        &self,
+        repo_id: i64,
+        limit: usize,
+        cursor: Option<&CommitWindowCursor>,
+    ) -> AppResult<Vec<CommitWindowItem>> {
+        let mut commits = self.load_all_commits(repo_id)?;
+        commits.sort_unstable_by(|left, right| {
+            right
+                .committer_time
+                .cmp(&left.committer_time)
+                .then_with(|| right.sha.cmp(&left.sha))
+        });
+
+        let mut results = Vec::with_capacity(limit.min(commits.len()));
+        for commit in commits {
+            if cursor.as_ref().is_some_and(|cursor_value| {
+                commit.committer_time > cursor_value.committer_time
+                    || (commit.committer_time == cursor_value.committer_time
+                        && commit.sha >= cursor_value.sha)
+            }) {
+                continue;
+            }
+
+            results.push(CommitWindowItem {
+                sha: commit.sha,
+                author_name: commit.author_name,
+                author_email: commit.author_email,
+                committer_time: commit.committer_time,
+                subject: commit.subject,
+                tree_sha: commit.tree_sha,
+            });
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn load_all_commits(&self, repo_id: i64) -> AppResult<Vec<CommitRecord>> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.commits)?;
+        let mut commits = Vec::new();
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let commit: CommitRecord = deserialize(value, "deserialize commit record")?;
+            commits.push(commit);
+            Ok(true)
+        })?;
+        Ok(commits)
+    }
+
+    pub fn initialize_empty_csr_snapshot(&self, repo_id: i64) -> AppResult<()> {
+        let snapshot = CsrSnapshot {
+            generated_at_epoch: now_epoch_seconds(),
+            shas: Vec::new(),
+            parents_offsets: vec![0],
+            parents_neighbors: Vec::new(),
+            children_offsets: vec![0],
+            children_neighbors: Vec::new(),
+            directed_edges: 0,
+        };
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let metadata = self.persist_graph_snapshot_state(&mut txn, repo_id, &snapshot)?;
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "csr_snapshot_initialize_empty version={} nodes={} directed_edges={}",
+                metadata.snapshot_version, metadata.node_count, metadata.directed_edges
+            ),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub fn rebuild_csr_snapshot(&self, repo_id: i64) -> AppResult<(usize, usize)> {
+        let commits = self.load_all_commits(repo_id)?;
+        let mut ordered = commits;
+        ordered.sort_unstable_by(|left, right| {
+            right
+                .committer_time
+                .cmp(&left.committer_time)
+                .then_with(|| right.sha.cmp(&left.sha))
+        });
+
+        let node_count = ordered.len();
+        let mut sha_to_index = HashMap::with_capacity(node_count);
+        for (index, commit) in ordered.iter().enumerate() {
+            sha_to_index.insert(commit.sha.clone(), index);
+        }
+
+        let mut parent_counts = vec![0usize; node_count];
+        let mut child_counts = vec![0usize; node_count];
+        let mut directed_edges = 0usize;
+
+        for (child_index, commit) in ordered.iter().enumerate() {
+            for parent_sha in &commit.parents {
+                let Some(&parent_index) = sha_to_index.get(parent_sha) else {
+                    continue;
+                };
+                parent_counts[child_index] = parent_counts[child_index].saturating_add(1);
+                child_counts[parent_index] = child_counts[parent_index].saturating_add(1);
+                directed_edges = directed_edges.saturating_add(1);
+            }
+        }
+
+        let parents_offsets = build_offsets_from_counts(&parent_counts)?;
+        let children_offsets = build_offsets_from_counts(&child_counts)?;
+
+        let mut parents_neighbors = vec![0u32; directed_edges];
+        let mut children_neighbors = vec![0u32; directed_edges];
+        let mut parent_write_positions = offsets_to_write_positions(&parents_offsets)?;
+        let mut child_write_positions = offsets_to_write_positions(&children_offsets)?;
+
+        for (child_index, commit) in ordered.iter().enumerate() {
+            let child_id = u32::try_from(child_index).map_err(|_| {
+                AppError::Parse(
+                    "csr snapshot child index exceeded u32 capacity during rebuild".to_string(),
+                )
+            })?;
+            for parent_sha in &commit.parents {
+                let Some(&parent_index) = sha_to_index.get(parent_sha) else {
+                    continue;
+                };
+                let parent_id = u32::try_from(parent_index).map_err(|_| {
+                    AppError::Parse(
+                        "csr snapshot parent index exceeded u32 capacity during rebuild"
+                            .to_string(),
+                    )
+                })?;
+
+                let parent_slot = parent_write_positions[child_index];
+                parents_neighbors[parent_slot] = parent_id;
+                parent_write_positions[child_index] =
+                    parent_write_positions[child_index].saturating_add(1);
+
+                let child_slot = child_write_positions[parent_index];
+                children_neighbors[child_slot] = child_id;
+                child_write_positions[parent_index] =
+                    child_write_positions[parent_index].saturating_add(1);
+            }
+        }
+
+        let snapshot = CsrSnapshot {
+            generated_at_epoch: now_epoch_seconds(),
+            shas: ordered.into_iter().map(|commit| commit.sha).collect(),
+            parents_offsets,
+            parents_neighbors,
+            children_offsets,
+            children_neighbors,
+            directed_edges,
+        };
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let metadata = self.persist_graph_snapshot_state(&mut txn, repo_id, &snapshot)?;
+
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "csr_snapshot_rebuild version={} nodes={} directed_edges={}",
+                metadata.snapshot_version, metadata.node_count, metadata.directed_edges
+            ),
+        )?;
+        txn.commit()?;
+
+        Ok((snapshot.node_count(), snapshot.directed_edges))
+    }
+
+    pub fn apply_csr_delta_from_commit_shas(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<Option<(usize, usize)>> {
+        let Some(existing_snapshot) = self.load_csr_snapshot(repo_id)? else {
+            return Ok(None);
+        };
+
+        if commit_shas.is_empty() {
+            return Ok(Some((
+                existing_snapshot.node_count(),
+                existing_snapshot.directed_edges,
+            )));
+        }
+
+        let txn = self.env.begin_ro_txn()?;
+        let mut unique_shas = HashSet::new();
+        let mut delta_commits = Vec::with_capacity(commit_shas.len());
+        for sha in commit_shas {
+            if !unique_shas.insert(sha.as_str()) {
+                continue;
+            }
+            let key = repository_commit_key(repo_id, sha.as_str());
+            let commit = match txn.get(self.dbs.commits, &key) {
+                Ok(raw) => deserialize::<CommitRecord>(raw, "deserialize commit for csr delta")?,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            delta_commits.push(commit);
+        }
+
+        let (next_snapshot, changed) =
+            build_incremental_csr_snapshot(existing_snapshot, delta_commits)?;
+        if !changed {
+            return Ok(Some((
+                next_snapshot.node_count(),
+                next_snapshot.directed_edges,
+            )));
+        }
+
+        let mut write_txn = self.env.begin_rw_txn()?;
+        let metadata =
+            self.persist_graph_snapshot_state(&mut write_txn, repo_id, &next_snapshot)?;
+        append_delta_event(
+            &mut write_txn,
+            self.dbs,
+            Some(repo_id),
+            format!(
+                "csr_snapshot_incremental version={} nodes={} directed_edges={}",
+                metadata.snapshot_version, metadata.node_count, metadata.directed_edges
+            ),
+        )?;
+        write_txn.commit()?;
+
+        Ok(Some((
+            next_snapshot.node_count(),
+            next_snapshot.directed_edges,
+        )))
+    }
+
+    pub fn persist_graph_overlay_commits(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<GraphSnapshotMetadata> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut unique_shas = HashSet::new();
+        let mut overlay_commits_added = 0usize;
+        let mut overlay_edges_added = 0usize;
+        let mut pending_child_links: HashMap<String, Vec<String>> = HashMap::new();
+
+        for sha in commit_shas {
+            if !unique_shas.insert(sha.as_str()) {
+                continue;
+            }
+
+            let overlay_key = repository_graph_overlay_parent_key(repo_id, sha.as_str());
+            if txn
+                .get(self.dbs.graph_overlay_parent_rows, &overlay_key)
+                .is_ok()
+            {
+                continue;
+            }
+
+            let commit_key = repository_commit_key(repo_id, sha.as_str());
+            let commit = match txn.get(self.dbs.commits, &commit_key) {
+                Ok(raw) => deserialize::<CommitRecord>(
+                    raw,
+                    "deserialize commit record for graph overlay persistence",
+                )?,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+
+            let overlay_row = GraphOverlayParentRow {
+                child_sha: commit.sha.clone(),
+                parent_shas: commit.parents.clone(),
+                committer_time: commit.committer_time,
+            };
+            let overlay_raw = serialize(&overlay_row, "serialize graph overlay parent row record")?;
+            txn.put(
+                self.dbs.graph_overlay_parent_rows,
+                &overlay_key,
+                &overlay_raw,
+                WriteFlags::empty(),
+            )?;
+            overlay_commits_added = overlay_commits_added.saturating_add(1);
+            overlay_edges_added = overlay_edges_added.saturating_add(commit.parents.len());
+            for parent_sha in &overlay_row.parent_shas {
+                pending_child_links
+                    .entry(parent_sha.clone())
+                    .or_default()
+                    .push(overlay_row.child_sha.clone());
+            }
+        }
+
+        for (parent_sha, mut child_shas) in pending_child_links {
+            child_shas.sort_unstable();
+            child_shas.dedup();
+            self.merge_graph_overlay_child_row_in_txn(
+                &mut txn,
+                repo_id,
+                parent_sha.as_str(),
+                &child_shas,
+            )?;
+        }
+
+        let mut metadata = self
+            .load_graph_snapshot_metadata_from_txn(&txn, repo_id)?
+            .ok_or_else(|| {
+                AppError::InvalidArgument(
+                    "cannot persist graph overlay commits without existing graph snapshot metadata"
+                        .to_string(),
+                )
+            })?;
+        metadata.pending_overlay_commits = metadata
+            .pending_overlay_commits
+            .saturating_add(overlay_commits_added);
+        metadata.pending_overlay_edges = metadata
+            .pending_overlay_edges
+            .saturating_add(overlay_edges_added);
+        self.store_graph_snapshot_metadata_in_txn(&mut txn, repo_id, &metadata)?;
+
+        if overlay_commits_added > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!(
+                    "graph_overlay_upsert commits={} edges={}",
+                    overlay_commits_added, overlay_edges_added
+                ),
+            )?;
+        }
+
+        txn.commit()?;
+        Ok(metadata)
+    }
+
+    pub fn load_graph_overlay_parent_rows(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<Vec<GraphOverlayParentRow>> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.graph_overlay_parent_rows)?;
+        let mut rows = Vec::new();
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let row: GraphOverlayParentRow =
+                deserialize(value, "deserialize graph overlay parent row record")?;
+            rows.push(row);
+            Ok(true)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn load_graph_overlay_child_rows(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<HashMap<String, Vec<String>>> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.graph_overlay_child_rows)?;
+        let mut rows = HashMap::new();
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let row: GraphOverlayChildRow =
+                deserialize(value, "deserialize graph overlay child row record")?;
+            rows.insert(row.parent_sha, row.child_shas);
+            Ok(true)
+        })?;
+        Ok(rows)
+    }
+
+    pub fn clear_graph_overlay(&self, repo_id: i64) -> AppResult<GraphSnapshotMetadata> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let deleted_parent_rows = delete_prefixed_entries(
+            &mut txn,
+            self.dbs.graph_overlay_parent_rows,
+            prefix.as_str(),
+        )?;
+        let deleted_child_rows =
+            delete_prefixed_entries(&mut txn, self.dbs.graph_overlay_child_rows, prefix.as_str())?;
+        let mut metadata = self
+            .load_graph_snapshot_metadata_from_txn(&txn, repo_id)?
+            .ok_or_else(|| {
+                AppError::InvalidArgument(
+                    "cannot clear graph overlay without existing graph snapshot metadata"
+                        .to_string(),
+                )
+            })?;
+        metadata.pending_overlay_commits = 0;
+        metadata.pending_overlay_edges = 0;
+        self.store_graph_snapshot_metadata_in_txn(&mut txn, repo_id, &metadata)?;
+
+        if deleted_parent_rows > 0 || deleted_child_rows > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!(
+                    "graph_overlay_clear parent_rows={deleted_parent_rows} child_rows={deleted_child_rows}"
+                ),
+            )?;
+        }
+
+        txn.commit()?;
+        Ok(metadata)
+    }
+
+    pub fn compact_graph_overlay_into_snapshot(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<Option<(usize, usize)>> {
+        let overlay_parent_rows = self.load_graph_overlay_parent_rows(repo_id)?;
+        if overlay_parent_rows.is_empty() {
+            let snapshot = self.load_csr_snapshot(repo_id)?;
+            return Ok(snapshot.map(|value| (value.node_count(), value.directed_edges)));
+        }
+
+        let overlay_shas: Vec<String> = overlay_parent_rows
+            .into_iter()
+            .map(|row| row.child_sha)
+            .collect();
+        let compacted = self.apply_csr_delta_from_commit_shas(repo_id, &overlay_shas)?;
+        let _ = self.clear_graph_overlay(repo_id)?;
+        Ok(compacted)
+    }
+
+    pub fn load_csr_snapshot(&self, repo_id: i64) -> AppResult<Option<CsrSnapshot>> {
+        let txn = self.env.begin_ro_txn()?;
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.csr_snapshots, &key) {
+            Ok(raw) => Ok(Some(deserialize(raw, "deserialize csr snapshot")?)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn load_graph_snapshot_metadata(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<Option<GraphSnapshotMetadata>> {
+        let txn = self.env.begin_ro_txn()?;
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.graph_snapshot_metadata, &key) {
+            Ok(raw) => Ok(Some(deserialize(
+                raw,
+                "deserialize graph snapshot metadata",
+            )?)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn load_graph_snapshot_state(&self, repo_id: i64) -> AppResult<Option<GraphSnapshotState>> {
+        let Some(snapshot) = self.load_csr_snapshot(repo_id)? else {
+            return Ok(None);
+        };
+        let metadata = self
+            .load_graph_snapshot_metadata(repo_id)?
+            .unwrap_or_else(|| build_graph_snapshot_metadata(1, &snapshot));
+        let overlay_parent_rows = self.load_graph_overlay_parent_rows(repo_id)?;
+        let overlay_child_rows = self.load_graph_overlay_child_rows(repo_id)?;
+        Ok(Some(GraphSnapshotState {
+            metadata,
+            snapshot,
+            overlay_parent_rows,
+            overlay_child_rows,
+        }))
+    }
+
+    pub fn count_commits(&self, repo_id: i64) -> AppResult<usize> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        count_prefixed_entries(&txn, self.dbs.commits, prefix.as_str())
+    }
+
+    pub fn load_dataset_counts(&self, repo_id: i64) -> AppResult<(i64, i64, i64)> {
+        let commit_count = self.count_commits(repo_id)?;
+
+        let directed_edges = self
+            .load_graph_snapshot_metadata(repo_id)?
+            .map(|metadata| {
+                metadata
+                    .directed_edges
+                    .saturating_add(metadata.pending_overlay_edges)
+            })
+            .or_else(|| {
+                self.load_csr_snapshot(repo_id)
+                    .ok()
+                    .flatten()
+                    .map(|snapshot| snapshot.directed_edges)
+            })
+            .unwrap_or(0);
+
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let file_change_count =
+            count_prefixed_entries(&txn, self.dbs.file_changes, prefix.as_str())?;
+
+        Ok((
+            i64::try_from(commit_count).unwrap_or(i64::MAX),
+            i64::try_from(directed_edges).unwrap_or(i64::MAX),
+            i64::try_from(file_change_count).unwrap_or(i64::MAX),
+        ))
+    }
+
+    pub fn load_file_change_stats_state_counts(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<FileChangeStatsStateCounts> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.file_changes)?;
+        let mut counts = FileChangeStatsStateCounts::default();
+
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let record: FileChangeRecord =
+                deserialize(value, "deserialize file-change for state counts")?;
+            match record.stats_state {
+                FileChangeStatsState::Pending => counts.pending = counts.pending.saturating_add(1),
+                FileChangeStatsState::Ready => counts.ready = counts.ready.saturating_add(1),
+                FileChangeStatsState::Failed => counts.failed = counts.failed.saturating_add(1),
+            }
+            Ok(true)
+        })?;
+
+        Ok(counts)
+    }
+
+    pub fn load_file_change_extraction_queue_metrics(
+        &self,
+        repo_id: i64,
+    ) -> AppResult<FileChangeExtractionQueueMetrics> {
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = repository_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.extraction_queue)?;
+        let mut depth = 0usize;
+        let mut oldest_epoch: Option<i64> = None;
+
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let queue: ExtractionQueueCommitEntry =
+                deserialize(value, "deserialize extraction queue metrics")?;
+            depth = depth.saturating_add(1);
+            oldest_epoch = Some(oldest_epoch.map_or(queue.enqueued_at_epoch, |current| {
+                current.min(queue.enqueued_at_epoch)
+            }));
+            Ok(true)
+        })?;
+
+        let age_seconds = oldest_epoch
+            .map(|epoch| now_epoch_seconds().saturating_sub(epoch))
+            .unwrap_or(0);
+
+        Ok(FileChangeExtractionQueueMetrics {
+            depth,
+            oldest_queue_age_seconds: age_seconds,
+        })
+    }
+
+    fn load_repository_record_from_rw(
+        &self,
+        txn: &RwTransaction<'_>,
+        repo_id: i64,
+    ) -> AppResult<Option<RepositoryRecord>> {
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.repositories, &key) {
+            Ok(raw) => Ok(Some(deserialize(raw, "deserialize repository record")?)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn persist_graph_snapshot_state(
+        &self,
+        txn: &mut RwTransaction<'_>,
+        repo_id: i64,
+        snapshot: &CsrSnapshot,
+    ) -> AppResult<GraphSnapshotMetadata> {
+        let key = repo_id.to_be_bytes();
+        let snapshot_raw = serialize(snapshot, "serialize graph csr snapshot")?;
+        txn.put(
+            self.dbs.csr_snapshots,
+            &key,
+            &snapshot_raw,
+            WriteFlags::empty(),
+        )?;
+
+        let next_version = self
+            .load_graph_snapshot_metadata_from_txn(txn, repo_id)?
+            .map(|metadata| metadata.snapshot_version.saturating_add(1))
+            .unwrap_or(1);
+
+        let metadata = build_graph_snapshot_metadata(next_version, snapshot);
+        self.store_graph_snapshot_metadata_in_txn(txn, repo_id, &metadata)?;
+        Ok(metadata)
+    }
+
+    fn load_graph_snapshot_metadata_from_txn(
+        &self,
+        txn: &impl Transaction,
+        repo_id: i64,
+    ) -> AppResult<Option<GraphSnapshotMetadata>> {
+        let key = repo_id.to_be_bytes();
+        match txn.get(self.dbs.graph_snapshot_metadata, &key) {
+            Ok(raw) => Ok(Some(deserialize(
+                raw,
+                "deserialize graph snapshot metadata from transaction",
+            )?)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn store_graph_snapshot_metadata_in_txn(
+        &self,
+        txn: &mut RwTransaction<'_>,
+        repo_id: i64,
+        metadata: &GraphSnapshotMetadata,
+    ) -> AppResult<()> {
+        let key = repo_id.to_be_bytes();
+        let metadata_raw = serialize(metadata, "serialize graph snapshot metadata")?;
+        txn.put(
+            self.dbs.graph_snapshot_metadata,
+            &key,
+            &metadata_raw,
+            WriteFlags::empty(),
+        )?;
+        Ok(())
+    }
+
+    fn merge_graph_overlay_child_row_in_txn(
+        &self,
+        txn: &mut RwTransaction<'_>,
+        repo_id: i64,
+        parent_sha: &str,
+        new_child_shas: &[String],
+    ) -> AppResult<()> {
+        if new_child_shas.is_empty() {
+            return Ok(());
+        }
+
+        let key = repository_graph_overlay_child_key(repo_id, parent_sha);
+        let mut row = match txn.get(self.dbs.graph_overlay_child_rows, &key) {
+            Ok(raw) => deserialize::<GraphOverlayChildRow>(
+                raw,
+                "deserialize graph overlay child row for merge",
+            )?,
+            Err(lmdb::Error::NotFound) => GraphOverlayChildRow {
+                parent_sha: parent_sha.to_string(),
+                child_shas: Vec::new(),
+            },
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut changed = false;
+        for child_sha in new_child_shas {
+            if row.child_shas.iter().any(|existing| existing == child_sha) {
+                continue;
+            }
+            row.child_shas.push(child_sha.clone());
+            changed = true;
+        }
+
+        if changed {
+            let raw = serialize(&row, "serialize graph overlay child row record")?;
+            txn.put(
+                self.dbs.graph_overlay_child_rows,
+                &key,
+                &raw,
+                WriteFlags::empty(),
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+pub fn open_store(db_path: &Path) -> AppResult<GraphStore> {
+    GraphStore::open(db_path)
+}
+
+fn load_file_change_record(
+    txn: &RwTransaction<'_>,
+    db: Database,
+    key: &[u8],
+) -> AppResult<Option<FileChangeRecord>> {
+    match txn.get(db, &key) {
+        Ok(raw) => Ok(Some(deserialize(raw, "deserialize file-change record")?)),
+        Err(lmdb::Error::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn update_file_change_stats_state(
+    txn: &mut RwTransaction<'_>,
+    db: Database,
+    key: &[u8],
+    state: FileChangeStatsState,
+) -> AppResult<()> {
+    let Some(mut record) = load_file_change_record(txn, db, key)? else {
+        return Ok(());
+    };
+    record.stats_state = state;
+    let raw = serialize(&record, "serialize file-change state transition")?;
+    txn.put(db, &key, &raw, WriteFlags::empty())?;
+    Ok(())
+}
+
+fn resolve_store_directory(db_path: &Path) -> PathBuf {
+    if db_path.is_dir() {
+        return db_path.to_path_buf();
+    }
+
+    if db_path.extension().is_some_and(|ext| !ext.is_empty())
+        || db_path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains('.'))
+    {
+        return PathBuf::from(format!("{}.lmdb", db_path.to_string_lossy()));
+    }
+
+    db_path.to_path_buf()
+}
+
+fn resolve_map_size_bytes(store_dir: &Path) -> usize {
+    let configured = env::var("GITGRAPH_LMDB_MAP_SIZE_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value >= LMDB_MIN_MAP_SIZE_BYTES)
+        .unwrap_or(LMDB_DEFAULT_MAP_SIZE_BYTES);
+    effective_map_size_bytes(configured, current_lmdb_data_file_size_bytes(store_dir))
+}
+
+fn effective_map_size_bytes(configured_map_size: usize, observed_data_file_bytes: usize) -> usize {
+    configured_map_size
+        .max(observed_data_file_bytes)
+        .max(LMDB_MIN_MAP_SIZE_BYTES)
+}
+
+fn current_lmdb_data_file_size_bytes(store_dir: &Path) -> usize {
+    let data_file = store_dir.join("data.mdb");
+    fs::metadata(data_file)
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
+}
+
+fn resolve_lmdb_runtime_options() -> AppResult<LmdbRuntimeOptions> {
+    LmdbRuntimeOptions::from_env()
+}
+
+fn resolve_delta_log_retention_events() -> u64 {
+    env::var("GITGRAPH_DELTA_LOG_RETENTION_EVENTS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DELTA_LOG_RETENTION_DEFAULT_EVENTS)
+}
+
+pub fn graph_overlay_compaction_thresholds() -> (usize, usize) {
+    let max_commits = env::var(GRAPH_OVERLAY_MAX_COMMITS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GRAPH_OVERLAY_MAX_COMMITS_DEFAULT);
+    let max_edges = env::var(GRAPH_OVERLAY_MAX_EDGES_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(GRAPH_OVERLAY_MAX_EDGES_DEFAULT);
+    (max_commits, max_edges)
+}
+
+pub fn should_compact_graph_overlay(metadata: &GraphSnapshotMetadata) -> bool {
+    let (max_commits, max_edges) = graph_overlay_compaction_thresholds();
+    metadata.pending_overlay_commits >= max_commits || metadata.pending_overlay_edges >= max_edges
+}
+
+fn build_graph_snapshot_metadata(
+    snapshot_version: u64,
+    snapshot: &CsrSnapshot,
+) -> GraphSnapshotMetadata {
+    GraphSnapshotMetadata {
+        snapshot_version,
+        generated_at_epoch: snapshot.generated_at_epoch,
+        node_count: snapshot.node_count(),
+        directed_edges: snapshot.directed_edges,
+        pending_overlay_commits: 0,
+        pending_overlay_edges: 0,
+    }
+}
+
+fn parse_env_bool_enabled(key: &str) -> bool {
+    env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn repository_prefix(repo_id: i64) -> String {
+    format!("{repo_id:0REPO_KEY_WIDTH$}:")
+}
+
+fn repository_commit_key(repo_id: i64, sha: &str) -> String {
+    format!("{}{}", repository_prefix(repo_id), sha)
+}
+
+fn repository_ref_key(repo_id: i64, ref_name: &str) -> String {
+    format!("{}{}", repository_prefix(repo_id), ref_name)
+}
+
+fn repository_commit_file_change_prefix(repo_id: i64, commit_sha: &str) -> String {
+    format!("{}{}:", repository_prefix(repo_id), commit_sha)
+}
+
+fn repository_graph_overlay_parent_key(repo_id: i64, sha: &str) -> String {
+    format!("{}{}", repository_prefix(repo_id), sha)
+}
+
+fn repository_graph_overlay_child_key(repo_id: i64, sha: &str) -> String {
+    format!("{}{}", repository_prefix(repo_id), sha)
+}
+
+fn repository_file_change_key(repo_id: i64, commit_sha: &str, file_path: &str) -> String {
+    format!("{}{}:{file_path}", repository_prefix(repo_id), commit_sha)
+}
+
+fn repository_extraction_commit_key(repo_id: i64, commit_sha: &str) -> String {
+    format!("{}{}", repository_prefix(repo_id), commit_sha)
+}
+
+fn commit_window_index_key(repo_id: i64, committer_time: i64, sha: &str) -> AppResult<Vec<u8>> {
+    let prefix = repository_prefix(repo_id);
+    let desc_time_component = descending_time_component(committer_time);
+    let mut key =
+        Vec::with_capacity(prefix.len() + COMMIT_WINDOW_TIME_COMPONENT_WIDTH + 1 + sha.len());
+    key.extend_from_slice(prefix.as_bytes());
+    key.extend_from_slice(
+        format!(
+            "{desc_time_component:0COMMIT_WINDOW_TIME_COMPONENT_WIDTH$}",
+            COMMIT_WINDOW_TIME_COMPONENT_WIDTH = COMMIT_WINDOW_TIME_COMPONENT_WIDTH
+        )
+        .as_bytes(),
+    );
+    key.push(b':');
+    key.extend(invert_sha_bytes(sha)?);
+    Ok(key)
+}
+
+fn enrichment_due_index_key(
+    repo_id: i64,
+    due_epoch: i64,
+    commit_sha: &str,
+    file_path: &str,
+) -> String {
+    let due_component = normalize_epoch_for_index(due_epoch);
+    format!(
+        "{}{due_component:0DUE_TIME_COMPONENT_WIDTH$}:{commit_sha}:{file_path}",
+        repository_prefix(repo_id),
+        DUE_TIME_COMPONENT_WIDTH = DUE_TIME_COMPONENT_WIDTH
+    )
+}
+
+fn parse_due_index_identity_from_prefixed_key(
+    key: &[u8],
+    prefix: &[u8],
+) -> AppResult<(i64, String, String)> {
+    let suffix = key.strip_prefix(prefix).ok_or_else(|| {
+        AppError::Parse("enrichment due index key missing repository prefix".to_string())
+    })?;
+    let raw_suffix = std::str::from_utf8(suffix).map_err(|error| {
+        AppError::Parse(format!(
+            "decode enrichment due index key suffix as utf8 failed: {error}"
+        ))
+    })?;
+    let mut parts = raw_suffix.splitn(3, ':');
+    let due_raw = parts.next().ok_or_else(|| {
+        AppError::Parse("enrichment due index key missing due-time segment".to_string())
+    })?;
+    let commit_sha = parts.next().ok_or_else(|| {
+        AppError::Parse("enrichment due index key missing commit-sha segment".to_string())
+    })?;
+    let file_path = parts.next().ok_or_else(|| {
+        AppError::Parse("enrichment due index key missing file-path segment".to_string())
+    })?;
+    let due_epoch_u64 = due_raw.parse::<u64>().map_err(|error| {
+        AppError::Parse(format!(
+            "parse due-time segment from enrichment due index key: {error}"
+        ))
+    })?;
+    let due_epoch = i64::try_from(due_epoch_u64).unwrap_or(i64::MAX);
+    Ok((due_epoch, commit_sha.to_string(), file_path.to_string()))
+}
+
+fn parse_extraction_commit_sha_from_prefixed_key(key: &[u8], prefix: &[u8]) -> AppResult<String> {
+    let suffix = key.strip_prefix(prefix).ok_or_else(|| {
+        AppError::Parse("file-change extraction queue key missing repository prefix".to_string())
+    })?;
+    if suffix.is_empty() {
+        return Err(AppError::Parse(
+            "file-change extraction queue key missing commit-sha segment".to_string(),
+        ));
+    }
+    std::str::from_utf8(suffix)
+        .map(|value| value.to_string())
+        .map_err(|error| {
+            AppError::Parse(format!(
+                "decode file-change extraction queue key suffix as utf8 failed: {error}"
+            ))
+        })
+}
+
+fn normalize_epoch_for_index(epoch: i64) -> u64 {
+    if epoch <= 0 {
+        0
+    } else {
+        u64::try_from(epoch).unwrap_or(u64::MAX)
+    }
+}
+
+fn descending_time_component(committer_time: i64) -> u64 {
+    let monotonic = (committer_time as u64) ^ (1_u64 << 63);
+    u64::MAX.saturating_sub(monotonic)
+}
+
+fn invert_sha_bytes(sha: &str) -> AppResult<Vec<u8>> {
+    if sha.is_empty() {
+        return Err(AppError::Parse(
+            "cannot build commit-window index key for empty sha".to_string(),
+        ));
+    }
+    Ok(sha.as_bytes().iter().map(|byte| u8::MAX - *byte).collect())
+}
+
+fn for_each_prefixed_cursor<'txn, C, F>(cursor: &C, prefix: &[u8], on_entry: F) -> AppResult<()>
+where
+    C: Cursor<'txn>,
+    F: FnMut(&'txn [u8], &'txn [u8]) -> AppResult<bool>,
+{
+    for_each_prefixed_cursor_from(cursor, prefix, None, on_entry)
+}
+
+fn for_each_prefixed_cursor_from<'txn, C, F>(
+    cursor: &C,
+    prefix: &[u8],
+    start_key: Option<&[u8]>,
+    mut on_entry: F,
+) -> AppResult<()>
+where
+    C: Cursor<'txn>,
+    F: FnMut(&'txn [u8], &'txn [u8]) -> AppResult<bool>,
+{
+    let seek_key = start_key.unwrap_or(prefix);
+    let mut current = match cursor.get(Some(seek_key), None, lmdb_sys::MDB_SET_RANGE) {
+        Ok((Some(key), value)) if key.starts_with(prefix) => Some((key, value)),
+        Ok((_maybe_key, _value)) => None,
+        Err(lmdb::Error::NotFound) => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    while let Some((key, value)) = current {
+        if !on_entry(key, value)? {
+            break;
+        }
+
+        current = match cursor.get(None, None, lmdb_sys::MDB_NEXT) {
+            Ok((Some(next_key), next_value)) if next_key.starts_with(prefix) => {
+                Some((next_key, next_value))
+            }
+            Ok((_maybe_key, _value)) => None,
+            Err(lmdb::Error::NotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
     }
 
     Ok(())
 }
 
-pub fn load_file_change_extraction_queue_metrics(
-    conn: &Connection,
-    repo_id: i64,
-) -> AppResult<FileChangeExtractionQueueMetrics> {
-    let (depth, oldest_epoch): (i64, Option<i64>) = conn.query_row(
-        r#"
-        SELECT COUNT(1), MIN(enqueued_at_epoch)
-        FROM file_change_extraction_queue
-        WHERE repo_id = ?1
-    "#,
-        [repo_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-
-    let now_epoch = now_epoch_seconds();
-    let oldest_queue_age_seconds = oldest_epoch
-        .map(|epoch| now_epoch.saturating_sub(epoch).max(0))
-        .unwrap_or(0);
-
-    Ok(FileChangeExtractionQueueMetrics {
-        depth: depth.max(0) as usize,
-        oldest_queue_age_seconds,
-    })
-}
-
-fn build_file_change_upsert_sql(row_count: usize) -> String {
-    let mut sql = String::from(
-        r#"
-        INSERT INTO file_changes (
-          repo_id, commit_sha, file_path, additions, deletions, change_type, stats_state
-        ) VALUES
-    "#,
-    );
-    append_values_placeholders(&mut sql, row_count, FILE_CHANGE_UPSERT_COLUMNS);
-    sql.push_str(
-        r#"
-        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
-          additions = excluded.additions,
-          deletions = excluded.deletions,
-          change_type = excluded.change_type,
-          stats_state = excluded.stats_state
-    "#,
-    );
-    sql
-}
-
-fn build_commit_upsert_sql(row_count: usize) -> String {
-    let mut sql = String::from(
-        r#"
-        INSERT INTO commits (
-          sha, repo_id, author_name, author_email, author_time, committer_time, subject, tree_sha
-        ) VALUES
-    "#,
-    );
-    append_values_placeholders(&mut sql, row_count, COMMIT_UPSERT_COLUMNS);
-    sql.push_str(
-        r#"
-        ON CONFLICT(repo_id, sha) DO UPDATE SET
-          author_name = excluded.author_name,
-          author_email = excluded.author_email,
-          author_time = excluded.author_time,
-          committer_time = excluded.committer_time,
-          subject = excluded.subject,
-          tree_sha = excluded.tree_sha
-    "#,
-    );
-    sql
-}
-
-fn build_file_change_enrichment_enqueue_sql(row_count: usize) -> String {
-    let mut sql = String::from(
-        r#"
-        INSERT INTO file_change_enrichment_queue (
-          repo_id, commit_sha, file_path, enqueued_at_epoch
-        ) VALUES
-    "#,
-    );
-    append_values_placeholders(&mut sql, row_count, FILE_CHANGE_ENQUEUE_COLUMNS);
-    sql.push_str(
-        r#"
-        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
-          enqueued_at_epoch = excluded.enqueued_at_epoch,
-          attempts = 0,
-          last_error = NULL
-    "#,
-    );
-    sql
-}
-
-fn append_values_placeholders(sql: &mut String, row_count: usize, columns_per_row: usize) {
-    for row_index in 0..row_count {
-        if row_index > 0 {
-            sql.push_str(", ");
-        }
-        sql.push('(');
-        for column_index in 0..columns_per_row {
-            if column_index > 0 {
-                sql.push_str(", ");
-            }
-            let parameter_index = row_index * columns_per_row + column_index + 1;
-            let _ = write!(sql, "?{parameter_index}");
-        }
-        sql.push(')');
+fn delete_prefixed_entries(
+    txn: &mut RwTransaction<'_>,
+    db: Database,
+    prefix: &str,
+) -> AppResult<usize> {
+    let prefix_bytes = prefix.as_bytes();
+    let mut keys_to_delete = Vec::new();
+    {
+        let cursor = txn.open_rw_cursor(db)?;
+        for_each_prefixed_cursor(&cursor, prefix_bytes, |key, _value| {
+            keys_to_delete.push(key.to_vec());
+            Ok(true)
+        })?;
     }
-}
 
-pub fn load_pending_file_change_enrichment(
-    conn: &Connection,
-    repo_id: i64,
-    limit: usize,
-) -> AppResult<Vec<PendingFileChangeEnrichment>> {
-    let bounded_limit = limit.max(1);
-    let now_epoch = now_epoch_seconds();
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT q.commit_sha, q.file_path
-        FROM file_change_enrichment_queue q
-        JOIN file_changes f
-          ON f.repo_id = q.repo_id
-         AND f.commit_sha = q.commit_sha
-         AND f.file_path = q.file_path
-        WHERE q.repo_id = ?1
-          AND f.stats_state = 'pending'
-          AND q.attempts < ?2
-          AND q.enqueued_at_epoch <= ?3
-        ORDER BY q.enqueued_at_epoch ASC, q.commit_sha ASC, q.file_path ASC
-        LIMIT ?4
-    "#,
-    )?;
-    let rows = stmt.query_map(
-        params![
-            repo_id,
-            FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS,
-            now_epoch,
-            bounded_limit as i64
-        ],
-        |row| {
-            Ok(PendingFileChangeEnrichment {
-                commit_sha: row.get(0)?,
-                file_path: row.get(1)?,
-            })
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
+    for key in &keys_to_delete {
+        let _ = txn.del(db, key, None);
     }
-    Ok(result)
+
+    Ok(keys_to_delete.len())
 }
 
-pub fn load_pending_file_change_enrichment_for_commits(
-    conn: &Connection,
+fn delete_enrichment_due_entries_for_commits(
+    txn: &mut RwTransaction<'_>,
+    db: Database,
     repo_id: i64,
-    commit_shas: &[String],
-    limit: usize,
-) -> AppResult<Vec<PendingFileChangeEnrichment>> {
+    commit_shas: &HashSet<&str>,
+) -> AppResult<usize> {
     if commit_shas.is_empty() {
+        return Ok(0);
+    }
+
+    let prefix = repository_prefix(repo_id);
+    let prefix_bytes = prefix.as_bytes();
+    let mut keys_to_delete = Vec::new();
+    {
+        let cursor = txn.open_rw_cursor(db)?;
+        for_each_prefixed_cursor(&cursor, prefix_bytes, |key, _value| {
+            let (_due_epoch, commit_sha, _file_path) =
+                parse_due_index_identity_from_prefixed_key(key, prefix_bytes)?;
+            if commit_shas.contains(commit_sha.as_str()) {
+                keys_to_delete.push(key.to_vec());
+            }
+            Ok(true)
+        })?;
+    }
+
+    for key in &keys_to_delete {
+        let _ = txn.del(db, key, None);
+    }
+
+    Ok(keys_to_delete.len())
+}
+
+fn count_prefixed_entries(txn: &RoTransaction<'_>, db: Database, prefix: &str) -> AppResult<usize> {
+    let mut count = 0usize;
+    let cursor = txn.open_ro_cursor(db)?;
+    for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, _value| {
+        count = count.saturating_add(1);
+        Ok(true)
+    })?;
+    Ok(count)
+}
+
+fn build_offsets_from_counts(counts: &[usize]) -> AppResult<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(counts.len().saturating_add(1));
+    offsets.push(0);
+    let mut running_total = 0usize;
+    for &count in counts {
+        running_total = running_total.checked_add(count).ok_or_else(|| {
+            AppError::Parse("csr offset accumulation overflowed usize capacity".to_string())
+        })?;
+        let offset = u32::try_from(running_total).map_err(|_| {
+            AppError::Parse("csr offset exceeded u32 capacity during rebuild".to_string())
+        })?;
+        offsets.push(offset);
+    }
+    Ok(offsets)
+}
+
+fn offsets_to_write_positions(offsets: &[u32]) -> AppResult<Vec<usize>> {
+    if offsets.is_empty() {
         return Ok(Vec::new());
     }
 
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_pending_file_change_enrichment_commits (
-          sha TEXT PRIMARY KEY
-        );
-        DELETE FROM current_pending_file_change_enrichment_commits;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_pending_file_change_enrichment_commits (sha)
-            VALUES (?1)
-            ON CONFLICT(sha) DO NOTHING
-        "#,
-        )?;
-        for sha in commit_shas {
-            insert_stmt.execute([sha.as_str()])?;
-        }
+    let mut positions = Vec::with_capacity(offsets.len().saturating_sub(1));
+    for &offset in offsets.iter().take(offsets.len().saturating_sub(1)) {
+        let index = usize::try_from(offset).map_err(|_| {
+            AppError::Parse("csr write position exceeded usize capacity".to_string())
+        })?;
+        positions.push(index);
     }
-
-    let bounded_limit = limit.max(1);
-    let now_epoch = now_epoch_seconds();
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT q.commit_sha, q.file_path
-        FROM file_change_enrichment_queue q
-        JOIN current_pending_file_change_enrichment_commits c
-          ON c.sha = q.commit_sha
-        JOIN file_changes f
-          ON f.repo_id = q.repo_id
-         AND f.commit_sha = q.commit_sha
-         AND f.file_path = q.file_path
-        WHERE q.repo_id = ?1
-          AND f.stats_state = 'pending'
-          AND q.attempts < ?2
-          AND q.enqueued_at_epoch <= ?3
-        ORDER BY q.enqueued_at_epoch ASC, q.commit_sha ASC, q.file_path ASC
-        LIMIT ?4
-    "#,
-    )?;
-    let rows = stmt.query_map(
-        params![
-            repo_id,
-            FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS,
-            now_epoch,
-            bounded_limit as i64
-        ],
-        |row| {
-            Ok(PendingFileChangeEnrichment {
-                commit_sha: row.get(0)?,
-                file_path: row.get(1)?,
-            })
-        },
-    )?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
+    Ok(positions)
 }
 
-pub fn apply_file_change_line_stats_updates(
-    conn: &Connection,
-    repo_id: i64,
-    updates: &[FileChangeLineStatsUpdate],
-) -> AppResult<usize> {
-    if updates.is_empty() {
-        return Ok(0);
+pub(crate) fn build_incremental_csr_snapshot(
+    mut existing: CsrSnapshot,
+    mut delta_commits: Vec<CommitRecord>,
+) -> AppResult<(CsrSnapshot, bool)> {
+    if delta_commits.is_empty() {
+        return Ok((existing, false));
     }
 
-    let mut applied = 0usize;
-    let mut update_stmt = conn.prepare_cached(
-        r#"
-        UPDATE file_changes
-        SET
-          additions = ?4,
-          deletions = ?5,
-          stats_state = 'ready'
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-          AND file_path = ?3
-    "#,
-    )?;
-    let mut clear_queue_stmt = conn.prepare_cached(
-        r#"
-        DELETE FROM file_change_enrichment_queue
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-          AND file_path = ?3
-    "#,
-    )?;
+    let old_node_count = existing.shas.len();
+    let mut sha_to_index =
+        HashMap::with_capacity(old_node_count.saturating_add(delta_commits.len()));
+    for (index, sha) in existing.shas.iter().enumerate() {
+        sha_to_index.insert(sha.clone(), index);
+    }
 
-    for update in updates {
-        let changed = update_stmt.execute(params![
-            repo_id,
-            update.commit_sha.as_str(),
-            update.file_path.as_str(),
-            update.additions,
-            update.deletions
-        ])?;
-        if changed > 0 {
-            applied = applied.saturating_add(changed);
-            clear_queue_stmt.execute(params![
-                repo_id,
-                update.commit_sha.as_str(),
-                update.file_path.as_str()
-            ])?;
+    delta_commits.sort_unstable_by(|left, right| {
+        right
+            .committer_time
+            .cmp(&left.committer_time)
+            .then_with(|| right.sha.cmp(&left.sha))
+    });
+
+    let mut new_commits = Vec::new();
+    for commit in delta_commits {
+        if sha_to_index.contains_key(commit.sha.as_str()) {
+            continue;
         }
+        let new_index = old_node_count.saturating_add(new_commits.len());
+        sha_to_index.insert(commit.sha.clone(), new_index);
+        new_commits.push(commit);
+    }
+    if new_commits.is_empty() {
+        return Ok((existing, false));
     }
 
-    Ok(applied)
-}
+    let total_node_count = old_node_count.saturating_add(new_commits.len());
+    let old_parent_counts = csr_row_counts(&existing.parents_offsets, old_node_count)?;
+    let old_child_counts = csr_row_counts(&existing.children_offsets, old_node_count)?;
+    let mut parent_counts = old_parent_counts;
+    parent_counts.resize(total_node_count, 0);
+    let mut child_counts = old_child_counts;
+    child_counts.resize(total_node_count, 0);
 
-pub fn mark_file_change_enrichment_failed(
-    conn: &Connection,
-    repo_id: i64,
-    failed_items: &[PendingFileChangeEnrichment],
-    error_message: &str,
-) -> AppResult<()> {
-    if failed_items.is_empty() {
-        return Ok(());
-    }
+    let mut new_parent_lists: Vec<Vec<u32>> = vec![Vec::new(); new_commits.len()];
+    let mut child_deltas: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut new_edges = 0usize;
 
-    let mut pending_stmt = conn.prepare_cached(
-        r#"
-        UPDATE file_changes
-        SET stats_state = 'pending'
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-          AND file_path = ?3
-    "#,
-    )?;
-    let mut failed_stmt = conn.prepare_cached(
-        r#"
-        UPDATE file_changes
-        SET stats_state = 'failed'
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-          AND file_path = ?3
-    "#,
-    )?;
-    let mut load_attempts_stmt = conn.prepare_cached(
-        r#"
-        SELECT attempts
-        FROM file_change_enrichment_queue
-        WHERE repo_id = ?1
-          AND commit_sha = ?2
-          AND file_path = ?3
-        LIMIT 1
-    "#,
-    )?;
-    let mut queue_stmt = conn.prepare_cached(
-        r#"
-        INSERT INTO file_change_enrichment_queue (
-          repo_id, commit_sha, file_path, enqueued_at_epoch, attempts, last_error
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(repo_id, commit_sha, file_path) DO UPDATE SET
-          enqueued_at_epoch = excluded.enqueued_at_epoch,
-          attempts = excluded.attempts,
-          last_error = excluded.last_error
-    "#,
-    )?;
-    let now_epoch = now_epoch_seconds();
-
-    for failed in failed_items {
-        let current_attempts = load_attempts_stmt
-            .query_row(
-                params![
-                    repo_id,
-                    failed.commit_sha.as_str(),
-                    failed.file_path.as_str()
-                ],
-                |row| row.get::<_, i64>(0),
+    for (offset, commit) in new_commits.iter().enumerate() {
+        let child_index = old_node_count.saturating_add(offset);
+        let child_id = u32::try_from(child_index).map_err(|_| {
+            AppError::Parse(
+                "csr delta child index exceeded u32 capacity during incremental apply".to_string(),
             )
-            .optional()?
-            .unwrap_or_default();
-        let retry_decision = decide_enrichment_retry(current_attempts, now_epoch);
+        })?;
 
-        if retry_decision.is_terminal {
-            failed_stmt.execute(params![
-                repo_id,
-                failed.commit_sha.as_str(),
-                failed.file_path.as_str()
-            ])?;
-        } else {
-            pending_stmt.execute(params![
-                repo_id,
-                failed.commit_sha.as_str(),
-                failed.file_path.as_str()
-            ])?;
+        let mut parent_ids = Vec::with_capacity(commit.parents.len());
+        for parent_sha in &commit.parents {
+            let Some(&parent_index) = sha_to_index.get(parent_sha) else {
+                continue;
+            };
+            let parent_id = u32::try_from(parent_index).map_err(|_| {
+                AppError::Parse(
+                    "csr delta parent index exceeded u32 capacity during incremental apply"
+                        .to_string(),
+                )
+            })?;
+            parent_ids.push(parent_id);
         }
-        queue_stmt.execute(params![
-            repo_id,
-            failed.commit_sha.as_str(),
-            failed.file_path.as_str(),
-            retry_decision.next_enqueued_epoch,
-            retry_decision.next_attempt,
-            error_message,
-        ])?;
+        parent_ids.sort_unstable_by(|left, right| right.cmp(left));
+        parent_ids.dedup();
+
+        new_edges = new_edges.saturating_add(parent_ids.len());
+        parent_counts[child_index] = parent_ids.len();
+        for &parent_id in &parent_ids {
+            let parent_index = usize::try_from(parent_id).map_err(|_| {
+                AppError::Parse(
+                    "csr delta parent index exceeded usize capacity during incremental apply"
+                        .to_string(),
+                )
+            })?;
+            child_deltas.entry(parent_index).or_default().push(child_id);
+        }
+        new_parent_lists[offset] = parent_ids;
     }
 
-    Ok(())
-}
-
-fn decide_enrichment_retry(current_attempts: i64, now_epoch: i64) -> EnrichmentRetryDecision {
-    let next_attempt = current_attempts.saturating_add(1);
-    let is_terminal = next_attempt >= FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS;
-    let next_enqueued_epoch = if is_terminal {
-        now_epoch
-    } else {
-        now_epoch.saturating_add(enrichment_retry_delay_seconds(next_attempt))
-    };
-    EnrichmentRetryDecision {
-        next_attempt,
-        is_terminal,
-        next_enqueued_epoch,
+    for (node_index, delta_list) in &mut child_deltas {
+        delta_list.sort_unstable_by(|left, right| right.cmp(left));
+        delta_list.dedup();
+        child_counts[*node_index] = child_counts[*node_index].saturating_add(delta_list.len());
     }
-}
 
-fn enrichment_retry_delay_seconds(next_attempt: i64) -> i64 {
-    let shift = next_attempt.saturating_sub(1).clamp(0, 20) as u32;
-    let multiplier = 1_i64 << shift;
-    FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS
-        .saturating_mul(multiplier)
-        .min(FILE_CHANGE_ENRICHMENT_RETRY_MAX_DELAY_SECONDS)
-}
+    let parents_offsets = build_offsets_from_counts(&parent_counts)?;
+    let children_offsets = build_offsets_from_counts(&child_counts)?;
+    let total_parent_edges =
+        usize::try_from(*parents_offsets.last().unwrap_or(&0)).map_err(|_| {
+            AppError::Parse(
+                "csr parent-edge count exceeded usize capacity during incremental apply"
+                    .to_string(),
+            )
+        })?;
+    let total_child_edges =
+        usize::try_from(*children_offsets.last().unwrap_or(&0)).map_err(|_| {
+            AppError::Parse(
+                "csr child-edge count exceeded usize capacity during incremental apply".to_string(),
+            )
+        })?;
 
-fn decide_extraction_retry(current_attempts: i64, now_epoch: i64) -> ExtractionRetryDecision {
-    let next_attempt = current_attempts.saturating_add(1);
-    let is_terminal = next_attempt >= FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS;
-    let next_retry_epoch = if is_terminal {
-        now_epoch
-    } else {
-        now_epoch.saturating_add(extraction_retry_delay_seconds(next_attempt))
-    };
-    ExtractionRetryDecision {
-        next_attempt,
-        is_terminal,
-        next_retry_epoch,
+    let mut parents_neighbors = vec![0u32; total_parent_edges];
+    let old_parent_len = existing.parents_neighbors.len();
+    if old_parent_len > parents_neighbors.len() {
+        return Err(AppError::Parse(
+            "existing parent CSR exceeds incremental parent CSR capacity".to_string(),
+        ));
     }
-}
+    parents_neighbors[..old_parent_len].copy_from_slice(&existing.parents_neighbors);
+    for (offset, parent_list) in new_parent_lists.iter().enumerate() {
+        let node_index = old_node_count.saturating_add(offset);
+        let start = usize::try_from(parents_offsets[node_index]).map_err(|_| {
+            AppError::Parse(
+                "incremental parent offset exceeded usize capacity while writing neighbors"
+                    .to_string(),
+            )
+        })?;
+        let end = start.saturating_add(parent_list.len());
+        if end > parents_neighbors.len() {
+            return Err(AppError::Parse(
+                "incremental parent write exceeded neighbor buffer".to_string(),
+            ));
+        }
+        parents_neighbors[start..end].copy_from_slice(parent_list);
+    }
 
-fn extraction_retry_delay_seconds(next_attempt: i64) -> i64 {
-    let shift = next_attempt.saturating_sub(1).clamp(0, 20) as u32;
-    let multiplier = 1_i64 << shift;
-    FILE_CHANGE_EXTRACTION_RETRY_BASE_DELAY_SECONDS
-        .saturating_mul(multiplier)
-        .min(FILE_CHANGE_EXTRACTION_RETRY_MAX_DELAY_SECONDS)
-}
+    let mut children_neighbors = vec![0u32; total_child_edges];
+    let mut child_deltas_owned = child_deltas;
+    for node_index in 0..total_node_count {
+        let mut write_cursor = usize::try_from(children_offsets[node_index]).map_err(|_| {
+            AppError::Parse(
+                "incremental child offset exceeded usize capacity while writing neighbors"
+                    .to_string(),
+            )
+        })?;
 
-pub fn load_file_change_stats_state_counts(
-    conn: &Connection,
-    repo_id: i64,
-) -> AppResult<FileChangeStatsStateCounts> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT stats_state, COUNT(1)
-        FROM file_changes
-        WHERE repo_id = ?1
-        GROUP BY stats_state
-    "#,
-    )?;
-    let rows = stmt.query_map([repo_id], |row| {
-        let state: String = row.get(0)?;
-        let count: i64 = row.get(1)?;
-        Ok((state, count))
-    })?;
+        if node_index < old_node_count {
+            let existing_slice = csr_slice(
+                &existing.children_offsets,
+                &existing.children_neighbors,
+                node_index,
+            );
+            let end = write_cursor.saturating_add(existing_slice.len());
+            if end > children_neighbors.len() {
+                return Err(AppError::Parse(
+                    "existing child CSR copy exceeded incremental child buffer".to_string(),
+                ));
+            }
+            children_neighbors[write_cursor..end].copy_from_slice(existing_slice);
+            write_cursor = end;
+        }
 
-    let mut counts = FileChangeStatsStateCounts::default();
-    for row in rows {
-        let (state, count) = row?;
-        let normalized_count = count.max(0) as usize;
-        match FileChangeStatsState::parse_db(state.as_str()) {
-            Some(FileChangeStatsState::Pending) => counts.pending = normalized_count,
-            Some(FileChangeStatsState::Ready) => counts.ready = normalized_count,
-            Some(FileChangeStatsState::Failed) => counts.failed = normalized_count,
-            None => {}
+        if let Some(delta_slice) = child_deltas_owned.remove(&node_index) {
+            let end = write_cursor.saturating_add(delta_slice.len());
+            if end > children_neighbors.len() {
+                return Err(AppError::Parse(
+                    "incremental child delta write exceeded neighbor buffer".to_string(),
+                ));
+            }
+            children_neighbors[write_cursor..end].copy_from_slice(&delta_slice);
+            write_cursor = end;
+        }
+
+        let expected_end = usize::try_from(children_offsets[node_index.saturating_add(1)])
+            .map_err(|_| {
+                AppError::Parse(
+                    "incremental child offset exceeded usize capacity at row end".to_string(),
+                )
+            })?;
+        if write_cursor != expected_end {
+            return Err(AppError::Parse(
+                "incremental child row write did not match expected CSR row width".to_string(),
+            ));
         }
     }
 
+    existing.generated_at_epoch = now_epoch_seconds();
+    existing
+        .shas
+        .extend(new_commits.into_iter().map(|commit| commit.sha));
+    existing.parents_offsets = parents_offsets;
+    existing.parents_neighbors = parents_neighbors;
+    existing.children_offsets = children_offsets;
+    existing.children_neighbors = children_neighbors;
+    existing.directed_edges = old_parent_len.saturating_add(new_edges);
+
+    Ok((existing, true))
+}
+
+fn csr_row_counts(offsets: &[u32], node_count: usize) -> AppResult<Vec<usize>> {
+    if offsets.len() < node_count.saturating_add(1) {
+        return Err(AppError::Parse(
+            "csr offsets length is smaller than node_count + 1".to_string(),
+        ));
+    }
+
+    let mut counts = Vec::with_capacity(node_count);
+    for node_index in 0..node_count {
+        let start = usize::try_from(offsets[node_index]).map_err(|_| {
+            AppError::Parse("csr row start offset exceeded usize capacity".to_string())
+        })?;
+        let end = usize::try_from(offsets[node_index.saturating_add(1)]).map_err(|_| {
+            AppError::Parse("csr row end offset exceeded usize capacity".to_string())
+        })?;
+        if end < start {
+            return Err(AppError::Parse(
+                "csr row end offset is smaller than start offset".to_string(),
+            ));
+        }
+        counts.push(end - start);
+    }
     Ok(counts)
 }
 
-pub fn synchronize_refs(conn: &Connection, repo_id: i64, refs: &[ParsedRef]) -> AppResult<usize> {
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_refs (
-          ref_name TEXT PRIMARY KEY
-        );
-        DELETE FROM current_refs;
-    "#,
-    )?;
-
-    {
-        let mut current_refs_stmt = conn.prepare(
-            r#"
-            INSERT INTO current_refs (ref_name)
-            VALUES (?1)
-            ON CONFLICT(ref_name) DO NOTHING
-        "#,
-        )?;
-
-        let mut ref_stmt = conn.prepare(
-            r#"
-            INSERT INTO refs (repo_id, ref_name, target_sha, ref_type)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(repo_id, ref_name) DO UPDATE SET
-              target_sha = excluded.target_sha,
-              ref_type = excluded.ref_type
-        "#,
-        )?;
-
-        for reference in refs {
-            current_refs_stmt.execute([reference.ref_name.as_str()])?;
-            ref_stmt.execute(params![
-                repo_id,
-                reference.ref_name.as_str(),
-                reference.target_sha.as_str(),
-                reference.ref_type.as_str()
-            ])?;
-        }
-    }
-
-    conn.execute(
-        "DELETE FROM refs WHERE repo_id = ?1 AND ref_name NOT IN (SELECT ref_name FROM current_refs)",
-        [repo_id],
-    )?;
-
-    Ok(refs.len())
-}
-
-pub fn set_repository_indexed_at(
-    conn: &Connection,
-    repo_id: i64,
-    indexed_at_epoch: i64,
-) -> AppResult<()> {
-    conn.execute(
-        "UPDATE repositories SET indexed_at = ?1 WHERE id = ?2",
-        params![indexed_at_epoch.to_string(), repo_id],
-    )?;
-    Ok(())
-}
-
-pub fn load_repository_indexed_at(conn: &Connection, repo_id: i64) -> AppResult<Option<String>> {
-    let indexed_at = conn
-        .query_row(
-            "SELECT indexed_at FROM repositories WHERE id = ?1 LIMIT 1",
-            [repo_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(indexed_at)
-}
-
-pub fn load_index_checkpoint(
-    conn: &Connection,
-    repo_id: i64,
-) -> AppResult<Option<IndexCheckpoint>> {
-    let checkpoint = conn
-        .query_row(
-            r#"
-            SELECT last_committer_time, last_commit_sha, indexed_at_epoch
-            FROM indexing_checkpoints
-            WHERE repo_id = ?1
-        "#,
-            [repo_id],
-            |row| {
-                Ok(IndexCheckpoint {
-                    last_committer_time: row.get(0)?,
-                    last_commit_sha: row.get(1)?,
-                    indexed_at_epoch: row.get(2)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(checkpoint)
-}
-
-pub fn upsert_index_checkpoint(
-    conn: &Connection,
-    repo_id: i64,
-    checkpoint: &IndexCheckpoint,
-) -> AppResult<()> {
-    conn.execute(
-        r#"
-        INSERT INTO indexing_checkpoints (
-          repo_id,
-          last_committer_time,
-          last_commit_sha,
-          indexed_at_epoch
-        ) VALUES (?1, ?2, ?3, ?4)
-        ON CONFLICT(repo_id) DO UPDATE SET
-          last_committer_time = excluded.last_committer_time,
-          last_commit_sha = excluded.last_commit_sha,
-          indexed_at_epoch = excluded.indexed_at_epoch
-    "#,
-        params![
-            repo_id,
-            checkpoint.last_committer_time,
-            checkpoint.last_commit_sha.as_str(),
-            checkpoint.indexed_at_epoch,
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn load_commit_window(
-    conn: &Connection,
-    repo_id: i64,
-    limit: usize,
-    cursor: Option<&CommitWindowCursor>,
-) -> AppResult<Vec<CommitWindowItem>> {
-    let limit = limit.min(MAX_COMMIT_WINDOW_FETCH_LIMIT);
-
-    let mut commits = Vec::new();
-    if let Some(cursor) = cursor {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT sha, author_name, author_email, committer_time, subject, tree_sha
-            FROM commits
-            WHERE repo_id = ?1
-              AND (committer_time < ?2 OR (committer_time = ?2 AND sha < ?3))
-            ORDER BY committer_time DESC, sha DESC
-            LIMIT ?4
-        "#,
-        )?;
-        let rows = stmt.query_map(
-            params![
-                repo_id,
-                cursor.committer_time,
-                cursor.sha.as_str(),
-                limit as i64
-            ],
-            map_commit_window_item,
-        )?;
-
-        for row in rows {
-            commits.push(row?);
-        }
-    } else {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT sha, author_name, author_email, committer_time, subject, tree_sha
-            FROM commits
-            WHERE repo_id = ?1
-            ORDER BY committer_time DESC, sha DESC
-            LIMIT ?2
-        "#,
-        )?;
-        let rows = stmt.query_map(params![repo_id, limit as i64], map_commit_window_item)?;
-
-        for row in rows {
-            commits.push(row?);
-        }
-    }
-
-    Ok(commits)
-}
-
-pub fn commit_exists(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<bool> {
-    let exists = conn
-        .query_row(
-            "SELECT 1 FROM commits WHERE repo_id = ?1 AND sha = ?2 LIMIT 1",
-            params![repo_id, sha],
-            |_row| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    Ok(exists)
-}
-
-pub fn count_commits(conn: &Connection, repo_id: i64) -> AppResult<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(1) FROM commits WHERE repo_id = ?1",
-        [repo_id],
-        |row| row.get(0),
-    )?;
-    Ok(count.max(0) as usize)
-}
-
-pub fn load_commit_rowid(conn: &Connection, repo_id: i64, sha: &str) -> AppResult<Option<i64>> {
-    let rowid = conn
-        .query_row(
-            "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2 LIMIT 1",
-            params![repo_id, sha],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(rowid)
-}
-
-pub fn load_commit_shas_by_rowids(
-    conn: &Connection,
-    repo_id: i64,
-    rowids: &[i64],
-) -> AppResult<HashMap<i64, String>> {
-    if rowids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowids (
-          commit_rowid INTEGER PRIMARY KEY
-        );
-        DELETE FROM current_graph_rowids;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare(
-            r#"
-            INSERT INTO current_graph_rowids (commit_rowid)
-            VALUES (?1)
-            ON CONFLICT(commit_rowid) DO NOTHING
-        "#,
-        )?;
-        for rowid in rowids {
-            insert_stmt.execute([rowid])?;
-        }
-    }
-
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT c.commit_id, c.sha
-        FROM commits c
-        JOIN current_graph_rowids r ON r.commit_rowid = c.commit_id
-        WHERE c.repo_id = ?1
-    "#,
-    )?;
-    let rows = stmt.query_map([repo_id], |row| {
-        let rowid: i64 = row.get(0)?;
-        let sha: String = row.get(1)?;
-        Ok((rowid, sha))
-    })?;
-
-    let mut result = HashMap::new();
-    for row in rows {
-        let (rowid, sha) = row?;
-        result.insert(rowid, sha);
-    }
-
-    Ok(result)
-}
-
-pub fn load_commit_shas_for_rowids(
-    conn: &Connection,
-    repo_id: i64,
-    rowids: &[i64],
-) -> AppResult<Vec<String>> {
-    if rowids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_rowid_order (
-          ord INTEGER PRIMARY KEY,
-          commit_rowid INTEGER NOT NULL
-        );
-        DELETE FROM current_graph_rowid_order;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_graph_rowid_order (ord, commit_rowid)
-            VALUES (?1, ?2)
-        "#,
-        )?;
-        for (ord, rowid) in rowids.iter().enumerate() {
-            insert_stmt.execute(params![ord as i64, rowid])?;
-        }
-    }
-
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT c.sha
-        FROM current_graph_rowid_order o
-        JOIN commits c ON c.commit_id = o.commit_rowid
-        WHERE c.repo_id = ?1
-        ORDER BY o.ord ASC
-    "#,
-    )?;
-    let rows = stmt.query_map([repo_id], |row| row.get(0))?;
-
-    let mut result = Vec::with_capacity(rowids.len());
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-pub fn load_neighbor_shas(
-    conn: &Connection,
-    repo_id: i64,
-    sha: &str,
-    direction: GraphDirection,
-) -> AppResult<Vec<String>> {
-    let batch = vec![sha.to_string()];
-    let neighbors = load_neighbor_shas_batch(conn, repo_id, &batch, direction)?;
-    Ok(neighbors.get(sha).cloned().unwrap_or_default())
-}
-
-pub fn load_neighbor_shas_batch(
-    conn: &Connection,
-    repo_id: i64,
-    shas: &[String],
-    direction: GraphDirection,
-) -> AppResult<HashMap<String, Vec<String>>> {
-    if shas.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut neighbors = HashMap::with_capacity(shas.len());
-    for sha in shas {
-        neighbors.entry(sha.clone()).or_default();
-    }
-
-    let source_commit_ids = load_commit_ids_for_shas(conn, repo_id, shas)?;
-    if source_commit_ids.is_empty() {
-        return Ok(neighbors);
-    }
-
-    let mut ordered_source_ids = Vec::new();
-    let mut ordered_source_shas = Vec::new();
-    for sha in shas {
-        if let Some(commit_id) = source_commit_ids.get(sha) {
-            ordered_source_ids.push(*commit_id);
-            ordered_source_shas.push(sha.clone());
-        }
-    }
-
-    let rowid_neighbors =
-        load_neighbor_rowids_batch(conn, repo_id, &ordered_source_ids, direction)?;
-    let mut neighbor_ids = Vec::new();
-    for source_id in &ordered_source_ids {
-        if let Some(source_neighbors) = rowid_neighbors.get(source_id) {
-            neighbor_ids.extend(source_neighbors.iter().copied());
-        }
-    }
-    neighbor_ids.sort_unstable();
-    neighbor_ids.dedup();
-    let neighbor_shas = load_commit_shas_by_rowids(conn, repo_id, &neighbor_ids)?;
-
-    for (source_sha, source_id) in ordered_source_shas.iter().zip(ordered_source_ids.iter()) {
-        let mut source_neighbor_shas = Vec::new();
-        if let Some(source_neighbors) = rowid_neighbors.get(source_id) {
-            for neighbor_id in source_neighbors {
-                if let Some(neighbor_sha) = neighbor_shas.get(neighbor_id) {
-                    source_neighbor_shas.push(neighbor_sha.clone());
-                }
-            }
-        }
-        neighbors.insert(source_sha.clone(), source_neighbor_shas);
-    }
-
-    Ok(neighbors)
-}
-
-fn load_commit_ids_for_shas(
-    conn: &Connection,
-    repo_id: i64,
-    shas: &[String],
-) -> AppResult<HashMap<String, i64>> {
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_nodes (
-          sha TEXT PRIMARY KEY
-        );
-        DELETE FROM current_graph_nodes;
-    "#,
-    )?;
-
-    {
-        let mut insert_stmt = conn.prepare_cached(
-            r#"
-            INSERT INTO current_graph_nodes (sha)
-            VALUES (?1)
-            ON CONFLICT(sha) DO NOTHING
-        "#,
-        )?;
-        for sha in shas {
-            insert_stmt.execute([sha.as_str()])?;
-        }
-    }
-
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT c.sha, c.commit_id
-        FROM commits c
-        JOIN current_graph_nodes node ON node.sha = c.sha
-        WHERE c.repo_id = ?1
-    "#,
-    )?;
-    let rows = stmt.query_map([repo_id], |row| {
-        let sha: String = row.get(0)?;
-        let commit_id: i64 = row.get(1)?;
-        Ok((sha, commit_id))
-    })?;
-
-    let mut result = HashMap::new();
-    for row in rows {
-        let (sha, commit_id) = row?;
-        result.insert(sha, commit_id);
-    }
-    Ok(result)
-}
-
-pub fn load_neighbor_rowids(
-    conn: &Connection,
-    repo_id: i64,
-    rowid: i64,
-    direction: GraphDirection,
-) -> AppResult<Vec<i64>> {
-    match direction {
-        GraphDirection::Parents => load_parent_rowids(conn, repo_id, rowid),
-        GraphDirection::Children => load_child_rowids(conn, repo_id, rowid),
-        GraphDirection::Both => {
-            let mut combined = load_parent_rowids(conn, repo_id, rowid)?;
-            combined.extend(load_child_rowids(conn, repo_id, rowid)?);
-            combined.sort();
-            combined.dedup();
-            combined.reverse();
-            Ok(combined)
-        }
-    }
-}
-
-pub fn load_neighbor_rowids_batch(
-    conn: &Connection,
-    repo_id: i64,
-    rowids: &[i64],
-    direction: GraphDirection,
-) -> AppResult<HashMap<i64, Vec<i64>>> {
-    let ordered_neighbors = load_neighbor_rowids_for_sources(conn, repo_id, rowids, direction)?;
-
-    let mut neighbors = HashMap::with_capacity(rowids.len());
-    for (ord, source_rowid) in rowids.iter().enumerate() {
-        neighbors.insert(
-            *source_rowid,
-            ordered_neighbors.get(ord).cloned().unwrap_or_default(),
-        );
-    }
-
-    Ok(neighbors)
-}
-
-pub fn load_neighbor_rowids_for_sources(
-    conn: &Connection,
-    repo_id: i64,
-    rowids: &[i64],
-    direction: GraphDirection,
-) -> AppResult<Vec<Vec<i64>>> {
-    if rowids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    if rowids.len() > ORDERED_NEIGHBOR_STAGE_THRESHOLD {
-        stage_ordered_source_rowids(conn, rowids)?;
-        return match direction {
-            GraphDirection::Parents => query_neighbor_rowids_for_staged_sources(
-                conn,
-                repo_id,
-                rowids.len(),
-                "child_commit_id",
-                "parent_commit_id",
-            ),
-            GraphDirection::Children => query_neighbor_rowids_for_staged_sources(
-                conn,
-                repo_id,
-                rowids.len(),
-                "parent_commit_id",
-                "child_commit_id",
-            ),
-            GraphDirection::Both => {
-                let mut merged = query_neighbor_rowids_for_staged_sources(
-                    conn,
-                    repo_id,
-                    rowids.len(),
-                    "child_commit_id",
-                    "parent_commit_id",
-                )?;
-                let children = query_neighbor_rowids_for_staged_sources(
-                    conn,
-                    repo_id,
-                    rowids.len(),
-                    "parent_commit_id",
-                    "child_commit_id",
-                )?;
-                for (merged_neighbors, child_neighbors) in
-                    merged.iter_mut().zip(children.into_iter())
-                {
-                    merged_neighbors.extend(child_neighbors);
-                    sort_and_dedup_descending(merged_neighbors);
-                }
-                Ok(merged)
-            }
-        };
-    }
-
-    let mut neighbors = Vec::with_capacity(rowids.len());
-    for rowid_chunk in rowids.chunks(ORDERED_NEIGHBOR_QUERY_CHUNK_SIZE) {
-        let mut chunk_neighbors = match direction {
-            GraphDirection::Parents => query_neighbor_rowids_for_ordered_sources_chunk(
-                conn,
-                repo_id,
-                rowid_chunk,
-                "child_commit_id",
-                "parent_commit_id",
-                "edge.parent_commit_id DESC",
-            )?,
-            GraphDirection::Children => query_neighbor_rowids_for_ordered_sources_chunk(
-                conn,
-                repo_id,
-                rowid_chunk,
-                "parent_commit_id",
-                "child_commit_id",
-                "edge.child_commit_id DESC",
-            )?,
-            GraphDirection::Both => {
-                let mut merged = query_neighbor_rowids_for_ordered_sources_chunk(
-                    conn,
-                    repo_id,
-                    rowid_chunk,
-                    "child_commit_id",
-                    "parent_commit_id",
-                    "edge.parent_commit_id DESC",
-                )?;
-                let children = query_neighbor_rowids_for_ordered_sources_chunk(
-                    conn,
-                    repo_id,
-                    rowid_chunk,
-                    "parent_commit_id",
-                    "child_commit_id",
-                    "edge.child_commit_id DESC",
-                )?;
-
-                for (merged_neighbors, child_neighbors) in
-                    merged.iter_mut().zip(children.into_iter())
-                {
-                    merged_neighbors.extend(child_neighbors);
-                    merged_neighbors.sort_unstable();
-                    merged_neighbors.dedup();
-                    merged_neighbors.reverse();
-                }
-                merged
-            }
-        };
-        neighbors.append(&mut chunk_neighbors);
-    }
-
-    Ok(neighbors)
-}
-
-pub fn load_pull_neighbor_rowids(
-    conn: &Connection,
-    repo_id: i64,
-    frontier_rowids: &[i64],
-    direction: GraphDirection,
-) -> AppResult<Vec<i64>> {
-    if frontier_rowids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut combined = Vec::new();
-    if frontier_rowids.len() > FRONTIER_PULL_STAGE_THRESHOLD {
-        stage_frontier_rowids(conn, frontier_rowids)?;
-        match direction {
-            GraphDirection::Parents => {
-                combined.extend(query_pull_rowids_for_staged_frontier(
-                    conn,
-                    repo_id,
-                    "parent_commit_id",
-                    "child_commit_id",
-                )?);
-            }
-            GraphDirection::Children => {
-                combined.extend(query_pull_rowids_for_staged_frontier(
-                    conn,
-                    repo_id,
-                    "child_commit_id",
-                    "parent_commit_id",
-                )?);
-            }
-            GraphDirection::Both => {
-                combined.extend(query_pull_rowids_for_staged_frontier(
-                    conn,
-                    repo_id,
-                    "parent_commit_id",
-                    "child_commit_id",
-                )?);
-                combined.extend(query_pull_rowids_for_staged_frontier(
-                    conn,
-                    repo_id,
-                    "child_commit_id",
-                    "parent_commit_id",
-                )?);
-            }
-        }
-    } else {
-        for frontier_chunk in frontier_rowids.chunks(FRONTIER_PULL_QUERY_CHUNK_SIZE) {
-            match direction {
-                GraphDirection::Parents => combined.extend(query_pull_rowids_for_frontier_chunk(
-                    conn,
-                    repo_id,
-                    frontier_chunk,
-                    "parent_commit_id",
-                    "child_commit_id",
-                )?),
-                GraphDirection::Children => combined.extend(query_pull_rowids_for_frontier_chunk(
-                    conn,
-                    repo_id,
-                    frontier_chunk,
-                    "child_commit_id",
-                    "parent_commit_id",
-                )?),
-                GraphDirection::Both => {
-                    combined.extend(query_pull_rowids_for_frontier_chunk(
-                        conn,
-                        repo_id,
-                        frontier_chunk,
-                        "parent_commit_id",
-                        "child_commit_id",
-                    )?);
-                    combined.extend(query_pull_rowids_for_frontier_chunk(
-                        conn,
-                        repo_id,
-                        frontier_chunk,
-                        "child_commit_id",
-                        "parent_commit_id",
-                    )?);
-                }
-            }
-        }
-    }
-
-    sort_and_dedup_descending(&mut combined);
-    Ok(combined)
-}
-
-fn load_parent_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT parent_commit_id
-        FROM commit_edges
-        WHERE repo_id = ?1 AND child_commit_id = ?2
-        ORDER BY parent_commit_id DESC
-    "#,
-    )?;
-    let rows = stmt.query_map(params![repo_id, rowid], |row| row.get(0))?;
-
-    let mut rowids = Vec::new();
-    for row in rows {
-        rowids.push(row?);
-    }
-
-    Ok(rowids)
-}
-
-fn load_child_rowids(conn: &Connection, repo_id: i64, rowid: i64) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare_cached(
-        r#"
-        SELECT child_commit_id
-        FROM commit_edges
-        WHERE repo_id = ?1 AND parent_commit_id = ?2
-        ORDER BY child_commit_id DESC
-    "#,
-    )?;
-    let rows = stmt.query_map(params![repo_id, rowid], |row| row.get(0))?;
-
-    let mut rowids = Vec::new();
-    for row in rows {
-        rowids.push(row?);
-    }
-
-    Ok(rowids)
-}
-
-fn stage_ordered_source_rowids(conn: &Connection, rowids: &[i64]) -> AppResult<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_ordered_sources (
-          ord INTEGER PRIMARY KEY,
-          commit_rowid INTEGER NOT NULL
-        );
-        DELETE FROM current_graph_ordered_sources;
-    "#,
-    )?;
-
-    let mut insert_stmt = conn.prepare_cached(
-        r#"
-        INSERT INTO current_graph_ordered_sources (ord, commit_rowid)
-        VALUES (?1, ?2)
-    "#,
-    )?;
-    for (ord, rowid) in rowids.iter().enumerate() {
-        insert_stmt.execute(params![ord as i64, rowid])?;
-    }
-    Ok(())
-}
-
-fn stage_frontier_rowids(conn: &Connection, frontier_rowids: &[i64]) -> AppResult<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TEMP TABLE IF NOT EXISTS current_graph_frontier_rows (
-          commit_rowid INTEGER PRIMARY KEY
-        );
-        DELETE FROM current_graph_frontier_rows;
-    "#,
-    )?;
-
-    let mut insert_stmt = conn.prepare_cached(
-        r#"
-        INSERT INTO current_graph_frontier_rows (commit_rowid)
-        VALUES (?1)
-        ON CONFLICT(commit_rowid) DO NOTHING
-    "#,
-    )?;
-    for rowid in frontier_rowids {
-        insert_stmt.execute([rowid])?;
-    }
-    Ok(())
-}
-
-fn query_neighbor_rowids_for_staged_sources(
-    conn: &Connection,
-    repo_id: i64,
-    rowid_count: usize,
-    source_id_column: &str,
-    neighbor_id_column: &str,
-) -> AppResult<Vec<Vec<i64>>> {
-    let sql = build_staged_ordered_neighbor_query_sql(source_id_column, neighbor_id_column);
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params![repo_id], |row| {
-        let source_ord: i64 = row.get(0)?;
-        let neighbor_rowid: i64 = row.get(1)?;
-        Ok((source_ord, neighbor_rowid))
-    })?;
-
-    let mut result: Vec<Vec<i64>> = vec![Vec::new(); rowid_count];
-    for row in rows {
-        let (source_ord, neighbor_rowid) = row?;
-        if source_ord < 0 {
-            continue;
-        }
-        let source_index = source_ord as usize;
-        if source_index < result.len() {
-            result[source_index].push(neighbor_rowid);
-        }
-    }
-    for source_neighbors in &mut result {
-        sort_and_dedup_descending(source_neighbors);
-    }
-
-    Ok(result)
-}
-
-fn query_pull_rowids_for_staged_frontier(
-    conn: &Connection,
-    repo_id: i64,
-    candidate_id_column: &str,
-    frontier_id_column: &str,
-) -> AppResult<Vec<i64>> {
-    let sql = build_staged_pull_query_sql(candidate_id_column, frontier_id_column);
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params![repo_id], |row| row.get(0))?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-fn build_staged_ordered_neighbor_query_sql(
-    source_id_column: &str,
-    neighbor_id_column: &str,
-) -> String {
-    format!(
-        r#"
-        SELECT src.ord AS source_ord, edge.{neighbor_id_column} AS neighbor_rowid
-        FROM current_graph_ordered_sources src
-        JOIN commit_edges edge
-          ON edge.repo_id = ?1
-         AND edge.{source_id_column} = src.commit_rowid
-    "#
-    )
-}
-
-fn build_staged_pull_query_sql(candidate_id_column: &str, frontier_id_column: &str) -> String {
-    format!(
-        r#"
-        SELECT edge.{candidate_id_column} AS neighbor_rowid
-        FROM commit_edges edge
-        JOIN current_graph_frontier_rows frontier
-          ON frontier.commit_rowid = edge.{frontier_id_column}
-        WHERE edge.repo_id = ?1
-    "#
-    )
-}
-
-fn sort_and_dedup_descending(rowids: &mut Vec<i64>) {
-    rowids.sort_unstable_by(|left, right| right.cmp(left));
-    rowids.dedup();
-}
-
-fn query_neighbor_rowids_for_ordered_sources_chunk(
-    conn: &Connection,
-    repo_id: i64,
-    rowids: &[i64],
-    source_id_column: &str,
-    neighbor_id_column: &str,
-    neighbor_order: &str,
-) -> AppResult<Vec<Vec<i64>>> {
-    if rowids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut ordered_values = String::new();
-    for index in 0..rowids.len() {
-        if index > 0 {
-            ordered_values.push_str(", ");
-        }
-        let ord_param = index * 2 + 1;
-        let rowid_param = index * 2 + 2;
-        ordered_values.push_str(&format!("(?{ord_param}, ?{rowid_param})"));
-    }
-    let repo_param = rowids.len() * 2 + 1;
-
-    let sql = format!(
-        r#"
-        WITH ordered(ord, commit_rowid) AS (
-          VALUES {ordered_values}
-        )
-        SELECT ordered.ord AS source_ord, edge.{neighbor_id_column} AS neighbor_rowid
-        FROM ordered
-        JOIN commit_edges edge
-          ON edge.repo_id = ?{repo_param}
-         AND edge.{source_id_column} = ordered.commit_rowid
-        ORDER BY ordered.ord ASC, {neighbor_order}
-    "#
-    );
-
-    let mut query_params = Vec::with_capacity(rowids.len() * 2 + 1);
-    for (ord, rowid) in rowids.iter().enumerate() {
-        query_params.push(Value::Integer(ord as i64));
-        query_params.push(Value::Integer(*rowid));
-    }
-    query_params.push(Value::Integer(repo_id));
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| {
-        let source_ord: i64 = row.get(0)?;
-        let neighbor_rowid: i64 = row.get(1)?;
-        Ok((source_ord, neighbor_rowid))
-    })?;
-
-    let mut result: Vec<Vec<i64>> = vec![Vec::new(); rowids.len()];
-    for row in rows {
-        let (source_ord, neighbor_rowid) = row?;
-        if source_ord < 0 {
-            continue;
-        }
-        let source_index = source_ord as usize;
-        if source_index < result.len() {
-            result[source_index].push(neighbor_rowid);
-        }
-    }
-
-    Ok(result)
-}
-
-fn query_pull_rowids_for_frontier_chunk(
-    conn: &Connection,
-    repo_id: i64,
-    frontier_rowids: &[i64],
-    candidate_id_column: &str,
-    frontier_id_column: &str,
-) -> AppResult<Vec<i64>> {
-    if frontier_rowids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut frontier_values = String::new();
-    for index in 0..frontier_rowids.len() {
-        if index > 0 {
-            frontier_values.push_str(", ");
-        }
-        let frontier_param = index + 1;
-        frontier_values.push_str(&format!("(?{frontier_param})"));
-    }
-    let repo_param = frontier_rowids.len() + 1;
-
-    let sql = format!(
-        r#"
-        WITH frontier(commit_rowid) AS (
-          VALUES {frontier_values}
-        )
-        SELECT DISTINCT edge.{candidate_id_column} AS neighbor_rowid
-        FROM commit_edges edge
-        JOIN frontier
-          ON frontier.commit_rowid = edge.{frontier_id_column}
-        WHERE edge.repo_id = ?{repo_param}
-        ORDER BY edge.{candidate_id_column} DESC
-    "#
-    );
-
-    let mut query_params = Vec::with_capacity(frontier_rowids.len() + 1);
-    for frontier_rowid in frontier_rowids {
-        query_params.push(Value::Integer(*frontier_rowid));
-    }
-    query_params.push(Value::Integer(repo_id));
-
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(query_params.iter()), |row| row.get(0))?;
-
-    let mut result = Vec::new();
-    for row in rows {
-        result.push(row?);
-    }
-    Ok(result)
-}
-
-pub fn verify_sqlite_graph_query_plan_guards(conn: &Connection, repo_id: i64) -> AppResult<()> {
-    let sample_commit_id = conn
-        .query_row(
-            "SELECT commit_id FROM commits WHERE repo_id = ?1 ORDER BY commit_id ASC LIMIT 1",
-            [repo_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    let Some(sample_commit_id) = sample_commit_id else {
-        return Ok(());
+fn csr_slice<'a>(offsets: &[u32], neighbors: &'a [u32], node_id: usize) -> &'a [u32] {
+    let Some(&start) = offsets.get(node_id) else {
+        return &[];
+    };
+    let Some(&end) = offsets.get(node_id.saturating_add(1)) else {
+        return &[];
     };
 
-    stage_ordered_source_rowids(conn, &[sample_commit_id])?;
-    stage_frontier_rowids(conn, &[sample_commit_id])?;
+    let start_index = usize::try_from(start).ok();
+    let end_index = usize::try_from(end).ok();
+    match (start_index, end_index) {
+        (Some(start_idx), Some(end_idx)) if start_idx <= end_idx && end_idx <= neighbors.len() => {
+            &neighbors[start_idx..end_idx]
+        }
+        _ => &[],
+    }
+}
 
-    let ordered_parent_sql =
-        build_staged_ordered_neighbor_query_sql("child_commit_id", "parent_commit_id");
-    assert_sqlite_query_plan_guard(
-        conn,
-        ordered_parent_sql.as_str(),
-        repo_id,
-        "ordered-source parents",
+fn append_delta_event(
+    txn: &mut RwTransaction<'_>,
+    dbs: Databases,
+    repo_id: Option<i64>,
+    kind: String,
+) -> AppResult<()> {
+    let next_sequence = read_u64_meta(txn, dbs.metadata, META_NEXT_DELTA_SEQUENCE)?
+        .unwrap_or(1)
+        .max(1);
+    write_u64_meta(
+        txn,
+        dbs.metadata,
+        META_NEXT_DELTA_SEQUENCE,
+        next_sequence.saturating_add(1),
     )?;
 
-    let ordered_child_sql =
-        build_staged_ordered_neighbor_query_sql("parent_commit_id", "child_commit_id");
-    assert_sqlite_query_plan_guard(
-        conn,
-        ordered_child_sql.as_str(),
+    let event = DeltaEvent {
+        sequence: next_sequence,
         repo_id,
-        "ordered-source children",
-    )?;
+        at_epoch: now_epoch_seconds(),
+        kind,
+    };
+    let key = next_sequence.to_be_bytes();
+    let raw = serialize(&event, "serialize delta event")?;
+    txn.put(dbs.delta_log, &key, &raw, WriteFlags::empty())?;
 
-    let pull_parent_sql = build_staged_pull_query_sql("parent_commit_id", "child_commit_id");
-    assert_sqlite_query_plan_guard(conn, pull_parent_sql.as_str(), repo_id, "pull parents")?;
-
-    let pull_child_sql = build_staged_pull_query_sql("child_commit_id", "parent_commit_id");
-    assert_sqlite_query_plan_guard(conn, pull_child_sql.as_str(), repo_id, "pull children")?;
+    let retention_limit = resolve_delta_log_retention_events();
+    if retention_limit > 0 && next_sequence > retention_limit {
+        let oldest_sequence_to_prune = next_sequence.saturating_sub(retention_limit);
+        let oldest_key = oldest_sequence_to_prune.to_be_bytes();
+        let _ = txn.del(dbs.delta_log, &oldest_key, None);
+    }
 
     Ok(())
 }
 
-fn assert_sqlite_query_plan_guard(
-    conn: &Connection,
-    sql: &str,
-    repo_id: i64,
-    label: &str,
+fn ensure_u64_meta(
+    txn: &mut RwTransaction<'_>,
+    db: Database,
+    key: &str,
+    default_value: u64,
 ) -> AppResult<()> {
-    let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
-    let mut stmt = conn.prepare_cached(&explain_sql)?;
-    let rows = stmt.query_map(params![repo_id], |row| row.get::<_, String>(3))?;
-
-    let mut details = Vec::new();
-    for row in rows {
-        details.push(row?);
-    }
-
-    let mut found_broad_scan = false;
-    let mut found_temp_sort = false;
-    for detail in &details {
-        let normalized = detail.to_ascii_lowercase();
-        if normalized.contains("scan edge") || normalized.contains("scan commit_edges") {
-            found_broad_scan = true;
+    match txn.get(db, &key) {
+        Ok(_) => Ok(()),
+        Err(lmdb::Error::NotFound) => {
+            txn.put(db, &key, &encode_u64(default_value), WriteFlags::empty())?;
+            Ok(())
         }
-        if normalized.contains("use temp b-tree") {
-            found_temp_sort = true;
-        }
+        Err(error) => Err(error.into()),
     }
+}
 
-    if found_broad_scan || found_temp_sort {
+fn read_u64_meta(txn: &impl Transaction, db: Database, key: &str) -> AppResult<Option<u64>> {
+    match txn.get(db, &key) {
+        Ok(raw) => Ok(Some(decode_u64(raw, "decode metadata u64 value")?)),
+        Err(lmdb::Error::NotFound) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_u64_meta(
+    txn: &mut RwTransaction<'_>,
+    db: Database,
+    key: &str,
+    value: u64,
+) -> AppResult<()> {
+    txn.put(db, &key, &encode_u64(value), WriteFlags::empty())?;
+    Ok(())
+}
+
+fn encode_u64(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
+}
+
+fn decode_u64(raw: &[u8], context: &str) -> AppResult<u64> {
+    if raw.len() != 8 {
         return Err(AppError::Parse(format!(
-            "sqlite query-plan guard failed ({label}): broad_scan={found_broad_scan}, temp_sort={found_temp_sort}, details={details:?}"
+            "{context}: expected 8-byte u64 payload, got {} bytes",
+            raw.len()
         )));
     }
-
-    Ok(())
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(raw);
+    Ok(u64::from_be_bytes(bytes))
 }
 
-fn map_commit_window_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommitWindowItem> {
-    Ok(CommitWindowItem {
-        sha: row.get(0)?,
-        author_name: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-        author_email: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-        committer_time: row.get::<_, Option<i64>>(3)?.unwrap_or_default(),
-        subject: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-        tree_sha: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-    })
+fn backoff_delay_seconds(attempt: i64) -> i64 {
+    let exponent = attempt.saturating_sub(1).clamp(0, 16);
+    let factor = 1_i64
+        .checked_shl(u32::try_from(exponent).unwrap_or(0))
+        .unwrap_or(i64::MAX);
+    FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS
+        .saturating_mul(factor)
+        .clamp(
+            FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS,
+            FILE_CHANGE_ENRICHMENT_RETRY_MAX_DELAY_SECONDS,
+        )
+}
+
+fn extraction_backoff_delay_seconds(attempt: i64) -> i64 {
+    let exponent = attempt.saturating_sub(1).clamp(0, 16);
+    let factor = 1_i64
+        .checked_shl(u32::try_from(exponent).unwrap_or(0))
+        .unwrap_or(i64::MAX);
+    FILE_CHANGE_EXTRACTION_RETRY_BASE_DELAY_SECONDS
+        .saturating_mul(factor)
+        .clamp(
+            FILE_CHANGE_EXTRACTION_RETRY_BASE_DELAY_SECONDS,
+            FILE_CHANGE_EXTRACTION_RETRY_MAX_DELAY_SECONDS,
+        )
+}
+
+fn serialize<T: Serialize>(value: &T, context: &str) -> AppResult<Vec<u8>> {
+    bincode::serialize(value).map_err(|error| AppError::Parse(format!("{context}: {error}")))
+}
+
+fn deserialize<T: DeserializeOwned>(raw: &[u8], context: &str) -> AppResult<T> {
+    bincode::deserialize(raw).map_err(|error| AppError::Parse(format!("{context}: {error}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{params, Connection};
+    use lmdb::EnvironmentFlags;
+    use tempfile::TempDir;
 
     use super::{
-        clear_file_change_extraction_queue_for_commits, count_commits,
-        delete_file_changes_for_commits, enqueue_commits_for_file_change_extraction,
-        enqueue_file_changes_for_enrichment, enqueue_file_changes_for_enrichment_from_drain_stage,
-        load_commit_shas_by_rowids, load_commit_shas_for_rowids,
-        load_file_change_extraction_queue_metrics, load_index_checkpoint,
-        load_neighbor_rowids_batch, load_neighbor_rowids_for_sources, load_neighbor_shas_batch,
-        load_pending_file_change_enrichment, load_pending_file_change_extraction_commits,
-        load_pull_neighbor_rowids, load_repository_id_by_path, mark_file_change_enrichment_failed,
-        mark_file_change_extraction_failed, merge_file_changes_from_drain_stage,
-        prepare_file_change_drain_stage, run_migrations, stage_file_change_for_drain,
-        upsert_commits_batch, upsert_file_changes, upsert_index_checkpoint,
-        verify_sqlite_graph_query_plan_guards, FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK,
-        FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS, FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS,
-        FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, FILE_CHANGE_UPSERT_ROWS_PER_CHUNK,
-        FRONTIER_PULL_QUERY_CHUNK_SIZE, FRONTIER_PULL_STAGE_THRESHOLD,
-        ORDERED_NEIGHBOR_STAGE_THRESHOLD,
+        effective_map_size_bytes, open_store, LmdbRuntimeOptions,
+        FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, LMDB_MIN_MAP_SIZE_BYTES,
     };
-    use crate::domain::models::{
-        FileChangeStatsState, GraphDirection, IndexCheckpoint, ParsedCommit, ParsedFileChange,
-    };
-    use crate::support::clock::now_epoch_seconds;
 
     #[test]
-    fn migrations_are_idempotent() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("first migration run");
-        run_migrations(&mut conn).expect("second migration run");
+    fn lmdb_runtime_options_reject_map_async_without_write_map() {
+        let result = LmdbRuntimeOptions::from_bools(false, false, true, false);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn commits_and_edges_have_repo_scoped_primary_keys() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
+    fn lmdb_runtime_options_reject_no_mem_init_with_write_map() {
+        let result = LmdbRuntimeOptions::from_bools(false, true, false, true);
+        assert!(result.is_err());
+    }
 
-        let commits_pk = primary_key_columns(&conn, "commits");
-        assert_eq!(commits_pk, vec!["commit_id".to_string()]);
+    #[test]
+    fn lmdb_runtime_options_translate_to_expected_environment_flags() {
+        let options =
+            LmdbRuntimeOptions::from_bools(true, true, true, false).expect("valid lmdb flags");
+        let flags = options.environment_flags();
 
-        let edges_pk = primary_key_columns(&conn, "commit_edges");
+        assert!(flags.contains(EnvironmentFlags::WRITE_MAP));
+        assert!(flags.contains(EnvironmentFlags::MAP_ASYNC));
+        #[cfg(not(windows))]
+        assert!(flags.contains(EnvironmentFlags::NO_READAHEAD));
+        #[cfg(windows)]
+        assert!(!flags.contains(EnvironmentFlags::NO_READAHEAD));
+        assert!(!flags.contains(EnvironmentFlags::NO_MEM_INIT));
+    }
+
+    #[test]
+    fn lmdb_runtime_options_allow_no_mem_init_without_write_map() {
+        let options =
+            LmdbRuntimeOptions::from_bools(false, false, false, true).expect("valid lmdb flags");
+        let flags = options.environment_flags();
+
+        assert!(flags.contains(EnvironmentFlags::NO_MEM_INIT));
+        assert!(!flags.contains(EnvironmentFlags::WRITE_MAP));
+    }
+
+    #[test]
+    fn effective_map_size_respects_existing_environment_floor() {
+        let configured = LMDB_MIN_MAP_SIZE_BYTES;
+        let observed = configured.saturating_mul(2);
+
+        let effective = effective_map_size_bytes(configured, observed);
+
+        assert_eq!(effective, observed);
+    }
+
+    #[test]
+    fn effective_map_size_keeps_configured_budget_when_larger() {
+        let configured = LMDB_MIN_MAP_SIZE_BYTES.saturating_mul(4);
+        let observed = LMDB_MIN_MAP_SIZE_BYTES;
+
+        let effective = effective_map_size_bytes(configured, observed);
+
+        assert_eq!(effective, configured);
+    }
+
+    #[test]
+    fn extraction_queue_enqueue_is_idempotent_and_ordered() {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+        let db_path = temp.path().join("graph-store");
+        let store = open_store(&db_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let repo_id = 42_i64;
+        let commits = vec![
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ];
+
+        let first_enqueued = store
+            .enqueue_commits_for_file_change_extraction(repo_id, &commits)
+            .unwrap_or_else(|error| panic!("enqueue extraction commits: {error}"));
+        assert_eq!(first_enqueued, 2);
+
+        let second_enqueued = store
+            .enqueue_commits_for_file_change_extraction(repo_id, &commits)
+            .unwrap_or_else(|error| panic!("enqueue duplicate extraction commits: {error}"));
+        assert_eq!(second_enqueued, 0);
+
+        let pending = store
+            .load_pending_file_change_extraction_commits(repo_id, 16)
+            .unwrap_or_else(|error| panic!("load pending extraction commits: {error}"));
         assert_eq!(
-            edges_pk,
+            pending,
             vec![
-                "repo_id".to_string(),
-                "child_commit_id".to_string(),
-                "parent_commit_id".to_string()
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
             ]
         );
     }
 
     #[test]
-    fn indexing_checkpoint_roundtrip() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
+    fn extraction_queue_retries_and_eventually_drops_terminal_failures() {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+        let db_path = temp.path().join("graph-store");
+        let store = open_store(&db_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let repo_id = 77_i64;
+        let commit = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        let commits = vec![commit.clone()];
 
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/repo", "repo", "/tmp/repo/.git"],
-        )
-        .expect("insert repo");
-
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let checkpoint = IndexCheckpoint {
-            last_committer_time: 123,
-            last_commit_sha: "abc123".to_string(),
-            indexed_at_epoch: 456,
-        };
-        upsert_index_checkpoint(&conn, repo_id, &checkpoint).expect("insert checkpoint");
-
-        let loaded = load_index_checkpoint(&conn, repo_id)
-            .expect("load checkpoint")
-            .expect("checkpoint should exist");
-        assert_eq!(loaded.last_committer_time, 123);
-        assert_eq!(loaded.last_commit_sha, "abc123");
-        assert_eq!(loaded.indexed_at_epoch, 456);
-    }
-
-    #[test]
-    fn load_repository_id_by_path_roundtrip() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        let missing = load_repository_id_by_path(&conn, "/tmp/missing-repo")
-            .expect("query missing repository id");
-        assert!(missing.is_none());
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/read-repo", "read-repo", "/tmp/read-repo/.git"],
-        )
-        .expect("insert repository");
-
-        let loaded = load_repository_id_by_path(&conn, "/tmp/read-repo")
-            .expect("query existing repository id");
-        assert!(loaded.is_some());
-    }
-
-    #[test]
-    fn delete_file_changes_for_commits_removes_requested_shas_only() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/delete-repo", "delete-repo", "/tmp/delete-repo/.git"],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/delete-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let file_changes = vec![
-            ParsedFileChange {
-                commit_sha: "c1".to_string(),
-                file_path: "a.txt".to_string(),
-                additions: Some(1),
-                deletions: Some(0),
-                change_type: "add".to_string(),
-                stats_state: FileChangeStatsState::Ready,
-                requires_line_stats: false,
-            },
-            ParsedFileChange {
-                commit_sha: "c2".to_string(),
-                file_path: "b.txt".to_string(),
-                additions: Some(2),
-                deletions: Some(1),
-                change_type: "modify".to_string(),
-                stats_state: FileChangeStatsState::Ready,
-                requires_line_stats: false,
-            },
-            ParsedFileChange {
-                commit_sha: "c3".to_string(),
-                file_path: "c.txt".to_string(),
-                additions: Some(0),
-                deletions: Some(4),
-                change_type: "delete".to_string(),
-                stats_state: FileChangeStatsState::Ready,
-                requires_line_stats: false,
-            },
-        ];
-        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert file changes");
-
-        delete_file_changes_for_commits(&conn, repo_id, &["c1".to_string(), "c3".to_string()])
-            .expect("delete selected file changes");
-
-        let remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count remaining file changes");
-        assert_eq!(remaining, 1);
-
-        let remaining_sha: String = conn
-            .query_row(
-                "SELECT commit_sha FROM file_changes WHERE repo_id = ?1 LIMIT 1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("read remaining commit sha");
-        assert_eq!(remaining_sha, "c2");
-    }
-
-    #[test]
-    fn upsert_file_changes_handles_parameter_chunk_boundaries() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/chunked-upsert-repo",
-                "chunked-upsert-repo",
-                "/tmp/chunked/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/chunked-upsert-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let change_count = FILE_CHANGE_UPSERT_ROWS_PER_CHUNK + 37;
-        let file_changes: Vec<ParsedFileChange> = (0..change_count)
-            .map(|index| ParsedFileChange {
-                commit_sha: format!("sha-{index:04}"),
-                file_path: format!("src/file-{index:04}.rs"),
-                additions: Some(index as i64),
-                deletions: if index % 2 == 0 {
-                    Some((index / 2) as i64)
-                } else {
-                    None
-                },
-                change_type: "modify".to_string(),
-                stats_state: FileChangeStatsState::Ready,
-                requires_line_stats: false,
-            })
-            .collect();
-
-        let inserted = upsert_file_changes(&conn, repo_id, &file_changes)
-            .expect("bulk upsert file changes with chunk boundaries");
-        assert_eq!(inserted, change_count);
-
-        let persisted: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count persisted file changes");
-        assert_eq!(persisted, change_count as i64);
-    }
-
-    #[test]
-    fn upsert_commits_batch_handles_parameter_chunk_boundaries() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/chunked-commit-repo",
-                "chunked-commit-repo",
-                "/tmp/chunked/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/chunked-commit-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let commit_count = FILE_CHANGE_UPSERT_ROWS_PER_CHUNK + 53;
-        let commits: Vec<ParsedCommit> = (0..commit_count)
-            .map(|index| ParsedCommit {
-                sha: format!("commit-{index:05}"),
-                parents: Vec::new(),
-                tree_sha: format!("{index:040x}"),
-                author_name: "GitGraph".to_string(),
-                author_email: "gitgraph@example.com".to_string(),
-                author_time: index as i64,
-                committer_time: index as i64,
-                subject: format!("subject-{index}"),
-            })
-            .collect();
-
-        let inserted = upsert_commits_batch(&conn, repo_id, &commits)
-            .expect("bulk commit upsert with chunk boundaries");
-        assert_eq!(inserted, commit_count);
-
-        let persisted: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM commits WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count persisted commits");
-        assert_eq!(persisted, commit_count as i64);
-    }
-
-    #[test]
-    fn enqueue_file_changes_handles_parameter_chunk_boundaries() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/chunked-enqueue-repo",
-                "chunked-enqueue-repo",
-                "/tmp/chunked/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/chunked-enqueue-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let eligible_count = FILE_CHANGE_ENQUEUE_ROWS_PER_CHUNK + 41;
-        let mut file_changes: Vec<ParsedFileChange> = (0..eligible_count)
-            .map(|index| ParsedFileChange {
-                commit_sha: format!("pending-sha-{index:04}"),
-                file_path: format!("src/pending-{index:04}.rs"),
-                additions: None,
-                deletions: None,
-                change_type: "modify".to_string(),
-                stats_state: FileChangeStatsState::Pending,
-                requires_line_stats: true,
-            })
-            .collect();
-        file_changes.push(ParsedFileChange {
-            commit_sha: "not-eligible-sha".to_string(),
-            file_path: "src/not-eligible.rs".to_string(),
-            additions: None,
-            deletions: None,
-            change_type: "modify".to_string(),
-            stats_state: FileChangeStatsState::Ready,
-            requires_line_stats: false,
-        });
-
-        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert pending file changes");
-        let enqueued = enqueue_file_changes_for_enrichment(&conn, repo_id, &file_changes)
-            .expect("enqueue pending file changes");
-        assert_eq!(enqueued, eligible_count);
-
-        let queue_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM file_change_enrichment_queue WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count queue rows");
-        assert_eq!(queue_count, eligible_count as i64);
-    }
-
-    #[test]
-    fn drain_stage_merge_and_enrichment_enqueue_are_set_based_and_filtered() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/drain-stage-repo",
-                "drain-stage-repo",
-                "/tmp/drain/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/drain-stage-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        prepare_file_change_drain_stage(&conn).expect("prepare drain stage");
-        stage_file_change_for_drain(
-            &conn,
-            &ParsedFileChange {
-                commit_sha: "stage-c1".to_string(),
-                file_path: "src/a.rs".to_string(),
-                additions: Some(3),
-                deletions: Some(1),
-                change_type: "modify".to_string(),
-                stats_state: FileChangeStatsState::Pending,
-                requires_line_stats: true,
-            },
-        )
-        .expect("stage pending row");
-        stage_file_change_for_drain(
-            &conn,
-            &ParsedFileChange {
-                commit_sha: "stage-c2".to_string(),
-                file_path: "src/b.rs".to_string(),
-                additions: Some(5),
-                deletions: Some(0),
-                change_type: "binary".to_string(),
-                stats_state: FileChangeStatsState::Ready,
-                requires_line_stats: false,
-            },
-        )
-        .expect("stage ready row");
-
-        let merged =
-            merge_file_changes_from_drain_stage(&conn, repo_id).expect("merge staged rows");
-        assert_eq!(merged, 2);
-        let enqueued = enqueue_file_changes_for_enrichment_from_drain_stage(&conn, repo_id)
-            .expect("enqueue staged pending rows");
+        let enqueued = store
+            .enqueue_commits_for_file_change_extraction(repo_id, &commits)
+            .unwrap_or_else(|error| panic!("enqueue extraction commit: {error}"));
         assert_eq!(enqueued, 1);
 
-        let persisted: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM file_changes WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count persisted file_changes");
-        assert_eq!(persisted, 2);
-        let queue_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM file_change_enrichment_queue WHERE repo_id = ?1",
-                [repo_id],
-                |row| row.get(0),
-            )
-            .expect("count persisted enrichment queue");
-        assert_eq!(queue_count, 1);
-    }
+        let pending_before_failure = store
+            .load_pending_file_change_extraction_commits(repo_id, 4)
+            .unwrap_or_else(|error| {
+                panic!("load pending extraction commits before failure: {error}")
+            });
+        assert_eq!(pending_before_failure, vec![commit.clone()]);
 
-    #[test]
-    fn extraction_queue_roundtrip_and_metrics() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/extraction-queue",
-                "extraction-queue",
-                "/tmp/extraction/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/extraction-queue"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let enqueued = enqueue_commits_for_file_change_extraction(
-            &conn,
-            repo_id,
-            &[
-                "c3".to_string(),
-                "c1".to_string(),
-                "c3".to_string(),
-                "c2".to_string(),
-            ],
-        )
-        .expect("enqueue extraction commits");
-        assert_eq!(enqueued, 3);
-
-        let pending = load_pending_file_change_extraction_commits(&conn, repo_id, 10)
-            .expect("load pending extraction commits");
-        assert_eq!(
-            pending,
-            vec!["c1".to_string(), "c2".to_string(), "c3".to_string()]
-        );
-
-        let metrics = load_file_change_extraction_queue_metrics(&conn, repo_id)
-            .expect("load extraction queue metrics");
-        assert_eq!(metrics.depth, 3);
-        assert!(metrics.oldest_queue_age_seconds >= 0);
-
-        clear_file_change_extraction_queue_for_commits(&conn, repo_id, &["c2".to_string()])
-            .expect("clear completed extraction commit");
-        let metrics_after_clear = load_file_change_extraction_queue_metrics(&conn, repo_id)
-            .expect("load extraction queue metrics after clear");
-        assert_eq!(metrics_after_clear.depth, 2);
-    }
-
-    #[test]
-    fn extraction_queue_retries_until_terminal_attempt_gate() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/extraction-retry",
-                "extraction-retry",
-                "/tmp/extraction/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/extraction-retry"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        enqueue_commits_for_file_change_extraction(&conn, repo_id, &["retry-sha".to_string()])
-            .expect("enqueue extraction commit");
-
-        for attempt in 1..=FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS {
-            mark_file_change_extraction_failed(
-                &conn,
-                repo_id,
-                &["retry-sha".to_string()],
-                "extraction failure",
-            )
-            .expect("record extraction failure");
-
-            if attempt < FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS {
-                conn.execute(
-                    "UPDATE file_change_extraction_queue SET next_retry_epoch = ?1 WHERE repo_id = ?2 AND commit_sha = ?3",
-                    params![now_epoch_seconds().saturating_sub(1), repo_id, "retry-sha"],
+        let terminal_failures =
+            (0..FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS).fold(0usize, |accumulator, _| {
+                accumulator.saturating_add(
+                    store
+                        .mark_file_change_extraction_commits_failed(
+                            repo_id,
+                            &commits,
+                            "synthetic extraction failure",
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("mark extraction commit failure for retry path: {error}")
+                        }),
                 )
-                .expect("force extraction retry eligibility");
-            }
-        }
+            });
+        assert_eq!(terminal_failures, 1);
 
-        let pending_after_terminal = load_pending_file_change_extraction_commits(&conn, repo_id, 8)
-            .expect("load pending extraction commits after terminal attempt");
-        assert!(pending_after_terminal.is_empty());
-
-        let attempts: i64 = conn
-            .query_row(
-                "SELECT attempts FROM file_change_extraction_queue WHERE repo_id = ?1 AND commit_sha = ?2",
-                params![repo_id, "retry-sha"],
-                |row| row.get(0),
-            )
-            .expect("read terminal extraction attempts");
-        assert_eq!(attempts, FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS);
-    }
-
-    #[test]
-    fn neighbor_batch_lookup_returns_repo_scoped_neighbors() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/repo", "repo", "/tmp/repo/.git"],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        conn.execute(
-            "INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)",
-            params![repo_id, "c1"],
-        )
-        .expect("insert c1");
-        conn.execute(
-            "INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)",
-            params![repo_id, "c2"],
-        )
-        .expect("insert c2");
-        conn.execute(
-            "INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)",
-            params![repo_id, "c3"],
-        )
-        .expect("insert c3");
-
-        let c1_rowid: i64 = conn
-            .query_row(
-                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
-                params![repo_id, "c1"],
-                |row| row.get(0),
-            )
-            .expect("fetch c1 rowid");
-        let c2_rowid: i64 = conn
-            .query_row(
-                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
-                params![repo_id, "c2"],
-                |row| row.get(0),
-            )
-            .expect("fetch c2 rowid");
-        let c3_rowid: i64 = conn
-            .query_row(
-                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
-                params![repo_id, "c3"],
-                |row| row.get(0),
-            )
-            .expect("fetch c3 rowid");
-
-        conn.execute(
-            "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
-            params![repo_id, c2_rowid, c1_rowid],
-        )
-        .expect("insert edge c2->c1");
-        conn.execute(
-            "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
-            params![repo_id, c3_rowid, c2_rowid],
-        )
-        .expect("insert edge c3->c2");
-
-        let batch = vec!["c1".to_string(), "c2".to_string(), "c3".to_string()];
-        let parents = load_neighbor_shas_batch(&conn, repo_id, &batch, GraphDirection::Parents)
-            .expect("load parent neighbors");
-        assert_eq!(parents.get("c3"), Some(&vec!["c2".to_string()]));
-        assert_eq!(parents.get("c2"), Some(&vec!["c1".to_string()]));
-        assert_eq!(parents.get("c1"), Some(&Vec::new()));
-
-        let children = load_neighbor_shas_batch(&conn, repo_id, &batch, GraphDirection::Children)
-            .expect("load child neighbors");
-        assert_eq!(children.get("c1"), Some(&vec!["c2".to_string()]));
-        assert_eq!(children.get("c2"), Some(&vec!["c3".to_string()]));
-        assert_eq!(children.get("c3"), Some(&Vec::new()));
-
-        let mut both_for_c2 =
-            load_neighbor_shas_batch(&conn, repo_id, &batch, GraphDirection::Both)
-                .expect("load both neighbors")
-                .remove("c2")
-                .unwrap_or_default();
-        both_for_c2.sort();
-        assert_eq!(both_for_c2, vec!["c1".to_string(), "c3".to_string()]);
-
-        let rowid_batch = vec![c1_rowid, c2_rowid, c3_rowid];
-        let rowid_parents =
-            load_neighbor_rowids_batch(&conn, repo_id, &rowid_batch, GraphDirection::Parents)
-                .expect("load rowid parent neighbors");
-        assert_eq!(rowid_parents.get(&c3_rowid), Some(&vec![c2_rowid]));
-        assert_eq!(rowid_parents.get(&c2_rowid), Some(&vec![c1_rowid]));
-
-        let ordered_children = load_neighbor_rowids_for_sources(
-            &conn,
-            repo_id,
-            &[c2_rowid, c1_rowid, c3_rowid],
-            GraphDirection::Children,
-        )
-        .expect("load ordered rowid children");
-        assert_eq!(
-            ordered_children,
-            vec![vec![c3_rowid], vec![c2_rowid], Vec::new()]
-        );
-
-        let pull_children =
-            load_pull_neighbor_rowids(&conn, repo_id, &[c1_rowid], GraphDirection::Children)
-                .expect("pull children");
-        assert_eq!(pull_children, vec![c2_rowid]);
-
-        let pull_parents =
-            load_pull_neighbor_rowids(&conn, repo_id, &[c3_rowid], GraphDirection::Parents)
-                .expect("pull parents");
-        assert_eq!(pull_parents, vec![c2_rowid]);
-
-        let pull_both =
-            load_pull_neighbor_rowids(&conn, repo_id, &[c2_rowid], GraphDirection::Both)
-                .expect("pull both");
-        assert_eq!(pull_both, vec![c3_rowid, c1_rowid]);
-
-        let repo_commit_count = count_commits(&conn, repo_id).expect("count commits");
-        assert_eq!(repo_commit_count, 3);
-
-        let rowid_shas =
-            load_commit_shas_by_rowids(&conn, repo_id, &rowid_batch).expect("load sha by rowids");
-        assert_eq!(rowid_shas.get(&c1_rowid).map(String::as_str), Some("c1"));
-        assert_eq!(rowid_shas.get(&c2_rowid).map(String::as_str), Some("c2"));
-        assert_eq!(rowid_shas.get(&c3_rowid).map(String::as_str), Some("c3"));
-
-        let ordered_shas =
-            load_commit_shas_for_rowids(&conn, repo_id, &[c3_rowid, c1_rowid, c2_rowid])
-                .expect("load ordered sha by rowids");
-        assert_eq!(
-            ordered_shas,
-            vec!["c3".to_string(), "c1".to_string(), "c2".to_string()]
-        );
-    }
-
-    #[test]
-    fn neighbor_queries_handle_chunk_boundaries() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/chunk-repo", "chunk-repo", "/tmp/chunk-repo/.git"],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/chunk-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let commit_count = FRONTIER_PULL_QUERY_CHUNK_SIZE + 100;
-        {
-            let tx = conn.transaction().expect("start insert tx");
-            let mut commit_stmt = tx
-                .prepare_cached("INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)")
-                .expect("prepare commit insert");
-            for index in 0..commit_count {
-                let sha = format!("c{index:04}");
-                commit_stmt
-                    .execute(params![repo_id, sha])
-                    .expect("insert commit");
-            }
-            drop(commit_stmt);
-            tx.commit().expect("commit inserts");
-        }
-
-        let commit_ids = {
-            let mut id_stmt = conn
-                .prepare_cached(
-                    r#"
-                SELECT commit_id
-                FROM commits
-                WHERE repo_id = ?1
-                ORDER BY sha ASC
-            "#,
-                )
-                .expect("prepare commit id query");
-            let id_rows = id_stmt
-                .query_map([repo_id], |row| row.get::<_, i64>(0))
-                .expect("query commit ids");
-            let mut commit_ids = Vec::with_capacity(commit_count);
-            for row in id_rows {
-                commit_ids.push(row.expect("read commit id"));
-            }
-            commit_ids
-        };
-
-        {
-            let tx = conn.transaction().expect("start edge insert tx");
-            let mut edge_stmt = tx
-                .prepare_cached(
-                    r#"
-                    INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
-                    VALUES (?1, ?2, ?3)
-                "#,
-                )
-                .expect("prepare edge insert");
-            for index in 1..commit_ids.len() {
-                edge_stmt
-                    .execute(params![repo_id, commit_ids[index], commit_ids[index - 1]])
-                    .expect("insert edge");
-            }
-            drop(edge_stmt);
-            tx.commit().expect("commit edges");
-        }
-
-        let source_rowids: Vec<i64> = commit_ids.iter().skip(1).copied().collect();
+        let pending_after_failure = store
+            .load_pending_file_change_extraction_commits(repo_id, 4)
+            .unwrap_or_else(|error| {
+                panic!("load pending extraction commits after failure: {error}")
+            });
         assert!(
-            source_rowids.len() > ORDERED_NEIGHBOR_STAGE_THRESHOLD,
-            "test must cross ordered-neighbor staging threshold"
-        );
-        let ordered_parents = load_neighbor_rowids_for_sources(
-            &conn,
-            repo_id,
-            &source_rowids,
-            GraphDirection::Parents,
-        )
-        .expect("load ordered parents");
-        assert_eq!(ordered_parents.len(), source_rowids.len());
-        for (index, parents) in ordered_parents.iter().enumerate() {
-            assert_eq!(parents, &vec![commit_ids[index]]);
-        }
-
-        let frontier: Vec<i64> = commit_ids
-            .iter()
-            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 50)
-            .copied()
-            .collect();
-        assert!(
-            frontier.len() > FRONTIER_PULL_STAGE_THRESHOLD,
-            "test must cross pull-frontier staging threshold"
+            pending_after_failure.is_empty(),
+            "expected terminal failures to leave no pending extraction commits"
         );
 
-        let pull_children =
-            load_pull_neighbor_rowids(&conn, repo_id, &frontier, GraphDirection::Children)
-                .expect("load pull children");
-        let mut expected_children: Vec<i64> = commit_ids
-            .iter()
-            .skip(1)
-            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 50)
-            .copied()
-            .collect();
-        expected_children.sort_unstable_by(|left, right| right.cmp(left));
-        assert_eq!(pull_children, expected_children);
-
-        let pull_both = load_pull_neighbor_rowids(&conn, repo_id, &frontier, GraphDirection::Both)
-            .expect("load pull both");
-        let mut expected_both: Vec<i64> = commit_ids
-            .iter()
-            .take(FRONTIER_PULL_QUERY_CHUNK_SIZE + 51)
-            .copied()
-            .collect();
-        expected_both.sort_unstable_by(|left, right| right.cmp(left));
-        assert_eq!(pull_both, expected_both);
-    }
-
-    #[test]
-    fn sqlite_graph_query_plan_guard_accepts_indexed_staged_queries() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/plan-guard-repo",
-                "plan-guard-repo",
-                "/tmp/plan-guard-repo/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/plan-guard-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        conn.execute(
-            "INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)",
-            params![repo_id, "plan-guard-c1"],
-        )
-        .expect("insert c1");
-        conn.execute(
-            "INSERT INTO commits (repo_id, sha) VALUES (?1, ?2)",
-            params![repo_id, "plan-guard-c2"],
-        )
-        .expect("insert c2");
-        let c1_rowid: i64 = conn
-            .query_row(
-                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
-                params![repo_id, "plan-guard-c1"],
-                |row| row.get(0),
-            )
-            .expect("fetch c1 rowid");
-        let c2_rowid: i64 = conn
-            .query_row(
-                "SELECT commit_id FROM commits WHERE repo_id = ?1 AND sha = ?2",
-                params![repo_id, "plan-guard-c2"],
-                |row| row.get(0),
-            )
-            .expect("fetch c2 rowid");
-        conn.execute(
-            "INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id) VALUES (?1, ?2, ?3)",
-            params![repo_id, c2_rowid, c1_rowid],
-        )
-        .expect("insert c2->c1 edge");
-
-        verify_sqlite_graph_query_plan_guards(&conn, repo_id)
-            .expect("sqlite graph query plan guard");
-    }
-
-    #[test]
-    fn enrichment_failures_retry_until_terminal_failed() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            ["/tmp/retry-repo", "retry-repo", "/tmp/retry-repo/.git"],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/retry-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let file_changes = vec![ParsedFileChange {
-            commit_sha: "retry-sha".to_string(),
-            file_path: "retry.txt".to_string(),
-            additions: None,
-            deletions: None,
-            change_type: "modify".to_string(),
-            stats_state: FileChangeStatsState::Pending,
-            requires_line_stats: true,
-        }];
-        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert pending file change");
-        enqueue_file_changes_for_enrichment(&conn, repo_id, &file_changes)
-            .expect("enqueue pending file change");
-
-        for attempt in 1..=FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS {
-            let pending = load_pending_file_change_enrichment(&conn, repo_id, 8)
-                .expect("load pending for retry attempt");
-            assert_eq!(pending.len(), 1, "expected one pending row for attempt");
-            mark_file_change_enrichment_failed(&conn, repo_id, &pending, "retryable failure")
-                .expect("record enrichment failure");
-
-            let stats_state: String = conn
-                .query_row(
-                    "SELECT stats_state FROM file_changes WHERE repo_id = ?1 AND commit_sha = ?2 AND file_path = ?3",
-                    params![repo_id, "retry-sha", "retry.txt"],
-                    |row| row.get(0),
-                )
-                .expect("load stats state");
-            if attempt < FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS {
-                assert_eq!(stats_state, "pending");
-                conn.execute(
-                    "UPDATE file_change_enrichment_queue SET enqueued_at_epoch = ?1 WHERE repo_id = ?2 AND commit_sha = ?3 AND file_path = ?4",
-                    params![
-                        now_epoch_seconds().saturating_sub(1),
-                        repo_id,
-                        "retry-sha",
-                        "retry.txt"
-                    ],
-                )
-                .expect("force retry queue due timestamp");
-            } else {
-                assert_eq!(stats_state, "failed");
-            }
-        }
-
-        let pending_final = load_pending_file_change_enrichment(&conn, repo_id, 8)
-            .expect("load pending after terminal failure");
-        assert!(pending_final.is_empty());
-    }
-
-    #[test]
-    fn enrichment_retry_cooldown_gates_pending_pickup() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/retry-cooldown-repo",
-                "retry-cooldown-repo",
-                "/tmp/retry/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/retry-cooldown-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let file_changes = vec![ParsedFileChange {
-            commit_sha: "retry-cooldown-sha".to_string(),
-            file_path: "retry-cooldown.txt".to_string(),
-            additions: None,
-            deletions: None,
-            change_type: "modify".to_string(),
-            stats_state: FileChangeStatsState::Pending,
-            requires_line_stats: true,
-        }];
-        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert pending file change");
-        enqueue_file_changes_for_enrichment(&conn, repo_id, &file_changes)
-            .expect("enqueue pending file change");
-
-        let pending_before = load_pending_file_change_enrichment(&conn, repo_id, 8)
-            .expect("load pending before failure");
-        assert_eq!(pending_before.len(), 1);
-
-        let before_failure_epoch = now_epoch_seconds();
-        mark_file_change_enrichment_failed(
-            &conn,
-            repo_id,
-            &pending_before,
-            "transient enrichment failure",
-        )
-        .expect("record transient enrichment failure");
-
-        let pending_immediate = load_pending_file_change_enrichment(&conn, repo_id, 8)
-            .expect("load pending immediately after failure");
-        assert!(
-            pending_immediate.is_empty(),
-            "cooldown gate should defer immediate retry pickup"
-        );
-
-        let (attempts, last_error, enqueued_at_epoch): (i64, Option<String>, i64) = conn
-            .query_row(
-                "SELECT attempts, last_error, enqueued_at_epoch FROM file_change_enrichment_queue WHERE repo_id = ?1 AND commit_sha = ?2 AND file_path = ?3",
-                params![repo_id, "retry-cooldown-sha", "retry-cooldown.txt"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("load queue row after first failure");
-        assert_eq!(attempts, 1);
-        assert!(last_error.is_some());
-        assert!(
-            enqueued_at_epoch
-                >= before_failure_epoch
-                    .saturating_add(FILE_CHANGE_ENRICHMENT_RETRY_BASE_DELAY_SECONDS),
-            "enqueued_at_epoch should include retry cooldown delay"
-        );
-
-        conn.execute(
-            "UPDATE file_change_enrichment_queue SET enqueued_at_epoch = ?1 WHERE repo_id = ?2 AND commit_sha = ?3 AND file_path = ?4",
-            params![
-                now_epoch_seconds().saturating_sub(1),
-                repo_id,
-                "retry-cooldown-sha",
-                "retry-cooldown.txt"
-            ],
-        )
-        .expect("force queue row due");
-
-        let pending_after_cooldown = load_pending_file_change_enrichment(&conn, repo_id, 8)
-            .expect("load pending after cooldown");
-        assert_eq!(pending_after_cooldown.len(), 1);
-    }
-
-    #[test]
-    fn enqueue_resets_attempts_for_reindexed_rows() {
-        let mut conn = Connection::open_in_memory().expect("open memory db");
-        run_migrations(&mut conn).expect("migration run");
-
-        conn.execute(
-            "INSERT INTO repositories (path, name, git_dir) VALUES (?1, ?2, ?3)",
-            [
-                "/tmp/retry-reset-repo",
-                "retry-reset-repo",
-                "/tmp/retry-reset-repo/.git",
-            ],
-        )
-        .expect("insert repo");
-        let repo_id: i64 = conn
-            .query_row(
-                "SELECT id FROM repositories WHERE path = ?1",
-                ["/tmp/retry-reset-repo"],
-                |row| row.get(0),
-            )
-            .expect("fetch repo id");
-
-        let file_changes = vec![ParsedFileChange {
-            commit_sha: "retry-reset-sha".to_string(),
-            file_path: "retry-reset.txt".to_string(),
-            additions: None,
-            deletions: None,
-            change_type: "modify".to_string(),
-            stats_state: FileChangeStatsState::Pending,
-            requires_line_stats: true,
-        }];
-        upsert_file_changes(&conn, repo_id, &file_changes).expect("insert pending file change");
-        enqueue_file_changes_for_enrichment(&conn, repo_id, &file_changes)
-            .expect("enqueue pending file change");
-
-        for attempt in 1..=FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS {
-            let pending = load_pending_file_change_enrichment(&conn, repo_id, 8)
-                .expect("load pending for retry attempt");
-            assert_eq!(pending.len(), 1);
-            mark_file_change_enrichment_failed(&conn, repo_id, &pending, "persistent failure")
-                .expect("record failure");
-            if attempt < FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS {
-                conn.execute(
-                    "UPDATE file_change_enrichment_queue SET enqueued_at_epoch = ?1 WHERE repo_id = ?2",
-                    params![now_epoch_seconds().saturating_sub(1), repo_id],
-                )
-                .expect("force next retry");
-            }
-        }
-
-        let terminal_state: String = conn
-            .query_row(
-                "SELECT stats_state FROM file_changes WHERE repo_id = ?1 AND commit_sha = ?2 AND file_path = ?3",
-                params![repo_id, "retry-reset-sha", "retry-reset.txt"],
-                |row| row.get(0),
-            )
-            .expect("load terminal stats state");
-        assert_eq!(terminal_state, "failed");
-
-        let reindexed = vec![ParsedFileChange {
-            commit_sha: "retry-reset-sha".to_string(),
-            file_path: "retry-reset.txt".to_string(),
-            additions: None,
-            deletions: None,
-            change_type: "modify".to_string(),
-            stats_state: FileChangeStatsState::Pending,
-            requires_line_stats: true,
-        }];
-        upsert_file_changes(&conn, repo_id, &reindexed).expect("upsert reindexed pending row");
-        enqueue_file_changes_for_enrichment(&conn, repo_id, &reindexed)
-            .expect("re-enqueue after reindex");
-
-        let (attempts, last_error): (i64, Option<String>) = conn
-            .query_row(
-                "SELECT attempts, last_error FROM file_change_enrichment_queue WHERE repo_id = ?1 AND commit_sha = ?2 AND file_path = ?3",
-                params![repo_id, "retry-reset-sha", "retry-reset.txt"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("load queue row after re-enqueue");
-        assert_eq!(attempts, 0);
-        assert!(last_error.is_none());
-    }
-
-    fn primary_key_columns(conn: &Connection, table_name: &str) -> Vec<String> {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table_name})"))
-            .expect("prepare table_info");
-        let mapped = stmt
-            .query_map([], |row| {
-                let name: String = row.get(1)?;
-                let pk_pos: i64 = row.get(5)?;
-                Ok((name, pk_pos))
-            })
-            .expect("query table_info");
-
-        let mut pairs = Vec::new();
-        for row in mapped {
-            let (name, pk_pos) = row.expect("read row");
-            if pk_pos > 0 {
-                pairs.push((pk_pos, name));
-            }
-        }
-        pairs.sort_by_key(|(pk_pos, _)| *pk_pos);
-        pairs.into_iter().map(|(_, name)| name).collect()
+        let metrics = store
+            .load_file_change_extraction_queue_metrics(repo_id)
+            .unwrap_or_else(|error| panic!("load extraction queue metrics after failure: {error}"));
+        assert_eq!(metrics.depth, 0);
     }
 }

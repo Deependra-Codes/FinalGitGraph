@@ -1,7 +1,7 @@
 # ADR 0007: Bounded Rayon Ingestion Compute with Single-Writer SQLite Contract
 
 Date: 2026-03-07
-Status: Accepted
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-sql.md`)
 
 ## Context
 

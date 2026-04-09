@@ -2,7 +2,7 @@
 
 Version: 2.0  
 Date: 2026-03-06  
-Author: Codex (for final-year project planning)
+Author: Deependra Rathod
 
 ---
 

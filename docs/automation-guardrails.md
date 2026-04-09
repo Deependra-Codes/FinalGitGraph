@@ -69,7 +69,7 @@ Performance automation must not hide where time is spent. Required properties:
 2. `scripts/perf-report.ps1` prints separate build-phase and execute-phase durations.
 3. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits phase-level timing in report output (`phase_timing_ms`), including fixture generation and indexing/query phases.
 4. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits phase memory output (`phase_memory_bytes`) including peak observed RSS.
-5. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits in-memory adjacency hydration and query sections sourced from SQLite persistence.
+5. `apps/desktop/src-tauri/src/bin/perf-report.rs` emits in-memory adjacency hydration and query sections sourced from LMDB-backed persisted state.
 6. `scripts/layer-test-matrix.ps1` must exist and remain runnable through `pnpm run test:layers`.
 7. `package.json` must expose `perf:report:25k` for very-large soak profiling.
 8. CI/local operators can distinguish compile regressions from runtime regressions without manual instrumentation.
@@ -79,6 +79,7 @@ Performance automation must not hide where time is spent. Required properties:
 12. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit file-change stats-state counts (`pending|ready|failed`) and JIT enrichment timing phase.
 13. `scripts/perf-ingestion-budget.ps1` must support warm/cold lanes and enforce diff-share regression checks (`ingest_file_diff_extract_ms / core_end_to_end`).
 14. Warm ingestion lanes must be exposed in `package.json` (`perf:ingestion:25k:warm`, `perf:ingestion:90k:warm`).
+15. `apps/desktop/src-tauri/src/bin/perf-report.rs` must emit commit throughput telemetry by lane/phase (`full|incremental|aggregate`) with bottleneck phase attribution.
 
 ## Non-Goals
 
@@ -102,20 +103,32 @@ Repository-scale indexing guardrails now also enforce:
 3. bounded buffering in `application/indexer.rs` for commit/file-change batches
 4. bounded Rayon chunk parallelism for file-change compute in `adapters/git.rs`
 5. no database dependency in `adapters/git.rs` so DB writes stay single-owner in indexer/db adapters
-6. explicit single transaction boundary in `application/indexer.rs` for ingestion writes
-7. integer edge schema for graph hot paths (`child_commit_id`/`parent_commit_id`) in DB adapter and migrations
-8. no SHA edge hot-path queries in `adapters/db.rs`
+6. explicit single-writer ingestion orchestration in `application/indexer.rs` via `GraphStore`
+7. LMDB-backed DB adapter contract in `adapters/db.rs` (rw txn + commit semantics)
+8. persisted CSR graph hot-path contract in `adapters/db.rs` (`parents/children` offsets + neighbors)
 9. bounded rename detection in `adapters/git.rs` (`rename_limit`, `rename_threshold`, `exact_match_only`)
-10. set-based temp-table incremental file-change cleanup in `adapters/db.rs` (no row-by-row delete loop)
+10. prefix-set incremental file-change cleanup in `adapters/db.rs` (no SQL temp-table/delete-loop path)
 11. ingestion phase telemetry contract in perf report (`ingest_commit_walk_ms`, `ingest_file_diff_extract_ms`, `ingest_file_change_upsert_ms`, `ingest_tx_commit_ms`)
 12. lazy two-stage diff extraction in `adapters/git.rs` (`diff_requires_line_stats` + selective `Patch::from_diff` line stats)
 13. adaptive-but-bounded Rayon planning in `adapters/git.rs` for chunk/channel sizing (`parallel_file_change_plan`)
 14. metadata-only file-change hot ingestion mode in `adapters/git.rs` with selective JIT line-stats enrichment path
-15. file-change stats-state + queue persistence contract in DB/migrations (`stats_state`, `file_change_enrichment_queue`)
+15. file-change stats-state + retryable enrichment-queue persistence contract in LMDB (`stats_state`, `enrichment_queue`)
 16. retryable enrichment scheduling in `adapters/db.rs` (`attempts`, `last_error`, delayed `enqueued_at_epoch`, terminal `failed` at max attempts)
 17. dedicated bounded Rayon pool + adaptive incremental-friendly parallel threshold in `adapters/git.rs` (`GITGRAPH_FILE_CHANGE_PARALLEL_THREADS`, `GITGRAPH_FILE_CHANGE_PARALLEL_MIN_COMMITS`)
+18. no legacy SQL runtime modules in `application/*` (`graph_queries.rs`, `query_graph_cache.rs`, `indexer_pipeline.rs`)
+19. no SQL migration files under `apps/desktop/src-tauri/migrations`
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
+
+## Policy and Sync Guardrails
+
+To prevent process drift in AI-assisted development, guardrails also enforce:
+
+1. required standards docs under `docs/standards`
+2. required section structure in each standards doc
+3. `docs/standards/README.md` index sync with standards files
+4. `docs/adr/README.md` index sync with all existing ADR files
+5. presence of `docs/ai-change-survival-playbook.md` referenced by `AGENTS.md`
 
 ## References
 

@@ -250,28 +250,18 @@ if (-not (Test-Path $srcRoot)) {
         Add-Failure "Lint-suppression duct-tape attributes are blocked in Rust source tree: $($formatted -join ", ")"
     }
 
-    $graphQueriesPath = Join-Path $srcRoot "application/graph_queries.rs"
-    if (Test-Path $graphQueriesPath) {
-        $stringHeavyPatterns = @(
-            'HashSet<String>',
-            'HashMap<String,\s*String>',
-            'VecDeque<String>'
-        )
-        $stringHeavyMatches = @()
-        foreach ($pattern in $stringHeavyPatterns) {
-            $hits = Select-String -Path $graphQueriesPath -Pattern $pattern
-            if ($hits) {
-                $stringHeavyMatches += $hits
-            }
-        }
-
-        if ($stringHeavyMatches.Count -eq 0) {
-            Add-Pass "Graph query engine avoids String-heavy frontier state."
-        } else {
-            $sample = $stringHeavyMatches | Select-Object -First 10
-            $formatted = $sample | ForEach-Object { "$($_.Path):$($_.LineNumber)" }
-            Add-Failure "Graph query engine must use integer frontier state. Found String-heavy patterns at: $($formatted -join ", ")"
-        }
+    $legacySqlRuntimeFiles = @(
+        "application/graph_queries.rs",
+        "application/query_graph_cache.rs",
+        "application/indexer_pipeline.rs"
+    )
+    $presentLegacySqlRuntimeFiles = $legacySqlRuntimeFiles | Where-Object {
+        Test-Path (Join-Path $srcRoot $_)
+    }
+    if ($presentLegacySqlRuntimeFiles.Count -eq 0) {
+        Add-Pass "No legacy SQL runtime modules remain in application layer."
+    } else {
+        Add-Failure "Legacy SQL runtime modules must not exist: $($presentLegacySqlRuntimeFiles -join ", ")"
     }
 
     $gitAdapterPath = Join-Path $srcRoot "adapters/git.rs"
@@ -425,87 +415,176 @@ if (-not (Test-Path $srcRoot)) {
         }
 
         if (
-            (Select-String -Path $indexerPath -Pattern 'let tx = conn\.transaction\(\)\?;' -Quiet) -and
-            (Select-String -Path $indexerPath -Pattern 'tx\.commit\(\)\?;' -Quiet)
+            (Select-String -Path $indexerPath -Pattern 'let store = open_store\(' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'store\.persist_commits\(' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'store\.persist_file_changes\(' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'store\.synchronize_refs\(' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'store\.rebuild_csr_snapshot\(' -Quiet)
         ) {
-            Add-Pass "Indexer keeps single-writer transaction boundary for ingestion writes."
+            Add-Pass "Indexer keeps single-writer ingestion orchestration through GraphStore (LMDB + CSR)."
         } else {
-            Add-Failure "Indexer must keep explicit single-writer transaction boundary for ingestion writes."
+            Add-Failure "Indexer must orchestrate ingestion writes through GraphStore (`persist_commits`, `persist_file_changes`, `synchronize_refs`, `rebuild_csr_snapshot`)."
+        }
+
+        if (
+            (Select-String -Path $indexerPath -Pattern 'type NodeId = usize' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'struct DenseSet' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'load_graph_snapshot_state' -Quiet) -and
+            (Select-String -Path $indexerPath -Pattern 'QueryGraph::from_graph_state' -Quiet)
+        ) {
+            Add-Pass "Indexer query hot path keeps integer-based CSR traversal state with bounded overlay hydration."
+        } else {
+            Add-Failure "Indexer query hot path must keep integer-based CSR traversal state with overlay-aware hydration (`NodeId`, `DenseSet`, `load_graph_snapshot_state`, `QueryGraph::from_graph_state`)."
         }
     }
 
     $dbAdapterPath = Join-Path $srcRoot "adapters/db.rs"
     if (Test-Path $dbAdapterPath) {
         if (
-            (Select-String -Path $dbAdapterPath -Pattern 'child_commit_id' -Quiet) -and
-            (Select-String -Path $dbAdapterPath -Pattern 'parent_commit_id' -Quiet)
+            (Select-String -Path $dbAdapterPath -Pattern 'use lmdb::' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'pub struct GraphStore' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'begin_rw_txn' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'txn\.commit\(\)\?;' -Quiet)
         ) {
-            Add-Pass "DB adapter uses integer edge columns for graph neighbor hot paths."
+            Add-Pass "DB adapter keeps LMDB transaction-backed GraphStore contract."
         } else {
-            Add-Failure "DB adapter must use integer edge columns (`child_commit_id` / `parent_commit_id`) for graph neighbor hot paths."
-        }
-
-        if (Select-String -Path $dbAdapterPath -Pattern '\bchild_sha\b|\bparent_sha\b' -Quiet) {
-            Add-Failure "DB adapter must not use SHA edge columns in graph hot-path queries."
-        } else {
-            Add-Pass "DB adapter avoids SHA edge columns in graph hot-path queries."
-        }
-
-        if (Select-String -Path $dbAdapterPath -Pattern 'DELETE FROM file_changes WHERE repo_id = \?1 AND commit_sha = \?2' -Quiet) {
-            Add-Failure "DB adapter must not use row-by-row file-change delete loop in hot incremental path."
-        } else {
-            Add-Pass "DB adapter avoids row-by-row file-change delete loop in hot incremental path."
-        }
-
-        if (Select-String -Path $dbAdapterPath -Pattern 'current_pending_file_change_delete_shas' -Quiet) {
-            Add-Pass "DB adapter uses set-based pending SHA delete table for incremental file-change cleanup."
-        } else {
-            Add-Failure "DB adapter must use set-based pending SHA delete table for incremental file-change cleanup."
+            Add-Failure "DB adapter must keep LMDB GraphStore transaction contract (`lmdb`, `begin_rw_txn`, `txn.commit`)."
         }
 
         if (
-            (Select-String -Path $dbAdapterPath -Pattern 'stats_state' -Quiet) -and
-            (Select-String -Path $dbAdapterPath -Pattern 'file_change_enrichment_queue' -Quiet)
+            (Select-String -Path $dbAdapterPath -Pattern 'pub struct CsrSnapshot' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'parents_offsets' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'parents_neighbors' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'children_offsets' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'children_neighbors' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'rebuild_csr_snapshot' -Quiet)
         ) {
-            Add-Pass "DB adapter enforces file-change stats_state contract and enrichment queue persistence."
+            Add-Pass "DB adapter keeps persisted CSR snapshot contract for graph hot paths."
         } else {
-            Add-Failure "DB adapter must enforce file-change stats_state contract and enrichment queue persistence."
+            Add-Failure "DB adapter must keep persisted CSR snapshot contract (`CsrSnapshot` + `rebuild_csr_snapshot`)."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'GraphSnapshotMetadata' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'graph_snapshot_metadata' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'load_graph_snapshot_state' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps explicit graph snapshot metadata/versioning contract."
+        } else {
+            Add-Failure "DB adapter must keep explicit graph snapshot metadata/versioning contract."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'delta_log' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'append_delta_event' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'META_NEXT_DELTA_SEQUENCE' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps append-only delta mutation log contract."
+        } else {
+            Add-Failure "DB adapter must keep append-only delta mutation log contract."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'graph_overlay_parent_rows' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'graph_overlay_child_rows' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'persist_graph_overlay_commits' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'compact_graph_overlay_into_snapshot' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'should_compact_graph_overlay' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps bounded graph overlay adjacency plus compaction contract."
+        } else {
+            Add-Failure "DB adapter must keep bounded graph overlay adjacency plus compaction contract."
+        }
+
+        if (Select-String -Path $dbAdapterPath -Pattern '\brusqlite::\b|SELECT\s+|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|CREATE\s+TABLE' -Quiet) {
+            Add-Failure "DB adapter must remain no-SQL (no rusqlite imports or SQL statements)."
+        } else {
+            Add-Pass "DB adapter remains no-SQL (LMDB-only runtime contract)."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'fn delete_file_changes_for_commits' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'repository_commit_file_change_prefix' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'delete_prefixed_entries' -Quiet)
+        ) {
+            Add-Pass "DB adapter uses prefix-set cleanup for incremental file-change deletion."
+        } else {
+            Add-Failure "DB adapter must keep prefix-set cleanup path for incremental file-change deletion."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'FileChangeStatsState' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'enrichment_queue' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'mark_file_change_enrichment_failed' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'FILE_CHANGE_ENRICHMENT_MAX_ATTEMPTS' -Quiet)
+        ) {
+            Add-Pass "DB adapter enforces file-change stats-state and retryable enrichment queue contract."
+        } else {
+            Add-Failure "DB adapter must enforce stats-state + retryable enrichment queue contract."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'EnvironmentFlags' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'resolve_lmdb_runtime_options' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'LmdbRuntimeOptions' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'effective_map_size_bytes' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'GITGRAPH_LMDB_NO_READAHEAD' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'GITGRAPH_LMDB_WRITE_MAP' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'GITGRAPH_LMDB_MAP_ASYNC' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'GITGRAPH_LMDB_NO_MEM_INIT' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps centralized LMDB mmap/runtime flag parsing and map-size flooring."
+        } else {
+            Add-Failure "DB adapter must keep centralized LMDB mmap/runtime flag parsing and map-size flooring (`LmdbRuntimeOptions` + validated env flags + `effective_map_size_bytes`)."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'commit_window_index' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'load_commit_window' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'for_each_prefixed_cursor_from' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'MDB_SET_RANGE' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps commit-window hot path on index/range-seek reads."
+        } else {
+            Add-Failure "DB adapter must keep commit-window hot path on index/range-seek reads."
+        }
+
+        if (
+            (Select-String -Path $dbAdapterPath -Pattern 'enrichment_due_index' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'load_pending_file_change_enrichment_internal' -Quiet) -and
+            (Select-String -Path $dbAdapterPath -Pattern 'parse_due_index_identity_from_prefixed_key' -Quiet)
+        ) {
+            Add-Pass "DB adapter keeps due-index ordered enrichment acquisition path."
+        } else {
+            Add-Failure "DB adapter must keep due-index ordered enrichment acquisition path."
         }
     }
 }
 
-$integerEdgeMigrationPath = Join-Path $repoRoot "apps/desktop/src-tauri/migrations/0004_integer_commit_edges.sql"
-if (Test-Path $integerEdgeMigrationPath) {
-    if (
-        (Select-String -Path $integerEdgeMigrationPath -Pattern 'commit_id INTEGER PRIMARY KEY' -Quiet) -and
-        (Select-String -Path $integerEdgeMigrationPath -Pattern 'child_commit_id' -Quiet) -and
-        (Select-String -Path $integerEdgeMigrationPath -Pattern 'parent_commit_id' -Quiet)
-    ) {
-        Add-Pass "Integer-edge migration contract present."
+$legacyMigrationRoot = Join-Path $repoRoot "apps/desktop/src-tauri/migrations"
+if (Test-Path $legacyMigrationRoot) {
+    $legacySqlMigrations = Get-ChildItem -Path $legacyMigrationRoot -File -Filter "*.sql"
+    if ($legacySqlMigrations.Count -eq 0) {
+        Add-Pass "No legacy SQL migration files remain in runtime repository."
     } else {
-        Add-Failure "Integer-edge migration must define stable commit_id and integer edge columns."
+        $migrationNames = $legacySqlMigrations | Select-Object -ExpandProperty Name
+        Add-Failure "Legacy SQL migration files must be removed for LMDB runtime: $($migrationNames -join ", ")"
     }
 } else {
-    Add-Failure "Missing integer-edge migration file: apps/desktop/src-tauri/migrations/0004_integer_commit_edges.sql"
-}
-
-$fileChangeEnrichmentMigrationPath = Join-Path $repoRoot "apps/desktop/src-tauri/migrations/0005_file_change_enrichment_queue.sql"
-if (Test-Path $fileChangeEnrichmentMigrationPath) {
-    if (
-        (Select-String -Path $fileChangeEnrichmentMigrationPath -Pattern 'stats_state' -Quiet) -and
-        (Select-String -Path $fileChangeEnrichmentMigrationPath -Pattern 'file_change_enrichment_queue' -Quiet)
-    ) {
-        Add-Pass "File-change enrichment migration contract present."
-    } else {
-        Add-Failure "File-change enrichment migration must define stats_state and queue table contract."
-    }
-} else {
-    Add-Failure "Missing file-change enrichment migration file: apps/desktop/src-tauri/migrations/0005_file_change_enrichment_queue.sql"
+    Add-Pass "Legacy SQL migrations directory removed for LMDB runtime."
 }
 
 $requiredDocs = @(
     "docs/engineering-system.md",
     "docs/from-scratch-system.md",
+    "docs/ai-change-survival-playbook.md",
+    "docs/standards/README.md",
+    "docs/standards/AGENT_GUARDRAIL_SYSTEM.md",
+    "docs/standards/ENGINEERING_EXECUTION_POLICY.md",
+    "docs/standards/PERFORMANCE_AND_COMPLEXITY_DISCIPLINE.md",
+    "docs/standards/REPO_SYNC_POLICY.md",
+    "docs/standards/TYPE_TDD_SPEC_AGENTIC_DISCIPLINE.md",
+    "docs/standards/DOCS_INTENT_RESEARCH_PATTERN.md",
     "docs/adr/README.md",
     "docs/adr/0006-streaming-libgit2-ingestion.md",
     "docs/adr/0007-bounded-rayon-ingestion-compute-single-writer-db.md",
@@ -514,6 +593,8 @@ $requiredDocs = @(
     "docs/adr/0010-bounded-rename-detection-and-ingestion-phase-telemetry.md",
     "docs/adr/0011-core-file-change-ingestion-and-jit-enrichment.md",
     "docs/adr/0012-gitoxide-ingestion-adapter-migration.md",
+    "docs/adr/0015-lmdb-csr-delta-storage-no-sql.md",
+    "docs/adr/0016-overlay-adjacency-and-lmdb-map-flooring.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
 )
@@ -655,6 +736,105 @@ if (Test-Path $perfBudgetPath) {
     }
 }
 
+$standardsRoot = Join-Path $repoRoot "docs/standards"
+$requiredStandardsFiles = @(
+    "AGENT_GUARDRAIL_SYSTEM.md",
+    "ENGINEERING_EXECUTION_POLICY.md",
+    "PERFORMANCE_AND_COMPLEXITY_DISCIPLINE.md",
+    "REPO_SYNC_POLICY.md",
+    "TYPE_TDD_SPEC_AGENTIC_DISCIPLINE.md",
+    "DOCS_INTENT_RESEARCH_PATTERN.md"
+)
+
+$standardsSectionRequirements = @{
+    "AGENT_GUARDRAIL_SYSTEM.md" = @(
+        "## Why This Exists",
+        "## One-Line Policy",
+        "## Required Behavior",
+        "## Anti-Patterns",
+        "## Enforcement"
+    )
+    "ENGINEERING_EXECUTION_POLICY.md" = @(
+        "## Why This Exists",
+        "## One-Line Policy",
+        "## Change Classes",
+        "## Required Loop",
+        "## Anti-Patterns"
+    )
+    "PERFORMANCE_AND_COMPLEXITY_DISCIPLINE.md" = @(
+        "## Why This Exists",
+        "## One-Line Policy",
+        "## Core Rules",
+        "## Expected Artifacts For Scale-Sensitive Changes"
+    )
+    "REPO_SYNC_POLICY.md" = @(
+        "## Why This Exists",
+        "## One-Line Policy",
+        "## Canonical To Derived Map",
+        "## Sync Rules",
+        "## Enforcement"
+    )
+    "TYPE_TDD_SPEC_AGENTIC_DISCIPLINE.md" = @(
+        "## Why This Exists",
+        "## Core Doctrine",
+        "## Type-Driven Rules",
+        "## TDD Rules",
+        "## Spec Rules",
+        "## Agentic Loop"
+    )
+    "DOCS_INTENT_RESEARCH_PATTERN.md" = @(
+        "## Core Rule",
+        "## Lifecycle",
+        "## Quality Rules"
+    )
+}
+
+$standardsReadmePath = Join-Path $standardsRoot "README.md"
+if (Test-Path $standardsReadmePath) {
+    $standardsReadmeContent = Get-Content -Path $standardsReadmePath -Raw
+    foreach ($standardsFile in $requiredStandardsFiles) {
+        if ($standardsReadmeContent -match [regex]::Escape($standardsFile)) {
+            Add-Pass "Standards index includes: $standardsFile"
+        } else {
+            Add-Failure "docs/standards/README.md must list $standardsFile"
+        }
+    }
+}
+
+foreach ($standardsFile in $requiredStandardsFiles) {
+    $standardsFilePath = Join-Path $standardsRoot $standardsFile
+    if (-not (Test-Path $standardsFilePath)) {
+        continue
+    }
+
+    $content = Get-Content -Path $standardsFilePath -Raw
+    $requiredSections = $standardsSectionRequirements[$standardsFile]
+    foreach ($requiredSection in $requiredSections) {
+        if ($content -match [regex]::Escape($requiredSection)) {
+            Add-Pass "Standards section present: ${standardsFile} -> ${requiredSection}"
+        } else {
+            Add-Failure "Standards file ${standardsFile} is missing required section ${requiredSection}"
+        }
+    }
+}
+
+$adrReadmePath = Join-Path $repoRoot "docs/adr/README.md"
+$adrDirectory = Join-Path $repoRoot "docs/adr"
+if ((Test-Path $adrReadmePath) -and (Test-Path $adrDirectory)) {
+    $adrReadmeContent = Get-Content -Path $adrReadmePath -Raw
+    $adrFiles = Get-ChildItem -Path $adrDirectory -File -Filter "*.md" |
+        Where-Object { $_.Name -ne "README.md" } |
+        Sort-Object -Property Name
+
+    foreach ($adrFile in $adrFiles) {
+        if ($adrReadmeContent -match [regex]::Escape($adrFile.Name)) {
+            Add-Pass "ADR index references: $($adrFile.Name)"
+        } else {
+            Add-Failure "docs/adr/README.md must reference ADR file $($adrFile.Name)"
+        }
+    }
+}
+
 $perfReportScriptPath = Join-Path $repoRoot "scripts/perf-report.ps1"
 if (Test-Path $perfReportScriptPath) {
     $hasProbeMode = Select-String -Path $perfReportScriptPath -Pattern '\[switch\]\$ProbeOnly' -Quiet
@@ -728,6 +908,12 @@ if (Test-Path $perfReportBinaryPath) {
     $hasIngestDiffExtractField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_diff_extract_ms' -Quiet
     $hasIngestUpsertField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_file_change_upsert_ms' -Quiet
     $hasIngestTxCommitField = Select-String -Path $perfReportBinaryPath -Pattern 'ingest_tx_commit_ms' -Quiet
+    $hasFullCommitThroughputField = Select-String -Path $perfReportBinaryPath -Pattern 'full_commit_throughput_per_sec' -Quiet
+    $hasIncrementalCommitThroughputField = Select-String -Path $perfReportBinaryPath -Pattern 'incremental_commit_throughput_per_sec' -Quiet
+    $hasAggregateCommitThroughputField = Select-String -Path $perfReportBinaryPath -Pattern 'aggregate_commit_throughput_per_sec' -Quiet
+    $hasFullCommitBottleneckField = Select-String -Path $perfReportBinaryPath -Pattern 'full_commit_bottleneck_phase' -Quiet
+    $hasIncrementalCommitBottleneckField = Select-String -Path $perfReportBinaryPath -Pattern 'incremental_commit_bottleneck_phase' -Quiet
+    $hasAggregateCommitBottleneckField = Select-String -Path $perfReportBinaryPath -Pattern 'aggregate_commit_bottleneck_phase' -Quiet
 
     if (
         $hasPhaseTimingSection -and
@@ -742,11 +928,17 @@ if (Test-Path $perfReportBinaryPath) {
         $hasIngestCommitWalkField -and
         $hasIngestDiffExtractField -and
         $hasIngestUpsertField -and
-        $hasIngestTxCommitField
+        $hasIngestTxCommitField -and
+        $hasFullCommitThroughputField -and
+        $hasIncrementalCommitThroughputField -and
+        $hasAggregateCommitThroughputField -and
+        $hasFullCommitBottleneckField -and
+        $hasIncrementalCommitBottleneckField -and
+        $hasAggregateCommitBottleneckField
     ) {
-        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency + JIT/stats-state + ingestion-phase visibility contract."
+        Add-Pass "Performance report binary emits phase timing + memory + in-memory adjacency + JIT/stats-state + ingestion-phase + commit-throughput bottleneck visibility contract."
     } else {
-        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency, JIT/stats-state, and ingestion-phase fields."
+        Add-Failure "Performance report binary must emit phase timing + memory visibility contract, including in-memory adjacency, JIT/stats-state, ingestion-phase fields, and commit-throughput bottleneck telemetry."
     }
 }
 

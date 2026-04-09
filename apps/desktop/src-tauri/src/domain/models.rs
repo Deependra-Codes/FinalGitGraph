@@ -133,9 +133,13 @@ pub struct IndexingStats {
     pub commits_indexed: usize,
     pub edges_indexed: usize,
     pub file_changes_indexed: usize,
+    pub file_change_commits_enqueued: usize,
+    pub file_change_queue_depth_after_index: usize,
+    pub file_change_queue_oldest_age_seconds: i64,
     pub refs_indexed: usize,
     pub indexed_at_epoch: i64,
     pub ingestion_phase_timing_ms: IngestionPhaseTimingMs,
+    pub commit_throughput: CommitThroughputTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -223,10 +227,38 @@ pub struct IngestionPhaseTimingMs {
     pub extraction_worker_aborts: f64,
     pub file_change_delete: f64,
     pub file_change_upsert: f64,
+    pub jit_enrich_coscheduled: f64,
     pub tx_commit: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CommitThroughputTelemetry {
+    pub commits_seen: usize,
+    pub commits_indexed: usize,
+    pub end_to_end_ms: f64,
+    pub commits_per_sec_seen: f64,
+    pub commits_per_sec_indexed: f64,
+    pub ms_per_commit_seen: f64,
+    pub ms_per_commit_indexed: f64,
+    pub commit_walk_scope: String,
+    pub commit_walk_tip_count: usize,
+    pub commit_walk_pruned_parent_expansions: usize,
+    pub commit_walk_ms: f64,
+    pub commit_walk_commits_per_sec_seen: f64,
+    pub commit_upsert_ms: f64,
+    pub commit_upsert_commits_per_sec_seen: f64,
+    pub file_diff_extract_ms: f64,
+    pub file_diff_extract_commits_per_sec_seen: f64,
+    pub file_change_upsert_ms: f64,
+    pub file_change_upsert_commits_per_sec_seen: f64,
+    pub tx_commit_ms: f64,
+    pub tx_commit_commits_per_sec_seen: f64,
+    pub bottleneck_phase: String,
+    pub bottleneck_phase_ms: f64,
+    pub bottleneck_phase_share_of_tracked_time: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitWindowItem {
     pub sha: String,
     pub author_name: String,
@@ -267,7 +299,7 @@ pub struct ShortestPathResponse {
     pub visited_nodes: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexCheckpoint {
     pub last_committer_time: i64,
     pub last_commit_sha: String,
@@ -286,7 +318,7 @@ pub struct ParsedCommit {
     pub subject: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedRef {
     pub ref_name: String,
     pub target_sha: String,

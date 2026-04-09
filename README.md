@@ -11,6 +11,8 @@ This repository now contains the Phase-1 kickoff foundation for GitGraph Lab:
 7. From-scratch operating model in `docs/from-scratch-system.md`
 8. Research log behind decisions in `docs/research-foundations-2026-03-07.md`
 9. GitHub branch protection checklist in `docs/branch-protection-setup.md`
+10. Engineering discipline standards in `docs/standards/README.md`
+11. Architecture-sensitive AI playbook in `docs/ai-change-survival-playbook.md`
 
 ## Quick start
 

@@ -18,6 +18,7 @@
     "perf:report:25k": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-report.ps1 -Cycles 2500 -FeatureCommits 6 -IncrementalCommits 2500 -QueryRuns 20 -WindowLimit 500 -MaxNodes 25000 -OutputPath tmp/perf-report-25k.txt",
     "perf:report:25k:precondition": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-report.ps1 -Cycles 2500 -FeatureCommits 6 -IncrementalCommits 2500 -QueryRuns 20 -WindowLimit 500 -MaxNodes 25000 -PreconditionCommitGraph -OutputPath tmp/perf-report-25k-preconditioned.txt",
     "perf:report:90k": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-report.ps1 -Cycles 9000 -FeatureCommits 6 -IncrementalCommits 9000 -QueryRuns 20 -WindowLimit 1000 -MaxNodes 90000 -PreconditionCommitGraph -OutputPath tmp/perf-report-90k.txt",
+    "perf:ablation:25k": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-ablation.ps1",
     "perf:ingestion:25k": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-ingestion-budget.ps1",
     "perf:ingestion:90k": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-ingestion-budget.ps1 -Profile 90k",
     "perf:ingestion:90k:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/perf-ingestion-budget.ps1 -Profile 90k -FastMode -PreconditionCommitGraph",

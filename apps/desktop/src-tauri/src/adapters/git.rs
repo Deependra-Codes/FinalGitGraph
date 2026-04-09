@@ -1,8 +1,9 @@
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{hash_map::Entry, BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use gix::bstr::ByteSlice;
@@ -13,6 +14,11 @@ use gix::prelude::TreeDiffChangeExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 use gix::Repository;
+use gix_pack::cache::Never as PackDecodeNoCache;
+use gix_pack::data::decode::entry::ResolvedBase as PackResolvedBase;
+use gix_pack::data::entry::Header as PackEntryHeader;
+use gix_pack::data::File as PackDataFile;
+use gix_pack::index::File as PackIndexFile;
 use rayon::prelude::*;
 
 use crate::domain::models::{
@@ -21,7 +27,7 @@ use crate::domain::models::{
 };
 use crate::support::error::{AppError, AppResult};
 
-pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 200;
+pub const FILE_CHANGE_COMMIT_BATCH_SIZE: usize = 1024;
 const FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE: usize = 16;
 const FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE: usize = 4;
 const FILE_CHANGE_PARSE_PARALLEL_TARGET_CHUNKS_PER_WORKER: usize = 2;
@@ -37,7 +43,14 @@ const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_ENV: &str =
     "GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE";
 const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_ENV: &str = "GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY";
 const FILE_CHANGE_DIFF_REPO_API_FALLBACK_ENV: &str = "GITGRAPH_FILE_CHANGE_DIFF_REPO_API";
+const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
+const FILE_CHANGE_RENAME_HOT_PATH_ENV: &str = "GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH";
+const FILE_CHANGE_PARENT_TREE_MEMO_ENV: &str = "GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO";
+const LEVEL3_PACK_AWARE_INGEST_ENV: &str = "GITGRAPH_LEVEL3_PACK_AWARE_INGEST";
+const LEVEL3_TOPO_EXTRACTION_ORDER_ENV: &str = "GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER";
+const LEVEL3_PACK_INDEX_MAX_OBJECTS_ENV: &str = "GITGRAPH_LEVEL3_PACK_INDEX_MAX_OBJECTS";
 const COMMIT_WALK_SORT_ENV: &str = "GITGRAPH_COMMIT_WALK_SORT";
+const COMMIT_WALK_SCOPE_ENV: &str = "GITGRAPH_COMMIT_WALK_SCOPE";
 const INDEX_FAST_MODE_ENV: &str = "GITGRAPH_INDEX_FAST_MODE";
 const FILE_CHANGE_RENAME_LIMIT: usize = 400;
 const FILE_CHANGE_RENAME_THRESHOLD_SMALL: u16 = 60;
@@ -47,6 +60,11 @@ const FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES: u64 = 64 * 1024;
 const FILE_CHANGE_RENAME_LARGE_FILE_BYTES: u64 = 256 * 1024;
 const FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS: usize = 512;
 const FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES: u64 = 1_024 * 1_024;
+const FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT: usize = 200;
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT: usize = 100;
+const FILE_CHANGE_RENAME_LIMIT_LARGE_ENV: &str = "GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE";
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_ENV: &str = "GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE";
+const FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS: usize = 2_048;
 const PATCH_FROM_DIFF_GUARDRAIL_MARKER: &str = "Patch::from_diff";
 const MIN_OBJECT_ID_HEX_LEN: usize = 40;
 const GIX_OBJECT_CACHE_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
@@ -56,12 +74,56 @@ const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT: usize = 64;
 const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT: usize = 32;
 const FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_MAX: usize = 512;
 const FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_MAX: usize = 256;
+const FILE_CHANGE_PARENT_TREE_MEMO_MIN_COMMITS: usize = 8;
+const COMMIT_GRAPH_SIGNATURE: &[u8; 4] = b"CGPH";
+const COMMIT_GRAPH_CHUNK_LOOKUP_HEADER_LEN: usize = 8;
+const COMMIT_GRAPH_CHUNK_LOOKUP_ENTRY_LEN: usize = 12;
+const COMMIT_GRAPH_CHUNK_ID_OIDF: [u8; 4] = *b"OIDF";
+const COMMIT_GRAPH_CHUNK_ID_OIDL: [u8; 4] = *b"OIDL";
+const COMMIT_GRAPH_CHUNK_ID_BIDX: [u8; 4] = *b"BIDX";
+const COMMIT_GRAPH_CHUNK_ID_BDAT: [u8; 4] = *b"BDAT";
+const COMMIT_GRAPH_FANOUT_ENTRY_COUNT: usize = 256;
+const COMMIT_GRAPH_FANOUT_CHUNK_LEN: usize = COMMIT_GRAPH_FANOUT_ENTRY_COUNT * 4;
+const BLOOM_DATA_HEADER_LEN: usize = 12;
+const BLOOM_MURMUR_SEED0: u32 = 0x293a_e76f;
+const BLOOM_MURMUR_SEED1: u32 = 0x7e64_6e2c;
+const BLOOM_HASH_VERSION_GIT_V1: u32 = 1;
+const BLOOM_HASH_VERSION_GIT_V2: u32 = 2;
+const LEVEL3_PACK_INDEX_MAX_OBJECTS_DEFAULT: usize = 500_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitWalkSortMode {
     CommitTimeNewest,
     BreadthFirst,
     CommitTimeCutoff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitWalkBackend {
+    RevisionWalk,
+    PackAwareWired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitWalkScope {
+    Frontier,
+    AllRefs,
+}
+
+impl CommitWalkScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Frontier => "frontier",
+            Self::AllRefs => "all_refs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CommitWalkExecutionStats {
+    pub scope: String,
+    pub tip_count: usize,
+    pub pruned_parent_expansions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +192,132 @@ pub struct CanonicalRepo {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Level3RuntimeOptions {
+    pub pack_aware_ingest: bool,
+    pub topology_aware_extraction: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CommitGraphBloomIndex {
+    layers: Vec<CommitGraphBloomLayer>,
+}
+
+#[derive(Debug, Clone)]
+struct CommitGraphBloomLayer {
+    data: Vec<u8>,
+    oid_fan_offset: usize,
+    oid_lookup_offset: usize,
+    commit_count: usize,
+    hash_len: usize,
+    bloom_index_offset: usize,
+    bloom_data_offset: usize,
+    bloom_data_end: usize,
+    bloom_hash_version: u32,
+    bloom_num_hashes: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BloomFilterView<'a> {
+    bytes: &'a [u8],
+    hash_version: u32,
+    num_hashes: u32,
+}
+
+#[derive(Debug, Default)]
+struct CommitGraphBloomCache {
+    by_git_dir: HashMap<PathBuf, Option<Arc<CommitGraphBloomIndex>>>,
+}
+
+#[derive(Default)]
+struct CommitGraphMetadataCache {
+    by_git_dir: HashMap<PathBuf, Option<Arc<gix::commitgraph::Graph>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrehashedBloomProbe {
+    hash0_v1: u32,
+    hash1_v1: u32,
+    hash0_v2: u32,
+    hash1_v2: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PathBloomProbePlan {
+    prehashed_keys: Vec<PrehashedBloomProbe>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackObjectLocation {
+    pack_slot: usize,
+    pack_offset: u64,
+}
+
+struct PackBundle {
+    index: PackIndexFile,
+    pack: PackDataFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackFileFingerprint {
+    idx_path: PathBuf,
+    idx_len: u64,
+    idx_modified_seconds: u64,
+    pack_path: PathBuf,
+    pack_len: u64,
+    pack_modified_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackTraversalFingerprint {
+    entries: Vec<PackFileFingerprint>,
+}
+
+#[derive(Debug, Clone)]
+struct PackAwareCommitRecord {
+    parsed: ParsedCommit,
+    parent_ids: Vec<ObjectId>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPackTraversalMetadata {
+    fingerprint: PackTraversalFingerprint,
+    total_objects: usize,
+    pack_paths: Vec<(PathBuf, PathBuf)>,
+    object_locations: HashMap<ObjectId, PackObjectLocation>,
+}
+
+#[derive(Debug, Default)]
+struct PackTraversalMetadataCache {
+    by_git_dir: HashMap<PathBuf, CachedPackTraversalMetadata>,
+}
+
+struct PackAwareTraversalState {
+    packs: Vec<PackBundle>,
+    object_locations: HashMap<ObjectId, PackObjectLocation>,
+    commit_cache: HashMap<ObjectId, PackAwareCommitRecord>,
+    missing_commits: HashSet<ObjectId>,
+}
+
+#[derive(Debug, Default)]
+struct RepoPathProbeDictionary {
+    next_path_id: u32,
+    path_id_by_normalized_path: HashMap<String, u32>,
+    probe_by_path_id: HashMap<u32, Arc<PathBloomProbePlan>>,
+}
+
+#[derive(Debug, Default)]
+struct PathProbeDictionaryCache {
+    by_git_dir: HashMap<PathBuf, RepoPathProbeDictionary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedPathDecision {
+    Touched,
+    NotTouched,
+    Unknown,
+}
+
 pub fn validate_repository(path: &Path) -> AppResult<CanonicalRepo> {
     if !path.exists() {
         return Err(AppError::PathNotFound(path.display().to_string()));
@@ -168,7 +356,7 @@ pub fn stream_commits(
     repo_root: &Path,
     since_epoch: Option<i64>,
     on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<CommitWalkExecutionStats> {
     stream_commits_with_hide(repo_root, since_epoch, None, on_commit)
 }
 
@@ -176,19 +364,14 @@ pub fn stream_commits_with_hide(
     repo_root: &Path,
     since_epoch: Option<i64>,
     hide_ancestor_sha: Option<&str>,
-    mut on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
-) -> AppResult<()> {
-    walk_commits(
-        repo_root,
-        since_epoch,
-        hide_ancestor_sha,
-        |_repo, commit| on_commit(build_parsed_commit(commit)),
-    )
+    on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<CommitWalkExecutionStats> {
+    walk_commits(repo_root, since_epoch, hide_ancestor_sha, on_commit)
 }
 
 fn collect_commits(repo_root: &Path, since_epoch: Option<i64>) -> AppResult<Vec<ParsedCommit>> {
     let mut commits = Vec::new();
-    stream_commits(repo_root, since_epoch, |commit| {
+    let _ = stream_commits(repo_root, since_epoch, |commit| {
         commits.push(commit);
         Ok(())
     })?;
@@ -199,14 +382,96 @@ fn walk_commits(
     repo_root: &Path,
     since_epoch: Option<i64>,
     hide_ancestor_sha: Option<&str>,
-    mut on_commit: impl FnMut(&Repository, &gix::Commit<'_>) -> AppResult<()>,
-) -> AppResult<()> {
+    mut on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<CommitWalkExecutionStats> {
     let repo = open_repository(repo_root)?;
-    let tips = collect_revision_tips(&repo)?;
+    let requested_scope = parse_commit_walk_scope();
+    let (tips, effective_scope) = collect_revision_tips(&repo, requested_scope)?;
+    let tip_count = tips.len();
     if tips.is_empty() {
-        return Ok(());
+        return Ok(CommitWalkExecutionStats {
+            scope: effective_scope.as_str().to_string(),
+            tip_count: 0,
+            pruned_parent_expansions: 0,
+        });
     }
 
+    let pruned_parent_expansions = match resolve_commit_walk_backend() {
+        CommitWalkBackend::RevisionWalk => walk_commits_revision(
+            &repo,
+            tips,
+            since_epoch,
+            hide_ancestor_sha,
+            effective_scope,
+            &mut on_commit,
+        )?,
+        CommitWalkBackend::PackAwareWired => walk_commits_pack_aware_wired(
+            &repo,
+            tips,
+            since_epoch,
+            hide_ancestor_sha,
+            effective_scope,
+            &mut on_commit,
+        )?,
+    };
+
+    Ok(CommitWalkExecutionStats {
+        scope: effective_scope.as_str().to_string(),
+        tip_count,
+        pruned_parent_expansions,
+    })
+}
+
+fn walk_commits_pack_aware_wired(
+    repo: &Repository,
+    tips: Vec<ObjectId>,
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
+    walk_scope: CommitWalkScope,
+    on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<usize> {
+    let mut pack_state = match build_pack_aware_traversal_state(repo)? {
+        Some(state) => state,
+        None => {
+            return walk_commits_revision(
+                repo,
+                tips,
+                since_epoch,
+                hide_ancestor_sha,
+                walk_scope,
+                on_commit,
+            );
+        }
+    };
+    if pack_state.object_locations.is_empty() {
+        return walk_commits_revision(
+            repo,
+            tips,
+            since_epoch,
+            hide_ancestor_sha,
+            walk_scope,
+            on_commit,
+        );
+    }
+    walk_commits_from_pack_frontier(
+        repo,
+        tips,
+        since_epoch,
+        hide_ancestor_sha,
+        walk_scope,
+        &mut pack_state,
+        on_commit,
+    )
+}
+
+fn walk_commits_revision(
+    repo: &Repository,
+    tips: Vec<ObjectId>,
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
+    _walk_scope: CommitWalkScope,
+    on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<usize> {
     let mut revwalk = repo
         .rev_walk(tips)
         .sorting(resolve_commit_walk_sorting(since_epoch));
@@ -243,13 +508,404 @@ fn walk_commits(
             }
         }
 
-        on_commit(&repo, &commit)?;
+        on_commit(build_parsed_commit(&commit))?;
+    }
+    Ok(0)
+}
+
+fn walk_commits_from_pack_frontier(
+    repo: &Repository,
+    tips: Vec<ObjectId>,
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
+    walk_scope: CommitWalkScope,
+    pack_state: &mut PackAwareTraversalState,
+    on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<usize> {
+    let mut hidden = HashSet::new();
+    if let Some(hide_sha) = hide_ancestor_sha {
+        let hide_oid = parse_hex_object_id(hide_sha, "parse pack-aware hide commit sha")?;
+        let mut hide_stack = vec![hide_oid];
+        while let Some(oid) = hide_stack.pop() {
+            if !hidden.insert(oid) {
+                continue;
+            }
+            ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+            if let Some(commit) = pack_state.commit_cache.get(&oid) {
+                hide_stack.extend(commit.parent_ids.iter().cloned());
+            }
+        }
     }
 
+    let sort_mode = resolve_commit_walk_sort_mode(since_epoch);
+    let mut pruned_parent_expansions = 0usize;
+    if sort_mode == CommitWalkSortMode::BreadthFirst {
+        let mut queue: VecDeque<ObjectId> = tips.into_iter().collect();
+        let mut emitted = HashSet::new();
+        while let Some(oid) = queue.pop_front() {
+            if !emitted.insert(oid) || hidden.contains(&oid) {
+                continue;
+            }
+            ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+            let Some(commit) = pack_state.commit_cache.get(&oid) else {
+                continue;
+            };
+            let under_since_cutoff = since_epoch
+                .map(|since| commit.parsed.committer_time < since)
+                .unwrap_or(false);
+            if under_since_cutoff && walk_scope == CommitWalkScope::Frontier {
+                pruned_parent_expansions =
+                    pruned_parent_expansions.saturating_add(commit.parent_ids.len());
+                continue;
+            }
+            queue.extend(commit.parent_ids.iter().cloned());
+            if since_epoch
+                .map(|since| commit.parsed.committer_time >= since)
+                .unwrap_or(true)
+            {
+                on_commit(commit.parsed.clone())?;
+            }
+        }
+        return Ok(pruned_parent_expansions);
+    }
+
+    let mut reachable = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = tips.clone();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) || hidden.contains(&oid) {
+            continue;
+        }
+        ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+        let Some(commit) = pack_state.commit_cache.get(&oid) else {
+            continue;
+        };
+        let under_since_cutoff = since_epoch
+            .map(|since| commit.parsed.committer_time < since)
+            .unwrap_or(false);
+        if under_since_cutoff && walk_scope == CommitWalkScope::Frontier {
+            pruned_parent_expansions =
+                pruned_parent_expansions.saturating_add(commit.parent_ids.len());
+            continue;
+        }
+        stack.extend(commit.parent_ids.iter().cloned());
+        reachable.push(oid);
+    }
+
+    let mut ordered = Vec::with_capacity(reachable.len());
+    for oid in reachable {
+        if let Some(commit) = pack_state.commit_cache.get(&oid) {
+            if since_epoch
+                .map(|since| commit.parsed.committer_time >= since)
+                .unwrap_or(true)
+            {
+                ordered.push(commit.parsed.clone());
+            }
+        }
+    }
+    ordered.sort_unstable_by(|left, right| {
+        right
+            .committer_time
+            .cmp(&left.committer_time)
+            .then_with(|| right.sha.cmp(&left.sha))
+    });
+    for commit in ordered {
+        on_commit(commit)?;
+    }
+    Ok(pruned_parent_expansions)
+}
+
+fn ensure_pack_aware_commit_cached(
+    repo: &Repository,
+    pack_state: &mut PackAwareTraversalState,
+    oid: &ObjectId,
+) -> AppResult<()> {
+    if pack_state.commit_cache.contains_key(oid) || pack_state.missing_commits.contains(oid) {
+        return Ok(());
+    }
+
+    if let Some(location) = pack_state.object_locations.get(oid).copied() {
+        if let Some(commit) = decode_pack_aware_commit(repo, pack_state, oid, location)? {
+            pack_state.commit_cache.insert(*oid, commit);
+            return Ok(());
+        }
+    }
+
+    let commit = match repo.find_commit(*oid) {
+        Ok(commit) => commit,
+        Err(_) => {
+            pack_state.missing_commits.insert(*oid);
+            return Ok(());
+        }
+    };
+    let parsed = build_pack_aware_commit_from_commit(&commit);
+    pack_state.commit_cache.insert(*oid, parsed);
     Ok(())
 }
 
-fn collect_revision_tips(repo: &Repository) -> AppResult<Vec<ObjectId>> {
+fn build_pack_aware_traversal_state(
+    repo: &Repository,
+) -> AppResult<Option<PackAwareTraversalState>> {
+    let pack_dir = repo.path().join("objects").join("pack");
+    if !pack_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let object_hash = repo.object_hash();
+    let mut discovered_pack_paths = Vec::new();
+    for dir_entry in fs::read_dir(&pack_dir)? {
+        let dir_entry = dir_entry?;
+        let idx_path = dir_entry.path();
+        if idx_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("idx")
+        {
+            continue;
+        }
+        let pack_path = idx_path.with_extension("pack");
+        if !pack_path.is_file() {
+            continue;
+        }
+        discovered_pack_paths.push((idx_path, pack_path));
+    }
+    discovered_pack_paths.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+    if discovered_pack_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fingerprint_entries = Vec::with_capacity(discovered_pack_paths.len());
+    for (idx_path, pack_path) in &discovered_pack_paths {
+        let idx_meta = fs::metadata(idx_path)?;
+        let pack_meta = fs::metadata(pack_path)?;
+        fingerprint_entries.push(PackFileFingerprint {
+            idx_path: idx_path.clone(),
+            idx_len: idx_meta.len(),
+            idx_modified_seconds: metadata_modified_epoch_seconds(&idx_meta),
+            pack_path: pack_path.clone(),
+            pack_len: pack_meta.len(),
+            pack_modified_seconds: metadata_modified_epoch_seconds(&pack_meta),
+        });
+    }
+    let fingerprint = PackTraversalFingerprint {
+        entries: fingerprint_entries,
+    };
+
+    let cache_key = repo_git_dir_key(repo);
+    static PACK_TRAVERSAL_CACHE: OnceLock<Mutex<PackTraversalMetadataCache>> = OnceLock::new();
+    let cache =
+        PACK_TRAVERSAL_CACHE.get_or_init(|| Mutex::new(PackTraversalMetadataCache::default()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.by_git_dir.get(&cache_key) {
+            if cached.fingerprint == fingerprint {
+                if cached.total_objects > pack_index_max_objects() {
+                    return Ok(None);
+                }
+                let packs =
+                    open_pack_bundles_from_paths(object_hash, cached.pack_paths.as_slice())?;
+                if packs.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(PackAwareTraversalState {
+                    packs,
+                    object_locations: cached.object_locations.clone(),
+                    commit_cache: HashMap::new(),
+                    missing_commits: HashSet::new(),
+                }));
+            }
+        }
+    }
+
+    let mut total_objects = 0usize;
+    let mut packs = Vec::with_capacity(discovered_pack_paths.len());
+    let mut pack_paths = Vec::with_capacity(discovered_pack_paths.len());
+    for (idx_path, pack_path) in discovered_pack_paths {
+        let index = PackIndexFile::at(&idx_path, object_hash).map_err(|error| {
+            AppError::GitCommand(format!(
+                "open pack index for pack-aware traversal at {}: {error}",
+                idx_path.display()
+            ))
+        })?;
+        total_objects = total_objects.saturating_add(index.num_objects() as usize);
+        let pack = PackDataFile::at(&pack_path, object_hash).map_err(|error| {
+            AppError::GitCommand(format!(
+                "open pack data for pack-aware traversal at {}: {error}",
+                pack_path.display()
+            ))
+        })?;
+        pack_paths.push((idx_path, pack_path));
+        packs.push(PackBundle { index, pack });
+    }
+
+    if total_objects > pack_index_max_objects() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.by_git_dir.insert(
+                cache_key,
+                CachedPackTraversalMetadata {
+                    fingerprint,
+                    total_objects,
+                    pack_paths,
+                    object_locations: HashMap::new(),
+                },
+            );
+        }
+        return Ok(None);
+    }
+
+    let mut object_locations = HashMap::new();
+    for (pack_slot, bundle) in packs.iter().enumerate() {
+        for index_entry in bundle.index.iter() {
+            object_locations
+                .entry(index_entry.oid)
+                .or_insert(PackObjectLocation {
+                    pack_slot,
+                    pack_offset: index_entry.pack_offset,
+                });
+        }
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.by_git_dir.insert(
+            cache_key,
+            CachedPackTraversalMetadata {
+                fingerprint,
+                total_objects,
+                pack_paths,
+                object_locations: object_locations.clone(),
+            },
+        );
+    }
+
+    Ok(Some(PackAwareTraversalState {
+        packs,
+        object_locations,
+        commit_cache: HashMap::new(),
+        missing_commits: HashSet::new(),
+    }))
+}
+
+fn open_pack_bundles_from_paths(
+    object_hash: gix::hash::Kind,
+    pack_paths: &[(PathBuf, PathBuf)],
+) -> AppResult<Vec<PackBundle>> {
+    let mut packs = Vec::with_capacity(pack_paths.len());
+    for (idx_path, pack_path) in pack_paths {
+        let index = PackIndexFile::at(idx_path, object_hash).map_err(|error| {
+            AppError::GitCommand(format!(
+                "open cached pack index for pack-aware traversal at {}: {error}",
+                idx_path.display()
+            ))
+        })?;
+        let pack = PackDataFile::at(pack_path, object_hash).map_err(|error| {
+            AppError::GitCommand(format!(
+                "open cached pack data for pack-aware traversal at {}: {error}",
+                pack_path.display()
+            ))
+        })?;
+        packs.push(PackBundle { index, pack });
+    }
+    Ok(packs)
+}
+
+fn metadata_modified_epoch_seconds(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|timestamp| timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn decode_pack_aware_commit(
+    repo: &Repository,
+    pack_state: &PackAwareTraversalState,
+    oid: &ObjectId,
+    location: PackObjectLocation,
+) -> AppResult<Option<PackAwareCommitRecord>> {
+    let Some(bundle) = pack_state.packs.get(location.pack_slot) else {
+        return Ok(None);
+    };
+
+    let pack_entry = bundle.pack.entry(location.pack_offset).map_err(|error| {
+        AppError::GitCommand(format!(
+            "read pack entry at offset {} for {}: {error}",
+            location.pack_offset, oid
+        ))
+    })?;
+    let decode_candidate = matches!(
+        pack_entry.header,
+        PackEntryHeader::Commit
+            | PackEntryHeader::OfsDelta { .. }
+            | PackEntryHeader::RefDelta { .. }
+    );
+    if !decode_candidate {
+        return Ok(None);
+    }
+
+    let mut inflate = gix::features::zlib::Inflate::default();
+    let mut delta_cache = PackDecodeNoCache;
+    let mut decoded = Vec::new();
+    let outcome = bundle
+        .pack
+        .decode_entry(
+            pack_entry,
+            &mut decoded,
+            &mut inflate,
+            &|id, out| resolve_pack_base_object(repo, &bundle.index, &bundle.pack, id, out),
+            &mut delta_cache,
+        )
+        .map_err(|error| AppError::GitCommand(format!("decode pack entry for {}: {error}", oid)))?;
+    if outcome.kind != gix::objs::Kind::Commit {
+        return Ok(None);
+    }
+
+    let commit_ref = gix::objs::CommitRef::from_bytes(decoded.as_slice()).map_err(|error| {
+        AppError::GitCommand(format!(
+            "decode commit object {} from pack data: {error}",
+            oid
+        ))
+    })?;
+    Ok(Some(build_pack_aware_commit_from_ref(*oid, &commit_ref)))
+}
+
+fn resolve_pack_base_object(
+    repo: &Repository,
+    index: &PackIndexFile,
+    pack: &PackDataFile,
+    id: &gix::hash::oid,
+    out: &mut Vec<u8>,
+) -> Option<PackResolvedBase> {
+    if let Some(index_pos) = index.lookup(id) {
+        let pack_offset = index.pack_offset_at_index(index_pos);
+        if let Ok(entry) = pack.entry(pack_offset) {
+            return Some(PackResolvedBase::InPack(entry));
+        }
+    }
+    let object = repo.find_object(id.to_owned()).ok()?;
+    out.extend_from_slice(object.data.as_slice());
+    Some(PackResolvedBase::OutOfPack {
+        kind: object.kind,
+        end: out.len(),
+    })
+}
+
+fn collect_revision_tips(
+    repo: &Repository,
+    requested_scope: CommitWalkScope,
+) -> AppResult<(Vec<ObjectId>, CommitWalkScope)> {
+    if requested_scope == CommitWalkScope::AllRefs {
+        return Ok((collect_all_reference_tips(repo)?, CommitWalkScope::AllRefs));
+    }
+
+    let frontier_tips = collect_frontier_reference_tips(repo)?;
+    if frontier_tips.is_empty() {
+        return Ok((collect_all_reference_tips(repo)?, CommitWalkScope::AllRefs));
+    }
+    Ok((frontier_tips, CommitWalkScope::Frontier))
+}
+
+fn collect_all_reference_tips(repo: &Repository) -> AppResult<Vec<ObjectId>> {
     let references = repo
         .references()
         .map_err(|error| map_git_error("open reference iterator", error))?;
@@ -268,6 +924,45 @@ fn collect_revision_tips(repo: &Repository) -> AppResult<Vec<ObjectId>> {
             tips.push(tip);
         }
     }
+    Ok(tips)
+}
+
+fn collect_frontier_reference_tips(repo: &Repository) -> AppResult<Vec<ObjectId>> {
+    let references = repo
+        .references()
+        .map_err(|error| map_git_error("open frontier reference iterator", error))?;
+    let iterator = references
+        .prefixed("refs/heads/")
+        .map_err(|error| map_git_error("iterate frontier refs/heads", error))?;
+
+    let mut tips = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in iterator {
+        let mut reference =
+            entry.map_err(|error| map_git_error("read frontier refs/heads reference", error))?;
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        let tip = commit.id().detach();
+        if seen.insert(tip) {
+            tips.push(tip);
+        }
+    }
+
+    let head_path = repo.path().join("HEAD");
+    if let Ok(raw_head) = fs::read_to_string(head_path) {
+        let trimmed = raw_head.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("ref:") {
+            if let Ok(detached_head_oid) =
+                parse_hex_object_id(trimmed, "parse detached HEAD tip for frontier scope")
+            {
+                if seen.insert(detached_head_oid) {
+                    tips.push(detached_head_oid);
+                }
+            }
+        }
+    }
+
     Ok(tips)
 }
 
@@ -303,6 +998,50 @@ fn build_parsed_commit(commit: &gix::Commit<'_>) -> ParsedCommit {
             .unwrap_or_default(),
         subject,
     }
+}
+
+fn build_pack_aware_commit_from_commit(commit: &gix::Commit<'_>) -> PackAwareCommitRecord {
+    let parsed = build_parsed_commit(commit);
+    let parent_ids = commit.parent_ids().map(|parent| parent.detach()).collect();
+    PackAwareCommitRecord { parsed, parent_ids }
+}
+
+fn build_parsed_commit_from_ref(sha: String, commit: &gix::objs::CommitRef<'_>) -> ParsedCommit {
+    let author = commit.author().ok();
+    let committer = commit.committer().ok();
+    let subject = commit
+        .message
+        .lines()
+        .next()
+        .map(|line| line.to_str_lossy().into_owned())
+        .unwrap_or_default();
+    ParsedCommit {
+        sha,
+        parents: commit.parents().map(|parent| parent.to_string()).collect(),
+        tree_sha: commit.tree().to_string(),
+        author_name: author
+            .map(|signature| signature.name.to_str_lossy().into_owned())
+            .unwrap_or_default(),
+        author_email: author
+            .map(|signature| signature.email.to_str_lossy().into_owned())
+            .unwrap_or_default(),
+        author_time: author
+            .map(|signature| signature.seconds())
+            .unwrap_or_default(),
+        committer_time: committer
+            .map(|signature| signature.seconds())
+            .unwrap_or_default(),
+        subject,
+    }
+}
+
+fn build_pack_aware_commit_from_ref(
+    oid: ObjectId,
+    commit: &gix::objs::CommitRef<'_>,
+) -> PackAwareCommitRecord {
+    let parsed = build_parsed_commit_from_ref(oid.to_string(), commit);
+    let parent_ids = commit.parents().map(|parent| parent.to_owned()).collect();
+    PackAwareCommitRecord { parsed, parent_ids }
 }
 
 pub fn load_refs(repo_root: &Path) -> AppResult<Vec<ParsedRef>> {
@@ -375,6 +1114,11 @@ fn parse_positive_env_usize(key: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn pack_index_max_objects() -> usize {
+    parse_positive_env_usize(LEVEL3_PACK_INDEX_MAX_OBJECTS_ENV)
+        .unwrap_or(LEVEL3_PACK_INDEX_MAX_OBJECTS_DEFAULT)
+}
+
 fn parse_env_bool_enabled(key: &str) -> bool {
     std::env::var(key)
         .ok()
@@ -385,6 +1129,44 @@ fn parse_env_bool_enabled(key: &str) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn parse_env_bool_with_default(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        })
+        .unwrap_or(default)
+}
+
+fn hot_path_rename_detection_enabled() -> bool {
+    parse_env_bool_enabled(FILE_CHANGE_SYNC_STRICT_ENV)
+        || parse_env_bool_enabled(FILE_CHANGE_RENAME_HOT_PATH_ENV)
+}
+
+fn parent_tree_memoization_enabled() -> bool {
+    parse_env_bool_with_default(FILE_CHANGE_PARENT_TREE_MEMO_ENV, true)
+}
+
+pub fn level3_runtime_options() -> Level3RuntimeOptions {
+    Level3RuntimeOptions {
+        pack_aware_ingest: parse_env_bool_with_default(LEVEL3_PACK_AWARE_INGEST_ENV, true),
+        topology_aware_extraction: parse_env_bool_with_default(
+            LEVEL3_TOPO_EXTRACTION_ORDER_ENV,
+            true,
+        ),
+    }
+}
+
+fn resolve_commit_walk_backend() -> CommitWalkBackend {
+    if level3_runtime_options().pack_aware_ingest || parse_env_bool_enabled(INDEX_FAST_MODE_ENV) {
+        CommitWalkBackend::PackAwareWired
+    } else {
+        CommitWalkBackend::RevisionWalk
+    }
 }
 
 fn parse_commit_walk_sort_mode() -> Option<CommitWalkSortMode> {
@@ -398,19 +1180,24 @@ fn parse_commit_walk_sort_mode() -> Option<CommitWalkSortMode> {
     })
 }
 
-fn resolve_commit_walk_sorting(since_epoch: Option<i64>) -> Sorting {
+fn parse_commit_walk_scope() -> CommitWalkScope {
+    std::env::var(COMMIT_WALK_SCOPE_ENV)
+        .ok()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "all_refs" => CommitWalkScope::AllRefs,
+            _ => CommitWalkScope::Frontier,
+        })
+        .unwrap_or(CommitWalkScope::Frontier)
+}
+
+fn resolve_commit_walk_sort_mode(since_epoch: Option<i64>) -> CommitWalkSortMode {
     let explicit = parse_commit_walk_sort_mode();
-    let selected = explicit.unwrap_or_else(|| {
-        if parse_env_bool_enabled(INDEX_FAST_MODE_ENV) {
-            if since_epoch.is_some() {
-                CommitWalkSortMode::CommitTimeCutoff
-            } else {
-                CommitWalkSortMode::BreadthFirst
-            }
-        } else {
-            CommitWalkSortMode::CommitTimeNewest
-        }
-    });
+    let _ = since_epoch;
+    explicit.unwrap_or(CommitWalkSortMode::BreadthFirst)
+}
+
+fn resolve_commit_walk_sorting(since_epoch: Option<i64>) -> Sorting {
+    let selected = resolve_commit_walk_sort_mode(since_epoch);
     match selected {
         CommitWalkSortMode::CommitTimeNewest => Sorting::ByCommitTime(CommitTimeOrder::NewestFirst),
         CommitWalkSortMode::BreadthFirst => Sorting::BreadthFirst,
@@ -761,29 +1548,1016 @@ fn collect_file_changes_for_chunk_with_repo(
 ) -> AppResult<ChunkFileChanges> {
     let mut telemetry = FileDiffTelemetry::default();
     let mut chunk_changes = Vec::new();
-    let mut diff_resource_cache = None;
-    let mut line_stat_resource_cache = None;
-    for commit_sha in commit_shas {
-        let line_stat_targets = line_stat_targets_by_commit
-            .and_then(|targets_by_commit| targets_by_commit.get(commit_sha));
-        let commit_telemetry = append_file_changes_for_commit(
-            repo,
-            commit_sha,
-            extraction_mode,
-            line_stat_targets,
-            &mut diff_resource_cache,
-            &mut line_stat_resource_cache,
-            &mut |change| {
-                chunk_changes.push(change);
-                Ok(())
-            },
-        )?;
-        telemetry.merge(commit_telemetry);
+    if parent_tree_memoization_enabled()
+        && extraction_mode == FileChangeExtractionMode::MetadataOnly
+        && commit_shas.len() >= FILE_CHANGE_PARENT_TREE_MEMO_MIN_COMMITS
+    {
+        let mut grouped: BTreeMap<String, Vec<(usize, &String)>> = BTreeMap::new();
+        for (index, commit_sha) in commit_shas.iter().enumerate() {
+            let signature = parent_tree_signature(repo, commit_sha)?;
+            grouped
+                .entry(signature)
+                .or_default()
+                .push((index, commit_sha));
+        }
+
+        let mut ordered_telemetry = vec![FileDiffTelemetry::default(); commit_shas.len()];
+        let mut ordered_changes: Vec<Vec<ParsedFileChange>> = vec![Vec::new(); commit_shas.len()];
+        for (_signature, commits) in grouped {
+            let mut diff_resource_cache = None;
+            let mut line_stat_resource_cache = None;
+            for (index, commit_sha) in commits {
+                let line_stat_targets = line_stat_targets_by_commit
+                    .and_then(|targets_by_commit| targets_by_commit.get(commit_sha));
+                let commit_telemetry = append_file_changes_for_commit(
+                    repo,
+                    commit_sha,
+                    extraction_mode,
+                    line_stat_targets,
+                    &mut diff_resource_cache,
+                    &mut line_stat_resource_cache,
+                    &mut |change| {
+                        ordered_changes[index].push(change);
+                        Ok(())
+                    },
+                )?;
+                ordered_telemetry[index] = commit_telemetry;
+            }
+        }
+
+        for (commit_telemetry, mut changes) in ordered_telemetry
+            .into_iter()
+            .zip(ordered_changes.into_iter())
+        {
+            telemetry.merge(commit_telemetry);
+            chunk_changes.append(&mut changes);
+        }
+    } else {
+        let mut diff_resource_cache = None;
+        let mut line_stat_resource_cache = None;
+        for commit_sha in commit_shas {
+            let line_stat_targets = line_stat_targets_by_commit
+                .and_then(|targets_by_commit| targets_by_commit.get(commit_sha));
+            let commit_telemetry = append_file_changes_for_commit(
+                repo,
+                commit_sha,
+                extraction_mode,
+                line_stat_targets,
+                &mut diff_resource_cache,
+                &mut line_stat_resource_cache,
+                &mut |change| {
+                    chunk_changes.push(change);
+                    Ok(())
+                },
+            )?;
+            telemetry.merge(commit_telemetry);
+        }
     }
+
     Ok(ChunkFileChanges {
         changes: chunk_changes,
         telemetry,
     })
+}
+
+fn parent_tree_signature(repo: &Repository, commit_sha: &str) -> AppResult<String> {
+    let oid = parse_hex_object_id(commit_sha, "parse commit sha for parent-tree signature")?;
+    let commit = repo
+        .find_commit(oid)
+        .map_err(|error| map_git_error("resolve commit for parent-tree signature", error))?;
+    let commit_tree = commit
+        .tree_id()
+        .ok()
+        .map(|tree| tree.detach().to_string())
+        .unwrap_or_else(|| "missing-commit-tree".to_string());
+
+    let parent_tree = commit
+        .parent_ids()
+        .next()
+        .map(|parent_id| {
+            repo.find_commit(parent_id.detach())
+                .map_err(|error| map_git_error("resolve parent commit for signature", error))
+                .and_then(|parent| {
+                    parent
+                        .tree_id()
+                        .ok()
+                        .map(|tree| tree.detach().to_string())
+                        .ok_or_else(|| {
+                            AppError::GitCommand(
+                                "resolve parent tree for parent-tree signature".to_string(),
+                            )
+                        })
+                })
+        })
+        .transpose()?
+        .unwrap_or_else(|| "root".to_string());
+
+    Ok(format!("{parent_tree}|{commit_tree}"))
+}
+
+pub fn reorder_commits_topologically(
+    repo_root: &Path,
+    commit_shas: &[String],
+) -> AppResult<Vec<String>> {
+    if commit_shas.len() <= 1 {
+        return Ok(commit_shas.to_vec());
+    }
+
+    let repo = open_repository(repo_root)?;
+    let mut parents_by_sha: HashMap<String, Vec<String>> =
+        HashMap::with_capacity(commit_shas.len());
+    for sha in commit_shas {
+        let oid = parse_hex_object_id(sha, "parse commit sha for topology ordering")?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|error| map_git_error("resolve commit for topology ordering", error))?;
+        parents_by_sha.insert(
+            sha.clone(),
+            commit
+                .parent_ids()
+                .map(|parent| parent.to_string())
+                .collect(),
+        );
+    }
+    Ok(reorder_commits_topologically_with_parents(
+        commit_shas,
+        &parents_by_sha,
+    ))
+}
+
+pub fn reorder_commits_topologically_with_parents(
+    commit_shas: &[String],
+    parents_by_sha: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    if commit_shas.len() <= 1 {
+        return commit_shas.to_vec();
+    }
+
+    let wanted: HashSet<&str> = commit_shas.iter().map(String::as_str).collect();
+    let mut index_by_sha: HashMap<&str, usize> = HashMap::with_capacity(commit_shas.len());
+    for (position, sha) in commit_shas.iter().enumerate() {
+        index_by_sha.insert(sha.as_str(), position);
+    }
+
+    let mut indegree: HashMap<String, usize> = HashMap::with_capacity(commit_shas.len());
+    let mut children: HashMap<String, Vec<String>> = HashMap::with_capacity(commit_shas.len());
+    for sha in commit_shas {
+        let parents = parents_by_sha
+            .get(sha.as_str())
+            .map(|parents| parents.as_slice())
+            .unwrap_or(&[]);
+        let mut parent_count = 0usize;
+        for parent_sha in parents {
+            if wanted.contains(parent_sha.as_str()) {
+                parent_count = parent_count.saturating_add(1);
+                children
+                    .entry(parent_sha.clone())
+                    .or_default()
+                    .push(sha.clone());
+            }
+        }
+        indegree.insert(sha.clone(), parent_count);
+        children.entry(sha.clone()).or_default();
+    }
+
+    let mut ready = BinaryHeap::new();
+    for sha in commit_shas {
+        if indegree.get(sha.as_str()).copied().unwrap_or(0) == 0 {
+            let position = index_by_sha
+                .get(sha.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            ready.push(Reverse((position, sha.clone())));
+        }
+    }
+
+    let mut queue = VecDeque::new();
+    while let Some(item) = ready.pop() {
+        queue.push_back(item.0 .1);
+    }
+
+    let mut ordered = Vec::with_capacity(commit_shas.len());
+    while let Some(sha) = queue.pop_front() {
+        ordered.push(sha.clone());
+        if let Some(next_children) = children.get(sha.as_str()) {
+            for child_sha in next_children {
+                if let Some(entry) = indegree.get_mut(child_sha.as_str()) {
+                    if *entry > 0 {
+                        *entry -= 1;
+                    }
+                    if *entry == 0 {
+                        let position = index_by_sha
+                            .get(child_sha.as_str())
+                            .copied()
+                            .unwrap_or(usize::MAX);
+                        ready.push(Reverse((position, child_sha.clone())));
+                    }
+                }
+            }
+            while let Some(item) = ready.pop() {
+                queue.push_back(item.0 .1);
+            }
+        }
+    }
+
+    if ordered.len() == commit_shas.len() {
+        ordered
+    } else {
+        commit_shas.to_vec()
+    }
+}
+
+fn commit_might_touch_target_paths(
+    repo: &Repository,
+    commit_sha: &str,
+    target_paths: &HashSet<String>,
+) -> AppResult<bool> {
+    Ok(matches!(
+        evaluate_changed_path_decision(repo, commit_sha, target_paths)?,
+        ChangedPathDecision::Touched | ChangedPathDecision::Unknown
+    ))
+}
+
+fn evaluate_changed_path_decision(
+    repo: &Repository,
+    commit_sha: &str,
+    target_paths: &HashSet<String>,
+) -> AppResult<ChangedPathDecision> {
+    if target_paths.is_empty() {
+        return Ok(ChangedPathDecision::NotTouched);
+    }
+
+    let Ok(oid) = parse_hex_object_id(commit_sha, "parse commit sha for changed-path bloom lookup")
+    else {
+        return Ok(ChangedPathDecision::Unknown);
+    };
+    evaluate_changed_path_decision_for_oid(repo, &oid, target_paths)
+}
+
+fn evaluate_changed_path_decision_for_oid(
+    repo: &Repository,
+    commit_oid: &ObjectId,
+    target_paths: &HashSet<String>,
+) -> AppResult<ChangedPathDecision> {
+    if target_paths.is_empty() {
+        return Ok(ChangedPathDecision::NotTouched);
+    }
+
+    let Some(index) = load_commit_graph_bloom_index_cached(repo)? else {
+        return Ok(ChangedPathDecision::Unknown);
+    };
+    let Some(filter) = lookup_bloom_filter_for_commit(index.as_ref(), commit_oid) else {
+        return Ok(ChangedPathDecision::Unknown);
+    };
+
+    let prehashed_plans = load_prehashed_path_probe_plans_cached(repo, target_paths);
+    if prehashed_plans.is_empty() {
+        for path in target_paths {
+            if bloom_filter_might_contain_path(filter, path) {
+                return Ok(ChangedPathDecision::Touched);
+            }
+        }
+    } else {
+        for plan in &prehashed_plans {
+            if bloom_filter_might_contain_prehashed_path(filter, plan.as_ref()) {
+                return Ok(ChangedPathDecision::Touched);
+            }
+        }
+    }
+
+    if commit_touches_target_paths_exact(repo, commit_oid, target_paths)? {
+        Ok(ChangedPathDecision::Touched)
+    } else {
+        Ok(ChangedPathDecision::NotTouched)
+    }
+}
+
+fn load_prehashed_path_probe_plans_cached(
+    repo: &Repository,
+    target_paths: &HashSet<String>,
+) -> Vec<Arc<PathBloomProbePlan>> {
+    if target_paths.is_empty() {
+        return Vec::new();
+    }
+
+    static PATH_PROBE_CACHE: OnceLock<Mutex<PathProbeDictionaryCache>> = OnceLock::new();
+    let cache = PATH_PROBE_CACHE.get_or_init(|| Mutex::new(PathProbeDictionaryCache::default()));
+    let git_dir = repo_git_dir_key(repo);
+
+    let mut normalized_paths = Vec::with_capacity(target_paths.len());
+    let mut seen = HashSet::with_capacity(target_paths.len());
+    for raw_path in target_paths {
+        let normalized = normalize_repo_relative_path(raw_path);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        normalized_paths.push(normalized);
+    }
+    if normalized_paths.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(mut guard) = cache.lock() {
+        let dictionary = guard.by_git_dir.entry(git_dir).or_default();
+        let mut plans = Vec::with_capacity(normalized_paths.len());
+        for normalized in normalized_paths {
+            if let Some(plan) = get_or_insert_path_probe_plan(dictionary, normalized.as_str()) {
+                plans.push(plan);
+            }
+        }
+        return plans;
+    }
+
+    normalized_paths
+        .into_iter()
+        .filter_map(|normalized| build_path_bloom_probe_plan(normalized.as_str()).map(Arc::new))
+        .collect()
+}
+
+fn get_or_insert_path_probe_plan(
+    dictionary: &mut RepoPathProbeDictionary,
+    normalized_path: &str,
+) -> Option<Arc<PathBloomProbePlan>> {
+    let path_id = if let Some(existing) = dictionary
+        .path_id_by_normalized_path
+        .get(normalized_path)
+        .copied()
+    {
+        existing
+    } else {
+        let assigned = dictionary.next_path_id;
+        dictionary.next_path_id = dictionary.next_path_id.saturating_add(1);
+        dictionary
+            .path_id_by_normalized_path
+            .insert(normalized_path.to_string(), assigned);
+        assigned
+    };
+
+    if let Some(existing) = dictionary.probe_by_path_id.get(&path_id) {
+        return Some(existing.clone());
+    }
+
+    let plan = Arc::new(build_path_bloom_probe_plan(normalized_path)?);
+    dictionary.probe_by_path_id.insert(path_id, plan.clone());
+    Some(plan)
+}
+
+fn build_path_bloom_probe_plan(normalized_path: &str) -> Option<PathBloomProbePlan> {
+    if normalized_path.is_empty() {
+        return None;
+    }
+
+    let bytes = normalized_path.as_bytes();
+    let mut prehashed_keys =
+        Vec::with_capacity(1 + bytes.iter().filter(|byte| **byte == b'/').count());
+    prehashed_keys.push(prehash_bloom_probe_key(bytes));
+    for split in (0..bytes.len()).rev() {
+        if bytes[split] == b'/' && split > 0 {
+            prehashed_keys.push(prehash_bloom_probe_key(&bytes[..split]));
+        }
+    }
+
+    Some(PathBloomProbePlan { prehashed_keys })
+}
+
+fn prehash_bloom_probe_key(key: &[u8]) -> PrehashedBloomProbe {
+    PrehashedBloomProbe {
+        hash0_v1: bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V1, BLOOM_MURMUR_SEED0, key),
+        hash1_v1: bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V1, BLOOM_MURMUR_SEED1, key),
+        hash0_v2: bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V2, BLOOM_MURMUR_SEED0, key),
+        hash1_v2: bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V2, BLOOM_MURMUR_SEED1, key),
+    }
+}
+
+fn repo_git_dir_key(repo: &Repository) -> PathBuf {
+    fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().to_path_buf())
+}
+
+fn load_commit_graph_bloom_index_cached(
+    repo: &Repository,
+) -> AppResult<Option<Arc<CommitGraphBloomIndex>>> {
+    static BLOOM_CACHE: OnceLock<Mutex<CommitGraphBloomCache>> = OnceLock::new();
+    let cache = BLOOM_CACHE.get_or_init(|| Mutex::new(CommitGraphBloomCache::default()));
+    let git_dir = repo_git_dir_key(repo);
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.by_git_dir.get(&git_dir) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let loaded = load_commit_graph_bloom_index(repo).map(Arc::new);
+    if let Ok(mut guard) = cache.lock() {
+        guard.by_git_dir.insert(git_dir, loaded.clone());
+    }
+    Ok(loaded)
+}
+
+fn load_commit_graph_cached(repo: &Repository) -> AppResult<Option<Arc<gix::commitgraph::Graph>>> {
+    static GRAPH_CACHE: OnceLock<Mutex<CommitGraphMetadataCache>> = OnceLock::new();
+    let cache = GRAPH_CACHE.get_or_init(|| Mutex::new(CommitGraphMetadataCache::default()));
+    let git_dir = repo_git_dir_key(repo);
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(cached) = guard.by_git_dir.get(&git_dir) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let info_dir = repo.path().join("objects").join("info");
+    let loaded = gix::commitgraph::Graph::from_info_dir(info_dir.as_path())
+        .ok()
+        .map(Arc::new);
+    if let Ok(mut guard) = cache.lock() {
+        guard.by_git_dir.insert(git_dir, loaded.clone());
+    }
+    Ok(loaded)
+}
+
+fn load_commit_graph_bloom_index(repo: &Repository) -> Option<CommitGraphBloomIndex> {
+    let info_dir = repo.path().join("objects").join("info");
+    if !info_dir.is_dir() {
+        return None;
+    }
+
+    let commit_graphs_dir = info_dir.join("commit-graphs");
+    let chain_file = commit_graphs_dir.join("commit-graph-chain");
+    let graph_files: Vec<PathBuf> = if chain_file.is_file() {
+        let chain_content = fs::read_to_string(chain_file).ok()?;
+        chain_content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|hash| commit_graphs_dir.join(format!("graph-{hash}.graph")))
+            .collect()
+    } else {
+        let monolithic = info_dir.join("commit-graph");
+        if monolithic.is_file() {
+            vec![monolithic]
+        } else {
+            Vec::new()
+        }
+    };
+
+    if graph_files.is_empty() {
+        return None;
+    }
+
+    let hash_len = repo.object_hash().len_in_bytes();
+    let mut layers = Vec::new();
+    for path in graph_files {
+        let Some(layer) = parse_commit_graph_bloom_layer(path.as_path(), hash_len) else {
+            continue;
+        };
+        layers.push(layer);
+    }
+
+    if layers.is_empty() {
+        None
+    } else {
+        Some(CommitGraphBloomIndex { layers })
+    }
+}
+
+fn parse_commit_graph_bloom_layer(
+    path: &Path,
+    expected_hash_len: usize,
+) -> Option<CommitGraphBloomLayer> {
+    let data = fs::read(path).ok()?;
+    if data.len() < COMMIT_GRAPH_CHUNK_LOOKUP_HEADER_LEN {
+        return None;
+    }
+    if data.get(0..4)? != COMMIT_GRAPH_SIGNATURE {
+        return None;
+    }
+    if data[4] != 1 {
+        return None;
+    }
+
+    let hash_len = match data[5] {
+        1 => 20usize,
+        2 => 32usize,
+        _ => return None,
+    };
+    if hash_len != expected_hash_len {
+        return None;
+    }
+
+    let chunk_count = usize::from(data[6]);
+    let lookup_len = (chunk_count + 1).checked_mul(COMMIT_GRAPH_CHUNK_LOOKUP_ENTRY_LEN)?;
+    let lookup_start = COMMIT_GRAPH_CHUNK_LOOKUP_HEADER_LEN;
+    let lookup_end = lookup_start.checked_add(lookup_len)?;
+    if lookup_end > data.len() {
+        return None;
+    }
+
+    let mut chunk_ids = Vec::with_capacity(chunk_count + 1);
+    let mut chunk_offsets = Vec::with_capacity(chunk_count + 1);
+    for index in 0..=chunk_count {
+        let entry_start = lookup_start + index * COMMIT_GRAPH_CHUNK_LOOKUP_ENTRY_LEN;
+        let id: [u8; 4] = data.get(entry_start..entry_start + 4)?.try_into().ok()?;
+        let offset_u64 = u64::from_be_bytes(
+            data.get(entry_start + 4..entry_start + 12)?
+                .try_into()
+                .ok()?,
+        );
+        let offset = usize::try_from(offset_u64).ok()?;
+        chunk_ids.push(id);
+        chunk_offsets.push(offset);
+    }
+
+    let mut chunk_ranges: HashMap<[u8; 4], (usize, usize)> = HashMap::new();
+    for index in 0..chunk_count {
+        let id = chunk_ids[index];
+        if id == [0, 0, 0, 0] {
+            continue;
+        }
+        let start = chunk_offsets[index];
+        let end = chunk_offsets[index + 1];
+        if start > end || end > data.len() {
+            return None;
+        }
+        chunk_ranges.insert(id, (start, end));
+    }
+
+    let (oid_fan_offset, oid_fan_end) = *chunk_ranges.get(&COMMIT_GRAPH_CHUNK_ID_OIDF)?;
+    if oid_fan_end.saturating_sub(oid_fan_offset) != COMMIT_GRAPH_FANOUT_CHUNK_LEN {
+        return None;
+    }
+
+    let commit_count =
+        usize::try_from(read_be_u32(data.as_slice(), oid_fan_offset + (255 * 4))?).ok()?;
+    let (oid_lookup_offset, oid_lookup_end) = *chunk_ranges.get(&COMMIT_GRAPH_CHUNK_ID_OIDL)?;
+    let oid_lookup_len = oid_lookup_end.saturating_sub(oid_lookup_offset);
+    if oid_lookup_len < commit_count.saturating_mul(hash_len) {
+        return None;
+    }
+
+    let (bloom_index_offset, bloom_index_end) = *chunk_ranges.get(&COMMIT_GRAPH_CHUNK_ID_BIDX)?;
+    if bloom_index_end.saturating_sub(bloom_index_offset) != commit_count.saturating_mul(4) {
+        return None;
+    }
+
+    let (bloom_data_offset, bloom_data_end) = *chunk_ranges.get(&COMMIT_GRAPH_CHUNK_ID_BDAT)?;
+    if bloom_data_end <= bloom_data_offset + BLOOM_DATA_HEADER_LEN {
+        return None;
+    }
+
+    let bloom_hash_version = read_be_u32(data.as_slice(), bloom_data_offset)?;
+    let bloom_num_hashes = read_be_u32(data.as_slice(), bloom_data_offset + 4)?;
+    let _bloom_bits_per_entry = read_be_u32(data.as_slice(), bloom_data_offset + 8)?;
+    if bloom_num_hashes == 0 {
+        return None;
+    }
+    if bloom_hash_version != BLOOM_HASH_VERSION_GIT_V1
+        && bloom_hash_version != BLOOM_HASH_VERSION_GIT_V2
+    {
+        return None;
+    }
+
+    let bloom_payload_len = bloom_data_end
+        .saturating_sub(bloom_data_offset)
+        .saturating_sub(BLOOM_DATA_HEADER_LEN);
+    let mut previous = 0usize;
+    for index in 0..commit_count {
+        let end = usize::try_from(read_be_u32(
+            data.as_slice(),
+            bloom_index_offset + index * 4,
+        )?)
+        .ok()?;
+        if end < previous || end > bloom_payload_len {
+            return None;
+        }
+        previous = end;
+    }
+
+    Some(CommitGraphBloomLayer {
+        data,
+        oid_fan_offset,
+        oid_lookup_offset,
+        commit_count,
+        hash_len,
+        bloom_index_offset,
+        bloom_data_offset,
+        bloom_data_end,
+        bloom_hash_version,
+        bloom_num_hashes,
+    })
+}
+
+fn lookup_bloom_filter_for_commit<'a>(
+    index: &'a CommitGraphBloomIndex,
+    oid: &ObjectId,
+) -> Option<BloomFilterView<'a>> {
+    let oid_bytes = oid.as_slice();
+    for layer in &index.layers {
+        if layer.hash_len != oid_bytes.len() {
+            continue;
+        }
+        let Some(lex_pos) = lookup_commit_lex_position(layer, oid_bytes) else {
+            continue;
+        };
+        let Some(filter) = bloom_filter_for_lex_position(layer, lex_pos) else {
+            continue;
+        };
+        return Some(filter);
+    }
+    None
+}
+
+fn lookup_commit_lex_position(layer: &CommitGraphBloomLayer, oid_bytes: &[u8]) -> Option<usize> {
+    let first_byte = usize::from(*oid_bytes.first()?);
+    let lower = if first_byte == 0 {
+        0usize
+    } else {
+        usize::try_from(read_be_u32(
+            layer.data.as_slice(),
+            layer.oid_fan_offset + (first_byte - 1) * 4,
+        )?)
+        .ok()?
+    };
+    let mut upper = usize::try_from(read_be_u32(
+        layer.data.as_slice(),
+        layer.oid_fan_offset + first_byte * 4,
+    )?)
+    .ok()?;
+    let mut lower = lower;
+    while lower < upper {
+        let mid = lower + (upper - lower) / 2;
+        let oid_start = layer.oid_lookup_offset + mid * layer.hash_len;
+        let oid_end = oid_start + layer.hash_len;
+        let probe = layer.data.get(oid_start..oid_end)?;
+        match probe.cmp(oid_bytes) {
+            std::cmp::Ordering::Less => lower = mid.saturating_add(1),
+            std::cmp::Ordering::Greater => upper = mid,
+            std::cmp::Ordering::Equal => return Some(mid),
+        }
+    }
+    None
+}
+
+fn bloom_filter_for_lex_position<'a>(
+    layer: &'a CommitGraphBloomLayer,
+    lex_pos: usize,
+) -> Option<BloomFilterView<'a>> {
+    if lex_pos >= layer.commit_count {
+        return None;
+    }
+    let end = usize::try_from(read_be_u32(
+        layer.data.as_slice(),
+        layer.bloom_index_offset + lex_pos * 4,
+    )?)
+    .ok()?;
+    let start = if lex_pos == 0 {
+        0usize
+    } else {
+        usize::try_from(read_be_u32(
+            layer.data.as_slice(),
+            layer.bloom_index_offset + (lex_pos - 1) * 4,
+        )?)
+        .ok()?
+    };
+    if end < start {
+        return None;
+    }
+
+    let payload_start = layer.bloom_data_offset + BLOOM_DATA_HEADER_LEN;
+    let payload_end = layer.bloom_data_end;
+    let filter_start = payload_start.saturating_add(start);
+    let filter_end = payload_start.saturating_add(end);
+    if filter_end > payload_end || filter_start > filter_end {
+        return None;
+    }
+    let bytes = layer.data.get(filter_start..filter_end)?;
+    Some(BloomFilterView {
+        bytes,
+        hash_version: layer.bloom_hash_version,
+        num_hashes: layer.bloom_num_hashes,
+    })
+}
+
+fn bloom_filter_might_contain_path(filter: BloomFilterView<'_>, path: &str) -> bool {
+    let normalized = normalize_repo_relative_path(path);
+    if normalized.is_empty() {
+        return false;
+    }
+    let bytes = normalized.as_bytes();
+    if bloom_filter_contains_key(filter, bytes) {
+        return true;
+    }
+
+    for split in (0..bytes.len()).rev() {
+        if bytes[split] == b'/' && split > 0 && bloom_filter_contains_key(filter, &bytes[..split]) {
+            return true;
+        }
+    }
+    false
+}
+
+fn bloom_filter_might_contain_prehashed_path(
+    filter: BloomFilterView<'_>,
+    plan: &PathBloomProbePlan,
+) -> bool {
+    for key in &plan.prehashed_keys {
+        if bloom_filter_contains_prehashed_key(filter, *key) {
+            return true;
+        }
+    }
+    false
+}
+
+fn bloom_filter_contains_prehashed_key(
+    filter: BloomFilterView<'_>,
+    prehashed: PrehashedBloomProbe,
+) -> bool {
+    if filter.num_hashes == 0 || filter.bytes.is_empty() {
+        return false;
+    }
+    let total_bits = filter.bytes.len().saturating_mul(8);
+    if total_bits == 0 {
+        return false;
+    }
+
+    let (hash0, hash1) = if filter.hash_version == BLOOM_HASH_VERSION_GIT_V2 {
+        (prehashed.hash0_v2, prehashed.hash1_v2)
+    } else {
+        (prehashed.hash0_v1, prehashed.hash1_v1)
+    };
+
+    let rounds = usize::try_from(filter.num_hashes).unwrap_or(0);
+    for round in 0..rounds {
+        let hash = hash0.wrapping_add((round as u32).wrapping_mul(hash1));
+        let bit_pos = usize::try_from(hash).unwrap_or(0) % total_bits;
+        let byte = filter.bytes[bit_pos / 8];
+        let mask = 1u8 << (bit_pos & 7);
+        if byte & mask == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn bloom_filter_contains_key(filter: BloomFilterView<'_>, key: &[u8]) -> bool {
+    if key.is_empty() || filter.num_hashes == 0 || filter.bytes.is_empty() {
+        return false;
+    }
+    let total_bits = filter.bytes.len().saturating_mul(8);
+    if total_bits == 0 {
+        return false;
+    }
+
+    let hash0 = bloom_murmur3_seeded(filter.hash_version, BLOOM_MURMUR_SEED0, key);
+    let hash1 = bloom_murmur3_seeded(filter.hash_version, BLOOM_MURMUR_SEED1, key);
+    let rounds = usize::try_from(filter.num_hashes).unwrap_or(0);
+    for round in 0..rounds {
+        let hash = hash0.wrapping_add((round as u32).wrapping_mul(hash1));
+        let bit_pos = usize::try_from(hash).unwrap_or(0) % total_bits;
+        let byte = filter.bytes[bit_pos / 8];
+        let mask = 1u8 << (bit_pos & 7);
+        if byte & mask == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn bloom_murmur3_seeded(hash_version: u32, seed: u32, data: &[u8]) -> u32 {
+    if hash_version == BLOOM_HASH_VERSION_GIT_V2 {
+        return bloom_murmur3_seeded_v2(seed, data);
+    }
+    bloom_murmur3_seeded_v1(seed, data)
+}
+
+fn bloom_murmur3_seeded_v2(mut seed: u32, data: &[u8]) -> u32 {
+    const C1: u32 = 0xcc9e2d51;
+    const C2: u32 = 0x1b873593;
+    const M: u32 = 5;
+    const N: u32 = 0xe6546b64;
+
+    let mut chunks = data.chunks_exact(4);
+    for chunk in chunks.by_ref() {
+        let mut k = u32::from(chunk[0])
+            | (u32::from(chunk[1]) << 8)
+            | (u32::from(chunk[2]) << 16)
+            | (u32::from(chunk[3]) << 24);
+        k = k.wrapping_mul(C1);
+        k = k.rotate_left(15);
+        k = k.wrapping_mul(C2);
+        seed ^= k;
+        seed = seed.rotate_left(13).wrapping_mul(M).wrapping_add(N);
+    }
+
+    let tail = chunks.remainder();
+    let mut k1 = 0u32;
+    if tail.len() == 3 {
+        k1 ^= u32::from(tail[2]) << 16;
+    }
+    if tail.len() >= 2 {
+        k1 ^= u32::from(tail[1]) << 8;
+    }
+    if !tail.is_empty() {
+        k1 ^= u32::from(tail[0]);
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(15);
+        k1 = k1.wrapping_mul(C2);
+        seed ^= k1;
+    }
+
+    seed ^= u32::try_from(data.len()).unwrap_or(u32::MAX);
+    seed ^= seed >> 16;
+    seed = seed.wrapping_mul(0x85ebca6b);
+    seed ^= seed >> 13;
+    seed = seed.wrapping_mul(0xc2b2ae35);
+    seed ^= seed >> 16;
+    seed
+}
+
+fn bloom_murmur3_seeded_v1(mut seed: u32, data: &[u8]) -> u32 {
+    const C1: u32 = 0xcc9e2d51;
+    const C2: u32 = 0x1b873593;
+    const M: u32 = 5;
+    const N: u32 = 0xe6546b64;
+
+    let mut chunks = data.chunks_exact(4);
+    for chunk in chunks.by_ref() {
+        let mut k = ((chunk[0] as i8 as i32) as u32)
+            | (((chunk[1] as i8 as i32) as u32) << 8)
+            | (((chunk[2] as i8 as i32) as u32) << 16)
+            | (((chunk[3] as i8 as i32) as u32) << 24);
+        k = k.wrapping_mul(C1);
+        k = k.rotate_left(15);
+        k = k.wrapping_mul(C2);
+        seed ^= k;
+        seed = seed.rotate_left(13).wrapping_mul(M).wrapping_add(N);
+    }
+
+    let tail = chunks.remainder();
+    let mut k1 = 0u32;
+    if tail.len() == 3 {
+        k1 ^= ((tail[2] as i8 as i32) as u32) << 16;
+    }
+    if tail.len() >= 2 {
+        k1 ^= ((tail[1] as i8 as i32) as u32) << 8;
+    }
+    if !tail.is_empty() {
+        k1 ^= (tail[0] as i8 as i32) as u32;
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(15);
+        k1 = k1.wrapping_mul(C2);
+        seed ^= k1;
+    }
+
+    seed ^= u32::try_from(data.len()).unwrap_or(u32::MAX);
+    seed ^= seed >> 16;
+    seed = seed.wrapping_mul(0x85ebca6b);
+    seed ^= seed >> 13;
+    seed = seed.wrapping_mul(0xc2b2ae35);
+    seed ^= seed >> 16;
+    seed
+}
+
+fn commit_touches_target_paths_exact(
+    repo: &Repository,
+    commit_oid: &ObjectId,
+    target_paths: &HashSet<String>,
+) -> AppResult<bool> {
+    if target_paths.is_empty() {
+        return Ok(false);
+    }
+
+    let commit = match repo.find_commit(*commit_oid) {
+        Ok(commit) => commit,
+        Err(_) => return Ok(true),
+    };
+    let commit_tree = match commit.tree() {
+        Ok(tree) => tree,
+        Err(_) => return Ok(true),
+    };
+    let parent_tree = commit
+        .parent_ids()
+        .next()
+        .map(|parent_id| {
+            repo.find_commit(parent_id.detach())
+                .map_err(|error| {
+                    map_git_error("load parent commit for exact changed-path check", error)
+                })
+                .and_then(|parent| {
+                    parent.tree().map_err(|error| {
+                        map_git_error("load parent tree for exact changed-path check", error)
+                    })
+                })
+        })
+        .transpose()
+        .unwrap_or(None);
+
+    for raw_path in target_paths {
+        let normalized_path = normalize_repo_relative_path(raw_path);
+        if normalized_path.is_empty() {
+            continue;
+        }
+        let path = Path::new(normalized_path.as_str());
+        let commit_entry = match commit_tree.lookup_entry_by_path(path) {
+            Ok(value) => value,
+            Err(_) => return Ok(true),
+        };
+        let parent_entry = match parent_tree.as_ref() {
+            Some(parent_tree) => match parent_tree.lookup_entry_by_path(path) {
+                Ok(value) => value,
+                Err(_) => return Ok(true),
+            },
+            None => None,
+        };
+        if tree_entry_fingerprint(commit_entry.as_ref())
+            != tree_entry_fingerprint(parent_entry.as_ref())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn tree_entry_fingerprint(entry: Option<&gix::object::tree::Entry<'_>>) -> Option<(u16, ObjectId)> {
+    entry.map(|value| (value.mode().value(), value.object_id()))
+}
+
+fn normalize_repo_relative_path(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    while normalized.starts_with('/') {
+        normalized.remove(0);
+    }
+    normalized
+}
+
+fn read_be_u32(data: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(
+        data.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn bloom_filter_indicates_no_first_parent_changes(filter: BloomFilterView<'_>) -> bool {
+    !filter.bytes.is_empty() && filter.bytes.iter().all(|byte| *byte == 0)
+}
+
+fn commit_tree_matches_first_parent_in_commit_graph(
+    repo: &Repository,
+    commit_oid: &ObjectId,
+) -> AppResult<Option<bool>> {
+    let Some(graph) = load_commit_graph_cached(repo)? else {
+        return Ok(None);
+    };
+    let Some(commit) = graph.commit_by_id(commit_oid) else {
+        return Ok(None);
+    };
+    let first_parent = match commit.parent1() {
+        Ok(parent) => parent,
+        Err(_) => return Ok(None),
+    };
+    let Some(parent_pos) = first_parent else {
+        return Ok(Some(false));
+    };
+    let parent = graph.commit_at(parent_pos);
+    Ok(Some(parent.root_tree_id() == commit.root_tree_id()))
+}
+
+fn commit_might_have_first_parent_changes(
+    repo: &Repository,
+    commit_oid: &ObjectId,
+) -> AppResult<bool> {
+    let Some(index) = load_commit_graph_bloom_index_cached(repo)? else {
+        return Ok(true);
+    };
+    let Some(filter) = lookup_bloom_filter_for_commit(index.as_ref(), commit_oid) else {
+        return Ok(true);
+    };
+    Ok(!bloom_filter_indicates_no_first_parent_changes(filter))
+}
+
+pub fn filter_commits_for_line_stat_targets(
+    repo_root: &Path,
+    commit_shas: &[String],
+    line_stat_targets_by_commit: &HashMap<String, HashSet<String>>,
+) -> AppResult<Vec<String>> {
+    if commit_shas.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let repo = match open_repository(repo_root) {
+        Ok(repo) => repo,
+        Err(_) => return Ok(commit_shas.to_vec()),
+    };
+    let mut filtered = Vec::with_capacity(commit_shas.len());
+    for sha in commit_shas {
+        let Some(target_paths) = line_stat_targets_by_commit.get(sha) else {
+            continue;
+        };
+        if commit_might_touch_target_paths(&repo, sha, target_paths)? {
+            filtered.push(sha.clone());
+        }
+    }
+    Ok(filtered)
 }
 
 pub fn load_file_change_line_stats_for_targets(
@@ -806,7 +2580,9 @@ pub fn load_file_change_line_stats_for_targets(
     commit_shas.sort_unstable();
     let worker_count = file_change_thread_pool()?.current_num_threads().max(1);
     let min_commits_threshold = configured_parallel_min_commits_threshold(worker_count);
-    let parsed = if !should_use_parallel_file_change_extraction(
+    let parsed = if commit_shas.is_empty() {
+        Vec::new()
+    } else if !should_use_parallel_file_change_extraction(
         commit_shas.len(),
         worker_count,
         min_commits_threshold,
@@ -885,11 +2661,27 @@ fn rename_detection_policy(
 
     let rename_threshold = rename_threshold_for_bins(delta_count, max_file_size_bytes);
     Some(RenameDetectionPolicy {
-        rename_limit: delta_count.clamp(1, FILE_CHANGE_RENAME_LIMIT),
+        rename_limit: delta_count.clamp(1, rename_limit_for_bins(delta_count)),
         rename_threshold,
         exact_match_only: delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS
             || max_file_size_bytes >= FILE_CHANGE_EXACT_MATCH_ONLY_FILE_BYTES,
     })
+}
+
+fn rename_limit_for_bins(delta_count: usize) -> usize {
+    if delta_count >= FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS {
+        return parse_positive_env_usize(FILE_CHANGE_RENAME_LIMIT_XLARGE_ENV)
+            .unwrap_or(FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT)
+            .clamp(1, FILE_CHANGE_RENAME_LIMIT);
+    }
+
+    if delta_count >= FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS {
+        return parse_positive_env_usize(FILE_CHANGE_RENAME_LIMIT_LARGE_ENV)
+            .unwrap_or(FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT)
+            .clamp(1, FILE_CHANGE_RENAME_LIMIT);
+    }
+
+    FILE_CHANGE_RENAME_LIMIT
 }
 
 fn rename_threshold_for_bins(delta_count: usize, max_file_size_bytes: u64) -> u16 {
@@ -912,6 +2704,12 @@ fn should_run_rename_detection(
     has_add_delete_pair: bool,
 ) -> bool {
     if delta_count < 2 {
+        return false;
+    }
+
+    if extraction_mode == FileChangeExtractionMode::MetadataOnly
+        && !hot_path_rename_detection_enabled()
+    {
         return false;
     }
 
@@ -1227,6 +3025,38 @@ fn should_emit_path(
             .unwrap_or(false)
 }
 
+fn should_skip_commit_with_fused_pre_diff_gate(
+    repo: &Repository,
+    commit_oid: &ObjectId,
+    extraction_mode: FileChangeExtractionMode,
+    line_stat_targets: Option<&HashSet<String>>,
+) -> AppResult<bool> {
+    if extraction_mode == FileChangeExtractionMode::SelectiveLineStats {
+        let Some(target_paths) = line_stat_targets else {
+            return Ok(true);
+        };
+        if target_paths.is_empty() {
+            return Ok(true);
+        }
+        return Ok(matches!(
+            evaluate_changed_path_decision_for_oid(repo, commit_oid, target_paths)?,
+            ChangedPathDecision::NotTouched
+        ));
+    }
+
+    if matches!(
+        commit_tree_matches_first_parent_in_commit_graph(repo, commit_oid)?,
+        Some(true)
+    ) {
+        return Ok(true);
+    }
+    if !commit_might_have_first_parent_changes(repo, commit_oid)? {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn append_file_changes_for_commit(
     repo: &Repository,
     commit_sha: &str,
@@ -1237,26 +3067,46 @@ fn append_file_changes_for_commit(
     on_change: &mut impl FnMut(ParsedFileChange) -> AppResult<()>,
 ) -> AppResult<FileDiffTelemetry> {
     let mut telemetry = FileDiffTelemetry::default();
-    let diff_build_started = Instant::now();
-
     let oid = parse_hex_object_id(commit_sha, "parse commit sha")?;
+    if should_skip_commit_with_fused_pre_diff_gate(repo, &oid, extraction_mode, line_stat_targets)?
+    {
+        return Ok(telemetry);
+    }
+
     let commit = repo
         .find_commit(oid)
         .map_err(|error| map_git_error("resolve commit for file change extraction", error))?;
+    let first_parent_id = commit
+        .parent_ids()
+        .next()
+        .map(|parent_id| parent_id.detach());
+    let first_parent_commit = first_parent_id
+        .map(|parent_id| {
+            repo.find_commit(parent_id)
+                .map_err(|error| map_git_error("read first parent commit", error))
+        })
+        .transpose()?;
+
+    if extraction_mode == FileChangeExtractionMode::MetadataOnly {
+        if let Some(parent_commit) = first_parent_commit.as_ref() {
+            let commit_tree_id = commit.tree_id().ok().map(|id| id.detach());
+            let parent_tree_id = parent_commit.tree_id().ok().map(|id| id.detach());
+            if commit_tree_id.is_some() && commit_tree_id == parent_tree_id {
+                return Ok(telemetry);
+            }
+        }
+    }
+
+    let diff_build_started = Instant::now();
     let commit_tree = commit
         .tree()
         .map_err(|error| map_git_error("read commit tree", error))?;
-    let parent_tree = commit
-        .parent_ids()
-        .next()
-        .map(|parent_id| {
-            repo.find_commit(parent_id.detach())
-                .map_err(|error| map_git_error("read first parent commit", error))
-                .and_then(|parent| {
-                    parent
-                        .tree()
-                        .map_err(|error| map_git_error("read parent commit tree", error))
-                })
+    let parent_tree = first_parent_commit
+        .as_ref()
+        .map(|parent| {
+            parent
+                .tree()
+                .map_err(|error| map_git_error("read parent commit tree", error))
         })
         .transpose()?;
 
@@ -1578,21 +3428,37 @@ impl FileChangeAccumulator {
 #[cfg(test)]
 mod tests {
     use super::{
-        object_cache_bytes_for_workers, parallel_file_change_plan,
-        parallel_min_commits_threshold_for_workers, parse_hex_object_id, rename_detection_policy,
-        rename_threshold_for_bins, resolve_parallel_worker_count, should_probe_max_file_size,
-        should_run_rename_detection, should_use_parallel_file_change_extraction,
-        validate_repository, FileChangeExtractionMode, FileChangeParallelProfile,
-        FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT, FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT,
-        FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS, FILE_CHANGE_PARSE_CHANNEL_CAPACITY,
-        FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX, FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE,
-        FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE, FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX,
+        bloom_filter_contains_key, bloom_filter_indicates_no_first_parent_changes,
+        bloom_murmur3_seeded, filter_commits_for_line_stat_targets, level3_runtime_options,
+        normalize_repo_relative_path, object_cache_bytes_for_workers, parallel_file_change_plan,
+        parallel_min_commits_threshold_for_workers, parse_commit_walk_scope, parse_hex_object_id,
+        rename_detection_policy, rename_limit_for_bins, rename_threshold_for_bins,
+        reorder_commits_topologically_with_parents, resolve_commit_walk_sort_mode,
+        resolve_parallel_worker_count, should_probe_max_file_size, should_run_rename_detection,
+        should_use_parallel_file_change_extraction, validate_repository, BloomFilterView,
+        CommitWalkScope, CommitWalkSortMode, FileChangeExtractionMode, FileChangeParallelProfile,
+        BLOOM_HASH_VERSION_GIT_V1, BLOOM_MURMUR_SEED0, BLOOM_MURMUR_SEED1, COMMIT_WALK_SCOPE_ENV,
+        COMMIT_WALK_SORT_ENV, FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_DEFAULT,
+        FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE_DEFAULT, FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
+        FILE_CHANGE_PARSE_CHANNEL_CAPACITY, FILE_CHANGE_PARSE_CHANNEL_CAPACITY_MAX,
+        FILE_CHANGE_PARSE_PARALLEL_CHUNK_SIZE, FILE_CHANGE_PARSE_PARALLEL_MIN_CHUNK_SIZE,
+        FILE_CHANGE_PARSE_WORKER_THREADS_DEFAULT_MAX, FILE_CHANGE_RENAME_HOT_PATH_ENV,
         FILE_CHANGE_RENAME_LARGE_FILE_BYTES, FILE_CHANGE_RENAME_LIMIT,
-        FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES, FILE_CHANGE_RENAME_THRESHOLD_LARGE,
-        FILE_CHANGE_RENAME_THRESHOLD_MEDIUM, FILE_CHANGE_RENAME_THRESHOLD_SMALL,
+        FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT, FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT,
+        FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS, FILE_CHANGE_RENAME_MEDIUM_FILE_BYTES,
+        FILE_CHANGE_RENAME_THRESHOLD_LARGE, FILE_CHANGE_RENAME_THRESHOLD_MEDIUM,
+        FILE_CHANGE_RENAME_THRESHOLD_SMALL, FILE_CHANGE_SYNC_STRICT_ENV,
         GIX_OBJECT_CACHE_BYTES_DEFAULT, GIX_OBJECT_CACHE_BYTES_MAX, GIX_OBJECT_CACHE_BYTES_MIN,
+        LEVEL3_PACK_AWARE_INGEST_ENV, LEVEL3_TOPO_EXTRACTION_ORDER_ENV,
     };
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn unknown_repo_returns_error() {
@@ -1635,16 +3501,46 @@ mod tests {
         let bounded_large =
             rename_detection_policy(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS + 1, 1024)
                 .expect("policy for large delta set");
-        assert_eq!(bounded_large.rename_limit, FILE_CHANGE_RENAME_LIMIT);
+        assert_eq!(
+            bounded_large.rename_limit,
+            FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT
+        );
         assert_eq!(
             bounded_large.rename_threshold,
             FILE_CHANGE_RENAME_THRESHOLD_LARGE
         );
         assert!(bounded_large.exact_match_only);
+
+        let bounded_xlarge =
+            rename_detection_policy(FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS, 1024)
+                .expect("policy for very large delta set");
+        assert_eq!(
+            bounded_xlarge.rename_limit,
+            FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn rename_limit_is_scale_aware_for_large_delta_sets() {
+        assert_eq!(rename_limit_for_bins(16), FILE_CHANGE_RENAME_LIMIT);
+        assert_eq!(
+            rename_limit_for_bins(FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS),
+            FILE_CHANGE_RENAME_LIMIT_LARGE_DEFAULT
+        );
+        assert_eq!(
+            rename_limit_for_bins(FILE_CHANGE_RENAME_LIMIT_XLARGE_MIN_DELTAS),
+            FILE_CHANGE_RENAME_LIMIT_XLARGE_DEFAULT
+        );
     }
 
     #[test]
     fn rename_detection_runs_only_when_diff_shape_requires_it() {
+        let _guard = env_lock().lock().expect("lock env");
+        let previous_sync = std::env::var(FILE_CHANGE_SYNC_STRICT_ENV).ok();
+        let previous_hot = std::env::var(FILE_CHANGE_RENAME_HOT_PATH_ENV).ok();
+        std::env::remove_var(FILE_CHANGE_SYNC_STRICT_ENV);
+        std::env::remove_var(FILE_CHANGE_RENAME_HOT_PATH_ENV);
+
         assert!(!should_run_rename_detection(
             FileChangeExtractionMode::MetadataOnly,
             1,
@@ -1655,6 +3551,21 @@ mod tests {
             16,
             false
         ));
+        assert!(!should_run_rename_detection(
+            FileChangeExtractionMode::MetadataOnly,
+            16,
+            true
+        ));
+
+        std::env::set_var(FILE_CHANGE_RENAME_HOT_PATH_ENV, "1");
+        assert!(should_run_rename_detection(
+            FileChangeExtractionMode::MetadataOnly,
+            16,
+            true
+        ));
+        std::env::remove_var(FILE_CHANGE_RENAME_HOT_PATH_ENV);
+
+        std::env::set_var(FILE_CHANGE_SYNC_STRICT_ENV, "1");
         assert!(should_run_rename_detection(
             FileChangeExtractionMode::MetadataOnly,
             16,
@@ -1671,6 +3582,17 @@ mod tests {
             FILE_CHANGE_EXACT_MATCH_ONLY_MIN_DELTAS,
             false
         ));
+
+        if let Some(value) = previous_sync {
+            std::env::set_var(FILE_CHANGE_SYNC_STRICT_ENV, value);
+        } else {
+            std::env::remove_var(FILE_CHANGE_SYNC_STRICT_ENV);
+        }
+        if let Some(value) = previous_hot {
+            std::env::set_var(FILE_CHANGE_RENAME_HOT_PATH_ENV, value);
+        } else {
+            std::env::remove_var(FILE_CHANGE_RENAME_HOT_PATH_ENV);
+        }
     }
 
     #[test]
@@ -1784,5 +3706,185 @@ mod tests {
         assert!(parse_hex_object_id(&"a".repeat(39), "parse commit sha").is_err());
         assert!(parse_hex_object_id(&"a".repeat(42), "parse commit sha").is_err());
         assert!(parse_hex_object_id(&"a".repeat(66), "parse commit sha").is_err());
+    }
+
+    #[test]
+    fn level3_runtime_flags_default_to_enabled() {
+        let _guard = env_lock().lock().expect("lock env");
+        let previous_pack = std::env::var(LEVEL3_PACK_AWARE_INGEST_ENV).ok();
+        let previous_topo = std::env::var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV).ok();
+        std::env::remove_var(LEVEL3_PACK_AWARE_INGEST_ENV);
+        std::env::remove_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV);
+
+        let options = level3_runtime_options();
+        assert!(options.pack_aware_ingest);
+        assert!(options.topology_aware_extraction);
+
+        if let Some(value) = previous_pack {
+            std::env::set_var(LEVEL3_PACK_AWARE_INGEST_ENV, value);
+        } else {
+            std::env::remove_var(LEVEL3_PACK_AWARE_INGEST_ENV);
+        }
+        if let Some(value) = previous_topo {
+            std::env::set_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV, value);
+        } else {
+            std::env::remove_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV);
+        }
+    }
+
+    #[test]
+    fn level3_runtime_flags_follow_env_toggles() {
+        let _guard = env_lock().lock().expect("lock env");
+        let previous_pack = std::env::var(LEVEL3_PACK_AWARE_INGEST_ENV).ok();
+        let previous_topo = std::env::var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV).ok();
+        std::env::set_var(LEVEL3_PACK_AWARE_INGEST_ENV, "1");
+        std::env::set_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV, "on");
+
+        let options = level3_runtime_options();
+        assert!(options.pack_aware_ingest);
+        assert!(options.topology_aware_extraction);
+
+        if let Some(value) = previous_pack {
+            std::env::set_var(LEVEL3_PACK_AWARE_INGEST_ENV, value);
+        } else {
+            std::env::remove_var(LEVEL3_PACK_AWARE_INGEST_ENV);
+        }
+        if let Some(value) = previous_topo {
+            std::env::set_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV, value);
+        } else {
+            std::env::remove_var(LEVEL3_TOPO_EXTRACTION_ORDER_ENV);
+        }
+    }
+
+    #[test]
+    fn commit_walk_scope_defaults_to_frontier_and_supports_all_refs_override() {
+        let _guard = env_lock().lock().expect("lock env");
+        let previous_scope = std::env::var(COMMIT_WALK_SCOPE_ENV).ok();
+        std::env::remove_var(COMMIT_WALK_SCOPE_ENV);
+        assert_eq!(parse_commit_walk_scope(), CommitWalkScope::Frontier);
+
+        std::env::set_var(COMMIT_WALK_SCOPE_ENV, "all_refs");
+        assert_eq!(parse_commit_walk_scope(), CommitWalkScope::AllRefs);
+
+        std::env::set_var(COMMIT_WALK_SCOPE_ENV, "unknown");
+        assert_eq!(parse_commit_walk_scope(), CommitWalkScope::Frontier);
+
+        if let Some(value) = previous_scope {
+            std::env::set_var(COMMIT_WALK_SCOPE_ENV, value);
+        } else {
+            std::env::remove_var(COMMIT_WALK_SCOPE_ENV);
+        }
+    }
+
+    #[test]
+    fn commit_walk_sort_defaults_to_breadth_first_without_flags() {
+        let _guard = env_lock().lock().expect("lock env");
+        let previous_sort = std::env::var(COMMIT_WALK_SORT_ENV).ok();
+
+        std::env::remove_var(COMMIT_WALK_SORT_ENV);
+        assert_eq!(
+            resolve_commit_walk_sort_mode(Some(123)),
+            CommitWalkSortMode::BreadthFirst
+        );
+
+        std::env::set_var(COMMIT_WALK_SORT_ENV, "commit_time_cutoff");
+        assert_eq!(
+            resolve_commit_walk_sort_mode(Some(123)),
+            CommitWalkSortMode::CommitTimeCutoff
+        );
+
+        if let Some(value) = previous_sort {
+            std::env::set_var(COMMIT_WALK_SORT_ENV, value);
+        } else {
+            std::env::remove_var(COMMIT_WALK_SORT_ENV);
+        }
+    }
+
+    #[test]
+    fn topology_reorder_with_parent_map_orders_ancestors_first() {
+        let commits = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let parents_by_sha = HashMap::from([
+            ("a".to_string(), Vec::<String>::new()),
+            ("b".to_string(), vec!["a".to_string()]),
+            ("c".to_string(), vec!["b".to_string()]),
+        ]);
+
+        let ordered = reorder_commits_topologically_with_parents(&commits, &parents_by_sha);
+        assert_eq!(
+            ordered,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_repo_relative_path_handles_windows_and_dot_prefixes() {
+        assert_eq!(
+            normalize_repo_relative_path(".\\src\\adapters\\git.rs"),
+            "src/adapters/git.rs"
+        );
+        assert_eq!(
+            normalize_repo_relative_path("./src/application/indexer.rs"),
+            "src/application/indexer.rs"
+        );
+        assert_eq!(normalize_repo_relative_path("/src/lib.rs"), "src/lib.rs");
+    }
+
+    #[test]
+    fn bloom_membership_check_matches_seeded_bits() {
+        let key = b"src/adapters/git.rs";
+        let mut bytes = vec![0u8; 16];
+        let total_bits = bytes.len() * 8;
+        let num_hashes = 7u32;
+
+        let hash0 = bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V1, BLOOM_MURMUR_SEED0, key);
+        let hash1 = bloom_murmur3_seeded(BLOOM_HASH_VERSION_GIT_V1, BLOOM_MURMUR_SEED1, key);
+        for round in 0..usize::try_from(num_hashes).unwrap_or(0) {
+            let hash = hash0.wrapping_add((round as u32).wrapping_mul(hash1));
+            let bit_pos = usize::try_from(hash).unwrap_or(0) % total_bits;
+            bytes[bit_pos / 8] |= 1u8 << (bit_pos & 7);
+        }
+
+        let filter = BloomFilterView {
+            bytes: bytes.as_slice(),
+            hash_version: BLOOM_HASH_VERSION_GIT_V1,
+            num_hashes,
+        };
+        assert!(bloom_filter_contains_key(filter, key));
+        assert!(!bloom_filter_contains_key(filter, b"src/main.rs"));
+    }
+
+    #[test]
+    fn zeroed_bloom_filter_implies_no_first_parent_changes() {
+        let no_change = BloomFilterView {
+            bytes: &[0u8],
+            hash_version: BLOOM_HASH_VERSION_GIT_V1,
+            num_hashes: 7,
+        };
+        assert!(bloom_filter_indicates_no_first_parent_changes(no_change));
+
+        let has_change = BloomFilterView {
+            bytes: &[0xff],
+            hash_version: BLOOM_HASH_VERSION_GIT_V1,
+            num_hashes: 7,
+        };
+        assert!(!bloom_filter_indicates_no_first_parent_changes(has_change));
+    }
+
+    #[test]
+    fn bloom_filter_hook_fails_open_for_unresolved_commits() {
+        let commit_shas = vec!["a".repeat(40), "b".repeat(40)];
+        let mut targets = HashMap::<String, HashSet<String>>::new();
+        targets.insert(
+            commit_shas[0].clone(),
+            HashSet::from(["src/lib.rs".to_string()]),
+        );
+        targets.insert(
+            commit_shas[1].clone(),
+            HashSet::from(["src/main.rs".to_string()]),
+        );
+
+        let filtered = filter_commits_for_line_stat_targets(Path::new("."), &commit_shas, &targets)
+            .expect("filter should fail-open and preserve unresolved commits");
+        assert_eq!(filtered, commit_shas);
     }
 }

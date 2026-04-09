@@ -14,6 +14,9 @@ param(
     [double]$MinFullCommitThroughputPerSec = -1,
     [double]$MaxFileChangeExtractionDrainMs = -1,
     [int]$MaxOldestExtractionQueueAgeSeconds = 60,
+    [int]$FileChangeCommitBatchSize = -1,
+    [int]$RenameLimitLarge = -1,
+    [int]$RenameLimitXLarge = -1,
     [switch]$FastMode,
     [switch]$PreconditionCommitGraph,
     [switch]$ProbeOnly
@@ -138,6 +141,10 @@ Write-Host (
     "Thresholds: max_full_index_ms={0} max_incremental_index_ms={1} max_peak_rss_bytes={2} max_diff_share_ratio={3} min_full_commit_throughput_per_sec={4} max_file_change_extraction_drain_ms={5} max_oldest_extraction_queue_age_seconds={6}" `
         -f $MaxFullIndexMs, $MaxIncrementalIndexMs, $MaxPeakRssBytes, $MaxDiffShareRatio, $MinFullCommitThroughputPerSec, $MaxFileChangeExtractionDrainMs, $MaxOldestExtractionQueueAgeSeconds
 )
+Write-Host (
+    "CPS tuning overrides: file_change_commit_batch_size={0} rename_limit_large={1} rename_limit_xlarge={2}" `
+        -f $FileChangeCommitBatchSize, $RenameLimitLarge, $RenameLimitXLarge
+)
 
 $fixtureRoot = ""
 if ($Lane -eq "warm") {
@@ -169,6 +176,9 @@ $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
 $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
 $previousDrainChunkSize = $env:GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE
 $previousDrainChannelCapacity = $env:GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY
+$previousFileChangeCommitBatchSize = $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE
+$previousRenameLimitLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE
+$previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
 if ($FastMode) {
     $env:GITGRAPH_INDEX_FAST_MODE = "1"
     $env:GITGRAPH_SQLITE_WRITE_PROFILE = "throughput"
@@ -182,6 +192,15 @@ if ($FastMode) {
     if ([string]::IsNullOrWhiteSpace($previousDrainChannelCapacity)) {
         $env:GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY = "32"
     }
+}
+if ($FileChangeCommitBatchSize -gt 0) {
+    $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE = $FileChangeCommitBatchSize.ToString()
+}
+if ($RenameLimitLarge -gt 0) {
+    $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE = $RenameLimitLarge.ToString()
+}
+if ($RenameLimitXLarge -gt 0) {
+    $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE = $RenameLimitXLarge.ToString()
 }
 try {
     & "$PSScriptRoot\perf-report.ps1" `
@@ -231,6 +250,21 @@ finally {
     } else {
         $env:GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY = $previousDrainChannelCapacity
     }
+    if ($null -eq $previousFileChangeCommitBatchSize) {
+        Remove-Item Env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE = $previousFileChangeCommitBatchSize
+    }
+    if ($null -eq $previousRenameLimitLarge) {
+        Remove-Item Env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE = $previousRenameLimitLarge
+    }
+    if ($null -eq $previousRenameLimitXLarge) {
+        Remove-Item Env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE = $previousRenameLimitXLarge
+    }
 }
 
 $fullIndexRaw = Get-ReportValue -Path $OutputPath -Key "full_index"
@@ -245,6 +279,22 @@ $ingestCommitWalkRaw = Get-ReportValue -Path $OutputPath -Key "ingest_commit_wal
 $ingestDiffRaw = Get-ReportValue -Path $OutputPath -Key "ingest_file_diff_extract_ms"
 $ingestUpsertRaw = Get-ReportValue -Path $OutputPath -Key "ingest_file_change_upsert_ms"
 $ingestTxCommitRaw = Get-ReportValue -Path $OutputPath -Key "ingest_tx_commit_ms"
+$fullCommitBottleneckPhaseRaw = Get-ReportValue -Path $OutputPath -Key "full_commit_bottleneck_phase"
+$fullCommitBottleneckPhaseMsRaw = Get-ReportValue -Path $OutputPath -Key "full_commit_bottleneck_phase_ms"
+$fullCommitBottleneckPhaseShareRaw = Get-ReportValue -Path $OutputPath -Key "full_commit_bottleneck_phase_share"
+$incrementalCommitBottleneckPhaseRaw = Get-ReportValue -Path $OutputPath -Key "incremental_commit_bottleneck_phase"
+$incrementalCommitBottleneckPhaseMsRaw = Get-ReportValue -Path $OutputPath -Key "incremental_commit_bottleneck_phase_ms"
+$incrementalCommitBottleneckPhaseShareRaw = Get-ReportValue -Path $OutputPath -Key "incremental_commit_bottleneck_phase_share"
+$fullCommitWalkThroughputRaw = Get-ReportValue -Path $OutputPath -Key "full_commit_walk_commits_per_sec"
+$fullCommitUpsertThroughputRaw = Get-ReportValue -Path $OutputPath -Key "full_commit_upsert_commits_per_sec"
+$fullDiffExtractThroughputRaw = Get-ReportValue -Path $OutputPath -Key "full_file_diff_extract_commits_per_sec"
+$fullFileChangeUpsertThroughputRaw = Get-ReportValue -Path $OutputPath -Key "full_file_change_upsert_commits_per_sec"
+$fullTxCommitThroughputRaw = Get-ReportValue -Path $OutputPath -Key "full_tx_commit_commits_per_sec"
+$incrementalCommitWalkThroughputRaw = Get-ReportValue -Path $OutputPath -Key "incremental_commit_walk_commits_per_sec"
+$incrementalCommitUpsertThroughputRaw = Get-ReportValue -Path $OutputPath -Key "incremental_commit_upsert_commits_per_sec"
+$incrementalDiffExtractThroughputRaw = Get-ReportValue -Path $OutputPath -Key "incremental_file_diff_extract_commits_per_sec"
+$incrementalFileChangeUpsertThroughputRaw = Get-ReportValue -Path $OutputPath -Key "incremental_file_change_upsert_commits_per_sec"
+$incrementalTxCommitThroughputRaw = Get-ReportValue -Path $OutputPath -Key "incremental_tx_commit_commits_per_sec"
 
 $fullIndexMs = Parse-DoubleOrThrow -Raw $fullIndexRaw -Field "full_index"
 $incrementalIndexMs = Parse-DoubleOrThrow -Raw $incrementalIndexRaw -Field "incremental_index"
@@ -258,6 +308,20 @@ $fixtureGenerationMs = Parse-DoubleOrThrow -Raw $fixtureGenerationRaw -Field "fi
 $ingestDiffMs = Parse-DoubleOrThrow -Raw $ingestDiffRaw -Field "ingest_file_diff_extract_ms"
 [void](Parse-DoubleOrThrow -Raw $ingestUpsertRaw -Field "ingest_file_change_upsert_ms")
 [void](Parse-DoubleOrThrow -Raw $ingestTxCommitRaw -Field "ingest_tx_commit_ms")
+$fullCommitBottleneckPhaseMs = Parse-DoubleOrThrow -Raw $fullCommitBottleneckPhaseMsRaw -Field "full_commit_bottleneck_phase_ms"
+$fullCommitBottleneckPhaseShare = Parse-DoubleOrThrow -Raw $fullCommitBottleneckPhaseShareRaw -Field "full_commit_bottleneck_phase_share"
+$incrementalCommitBottleneckPhaseMs = Parse-DoubleOrThrow -Raw $incrementalCommitBottleneckPhaseMsRaw -Field "incremental_commit_bottleneck_phase_ms"
+$incrementalCommitBottleneckPhaseShare = Parse-DoubleOrThrow -Raw $incrementalCommitBottleneckPhaseShareRaw -Field "incremental_commit_bottleneck_phase_share"
+$fullCommitWalkThroughput = Parse-DoubleOrThrow -Raw $fullCommitWalkThroughputRaw -Field "full_commit_walk_commits_per_sec"
+$fullCommitUpsertThroughput = Parse-DoubleOrThrow -Raw $fullCommitUpsertThroughputRaw -Field "full_commit_upsert_commits_per_sec"
+$fullDiffExtractThroughput = Parse-DoubleOrThrow -Raw $fullDiffExtractThroughputRaw -Field "full_file_diff_extract_commits_per_sec"
+$fullFileChangeUpsertThroughput = Parse-DoubleOrThrow -Raw $fullFileChangeUpsertThroughputRaw -Field "full_file_change_upsert_commits_per_sec"
+$fullTxCommitThroughput = Parse-DoubleOrThrow -Raw $fullTxCommitThroughputRaw -Field "full_tx_commit_commits_per_sec"
+$incrementalCommitWalkThroughput = Parse-DoubleOrThrow -Raw $incrementalCommitWalkThroughputRaw -Field "incremental_commit_walk_commits_per_sec"
+$incrementalCommitUpsertThroughput = Parse-DoubleOrThrow -Raw $incrementalCommitUpsertThroughputRaw -Field "incremental_commit_upsert_commits_per_sec"
+$incrementalDiffExtractThroughput = Parse-DoubleOrThrow -Raw $incrementalDiffExtractThroughputRaw -Field "incremental_file_diff_extract_commits_per_sec"
+$incrementalFileChangeUpsertThroughput = Parse-DoubleOrThrow -Raw $incrementalFileChangeUpsertThroughputRaw -Field "incremental_file_change_upsert_commits_per_sec"
+$incrementalTxCommitThroughput = Parse-DoubleOrThrow -Raw $incrementalTxCommitThroughputRaw -Field "incremental_tx_commit_commits_per_sec"
 $diffShareRatio = if ($coreEndToEndMs -le 0) { 0.0 } else { $ingestDiffMs / $coreEndToEndMs }
 
 Write-Host ("Ingestion budget observed full_index_ms: {0}" -f $fullIndexMs)
@@ -268,6 +332,10 @@ Write-Host ("Ingestion budget observed file_change_extraction_drain_ms: {0}" -f 
 Write-Host ("Ingestion budget observed oldest_file_change_extraction_queue_age_seconds: {0}" -f $oldestExtractionQueueAgeSeconds)
 Write-Host ("Ingestion budget observed fixture_generation_ms: {0}" -f $fixtureGenerationMs)
 Write-Host ("Ingestion budget observed diff_share_ratio: {0}" -f ([Math]::Round($diffShareRatio, 4)))
+Write-Host ("Ingestion throughput phases (full) cps: walk={0} upsert={1} diff_extract={2} file_change_upsert={3} tx_commit={4}" -f $fullCommitWalkThroughput, $fullCommitUpsertThroughput, $fullDiffExtractThroughput, $fullFileChangeUpsertThroughput, $fullTxCommitThroughput)
+Write-Host ("Ingestion throughput phases (incremental) cps: walk={0} upsert={1} diff_extract={2} file_change_upsert={3} tx_commit={4}" -f $incrementalCommitWalkThroughput, $incrementalCommitUpsertThroughput, $incrementalDiffExtractThroughput, $incrementalFileChangeUpsertThroughput, $incrementalTxCommitThroughput)
+Write-Host ("Ingestion bottleneck (full): phase={0} phase_ms={1} phase_share={2}" -f $fullCommitBottleneckPhaseRaw, $fullCommitBottleneckPhaseMs, $fullCommitBottleneckPhaseShare)
+Write-Host ("Ingestion bottleneck (incremental): phase={0} phase_ms={1} phase_share={2}" -f $incrementalCommitBottleneckPhaseRaw, $incrementalCommitBottleneckPhaseMs, $incrementalCommitBottleneckPhaseShare)
 
 if ($fullIndexMs -gt $MaxFullIndexMs) {
     throw ("Ingestion budget failed: full_index_ms {0} > max {1}" -f $fullIndexMs, $MaxFullIndexMs)

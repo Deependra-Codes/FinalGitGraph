@@ -17,7 +17,7 @@ pub enum AppError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] lmdb::Error),
 }
 
 pub type AppResult<T> = Result<T, AppError>;

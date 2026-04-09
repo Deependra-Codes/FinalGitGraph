@@ -69,16 +69,43 @@ fn run_index(repo_path: &str, tail_args: &[String]) {
     }
 
     match index_commits_with_mode(repo_path, db_path, mode) {
-        Ok(stats) => println!(
-            "Indexed mode={:?} repo_id={} commits={} edges={} file_changes={} refs={} at epoch={}",
-            stats.mode,
-            stats.repo_id,
-            stats.commits_indexed,
-            stats.edges_indexed,
-            stats.file_changes_indexed,
-            stats.refs_indexed,
-            stats.indexed_at_epoch
-        ),
+        Ok(stats) => {
+            println!(
+                "Indexed mode={:?} repo_id={} commits={} edges={} file_changes={} refs={} at epoch={}",
+                stats.mode,
+                stats.repo_id,
+                stats.commits_indexed,
+                stats.edges_indexed,
+                stats.file_changes_indexed,
+                stats.refs_indexed,
+                stats.indexed_at_epoch
+            );
+            println!(
+                "Commit throughput seen_commits={} indexed_commits={} cps_seen={:.3} cps_indexed={:.3} ms_per_commit_seen={:.3} ms_per_commit_indexed={:.3}",
+                stats.commit_throughput.commits_seen,
+                stats.commit_throughput.commits_indexed,
+                stats.commit_throughput.commits_per_sec_seen,
+                stats.commit_throughput.commits_per_sec_indexed,
+                stats.commit_throughput.ms_per_commit_seen,
+                stats.commit_throughput.ms_per_commit_indexed
+            );
+            println!(
+                "Commit phase throughput (cps): commit_walk={:.3} commit_upsert={:.3} file_diff_extract={:.3} file_change_upsert={:.3} tx_commit={:.3}",
+                stats.commit_throughput.commit_walk_commits_per_sec_seen,
+                stats.commit_throughput.commit_upsert_commits_per_sec_seen,
+                stats.commit_throughput.file_diff_extract_commits_per_sec_seen,
+                stats.commit_throughput.file_change_upsert_commits_per_sec_seen,
+                stats.commit_throughput.tx_commit_commits_per_sec_seen
+            );
+            println!(
+                "Commit bottleneck phase={} phase_ms={:.3} phase_share={:.3}",
+                stats.commit_throughput.bottleneck_phase,
+                stats.commit_throughput.bottleneck_phase_ms,
+                stats
+                    .commit_throughput
+                    .bottleneck_phase_share_of_tracked_time
+            );
+        }
         Err(error) => {
             eprintln!("index failed: {error}");
             std::process::exit(1);

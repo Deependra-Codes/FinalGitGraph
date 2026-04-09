@@ -81,6 +81,8 @@ For every change:
 4. run `dev:gate:fast` during iteration
 5. run full gate before PR
 6. update docs/ADR in same PR when architecture changes
+7. for non-trivial work, follow `docs/standards/ENGINEERING_EXECUTION_POLICY.md`
+8. for architecture-sensitive paths, read `docs/ai-change-survival-playbook.md` first
 
 ## Phase 0 Exit Criteria
 

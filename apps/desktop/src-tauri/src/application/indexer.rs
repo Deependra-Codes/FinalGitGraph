@@ -1,40 +1,24 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::{params, params_from_iter, types::Value};
-
 use crate::adapters::db::{
-    apply_file_change_line_stats_updates, clear_file_change_extraction_queue_for_commits,
-    clear_repository_index_data, delete_file_changes_for_commits,
-    enqueue_commits_for_file_change_extraction, enqueue_file_changes_for_enrichment,
-    enqueue_file_changes_for_enrichment_from_drain_stage, load_commit_rowid, load_commit_window,
-    load_file_change_extraction_queue_metrics, load_index_checkpoint,
-    load_pending_file_change_enrichment, load_pending_file_change_enrichment_for_commits,
-    load_pending_file_change_extraction_commits, load_repository_id_by_path,
-    mark_file_change_enrichment_failed, mark_file_change_extraction_failed,
-    merge_file_changes_from_drain_stage, open_database, prepare_file_change_drain_stage,
-    run_migrations, set_repository_indexed_at, stage_file_change_for_drain, synchronize_refs,
-    upsert_commits_batch, upsert_file_changes, upsert_index_checkpoint, upsert_repository,
+    open_store, should_compact_graph_overlay, CsrSnapshot, GraphOverlayParentRow,
+    GraphSnapshotState, GraphStore,
 };
 use crate::adapters::git::{
-    load_file_change_line_stats_for_targets, load_refs, stream_commits, stream_commits_with_hide,
+    level3_runtime_options, load_file_change_line_stats_for_targets, load_refs,
+    reorder_commits_topologically, reorder_commits_topologically_with_parents, stream_commits,
+    stream_commits_with_hide, stream_file_changes_for_commits,
     stream_file_changes_for_commits_drain, validate_repository, FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
-use crate::application::graph_queries;
-use crate::application::indexer_pipeline::{
-    dispatch_pending_commit_batch, drain_all_file_change_batches, drain_ready_file_change_batches,
-    resolve_file_change_pipeline_config, FileChangeExtractionPipeline, FileChangeFlushStats,
-};
-use crate::application::limits::normalize_window_limit;
-use crate::application::query_graph_cache::{
-    invalidate_query_graph_cache, load_or_hydrate_query_graph,
-};
+use crate::application::limits::{normalize_graph_max_nodes, normalize_window_limit};
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowResponse, FileChangeExtractionDrainBatchStats,
-    FileChangeExtractionDrainPhaseTimingMs, FileChangeExtractionDrainStats, GraphDirection,
-    GraphTraversalResponse, GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats,
-    IngestionPhaseTimingMs, ParsedCommit, PendingFileChangeEnrichment, RepositorySummary,
-    ShortestPathResponse,
+    CommitThroughputTelemetry, CommitWindowCursor, CommitWindowResponse,
+    FileChangeExtractionDrainBatchStats, FileChangeExtractionDrainPhaseTimingMs,
+    FileChangeExtractionDrainStats, GraphDirection, GraphTraversalResponse, GraphTraversalStrategy,
+    IndexCheckpoint, IndexingMode, IndexingStats, IngestionPhaseTimingMs,
+    PendingFileChangeEnrichment, RepositorySummary, ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
@@ -42,15 +26,10 @@ use crate::support::error::{AppError, AppResult};
 const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
 const FILE_CHANGE_JIT_ENRICH_BATCH_SIZE: usize = 1_024;
-const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_DEFAULT: usize = 512;
-const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_ENV: &str =
-    "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL";
-const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_DEFAULT: usize = 1_000;
-const FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_ENV: &str =
-    "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_DRAIN";
-const INDEX_FAST_MODE_ENV: &str = "GITGRAPH_INDEX_FAST_MODE";
-const SQLITE_MAX_BIND_PARAMETERS_FALLBACK: usize = 999;
-const PENDING_EDGE_STAGE_COLUMNS: usize = 2;
+const FILE_CHANGE_COMMIT_BATCH_SIZE_ENV: &str = "GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE";
+const LEVEL3_STREAMING_CSR_ENV: &str = "GITGRAPH_LEVEL3_STREAMING_CSR";
+const LEVEL3_COSCHEDULE_JIT_ENRICH_ENV: &str = "GITGRAPH_LEVEL3_COSCHEDULE_JIT_ENRICH";
+const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
 
 #[derive(Default)]
 struct IngestionPhaseTiming {
@@ -68,7 +47,22 @@ struct IngestionPhaseTiming {
     extraction_worker_aborts: usize,
     file_change_delete: Duration,
     file_change_upsert: Duration,
+    jit_enrich_coscheduled: Duration,
     tx_commit: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InMemoryAdjacencyQueryLatencyMs {
+    pub bfs_parents: f64,
+    pub shortest_path_parents: f64,
+    pub shortest_path_both: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct InMemoryQueryBenchmarkStats {
+    pub hydration: Duration,
+    pub query_benchmark: Duration,
+    pub adjacency_latency_ms: InMemoryAdjacencyQueryLatencyMs,
 }
 
 impl IngestionPhaseTiming {
@@ -88,6 +82,7 @@ impl IngestionPhaseTiming {
             extraction_worker_aborts: self.extraction_worker_aborts as f64,
             file_change_delete: duration_ms(self.file_change_delete),
             file_change_upsert: duration_ms(self.file_change_upsert),
+            jit_enrich_coscheduled: duration_ms(self.jit_enrich_coscheduled),
             tx_commit: duration_ms(self.tx_commit),
         }
     }
@@ -103,15 +98,13 @@ impl Indexer {
     }
 
     pub fn default_db_path() -> PathBuf {
-        PathBuf::from(".gitgraph-lab/gitgraph-lab.db")
+        PathBuf::from(".gitgraph-lab/gitgraph-lab.lmdb")
     }
 
     pub fn scan_repository(&self, path: &Path) -> AppResult<RepositorySummary> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-        upsert_repository(
-            &conn,
+        let store = open_store(&self.db_path)?;
+        store.upsert_repository(
             &canonical_repo.root.display().to_string(),
             &canonical_repo.name,
             &canonical_repo.git_dir.display().to_string(),
@@ -126,18 +119,17 @@ impl Indexer {
     }
 
     pub fn index_repository(&self, path: &Path, mode: IndexingMode) -> AppResult<IndexingStats> {
+        let index_started = Instant::now();
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
+        let store = open_store(&self.db_path)?;
 
-        let repo_id = upsert_repository(
-            &conn,
+        let repo_id = store.upsert_repository(
             &canonical_repo.root.display().to_string(),
             &canonical_repo.name,
             &canonical_repo.git_dir.display().to_string(),
         )?;
 
-        let checkpoint = load_index_checkpoint(&conn, repo_id)?;
+        let checkpoint = store.load_index_checkpoint(repo_id)?;
         let mut effective_mode = mode;
         let since_epoch = match mode {
             IndexingMode::Full => None,
@@ -154,251 +146,256 @@ impl Indexer {
                 }
             }
         };
+        let level3_options = level3_runtime_options();
+        let streaming_csr_enabled = parse_env_bool_enabled(LEVEL3_STREAMING_CSR_ENV);
+        let streaming_snapshot_apply_enabled =
+            streaming_csr_enabled && effective_mode == IndexingMode::Full;
+        let coschedule_jit_enrichment_enabled =
+            parse_env_bool_enabled(LEVEL3_COSCHEDULE_JIT_ENRICH_ENV);
+        let sync_file_change_extraction = parse_env_bool_enabled(FILE_CHANGE_SYNC_STRICT_ENV);
+        let commit_batch_size = parse_positive_env_usize(FILE_CHANGE_COMMIT_BATCH_SIZE_ENV)
+            .unwrap_or(FILE_CHANGE_COMMIT_BATCH_SIZE)
+            .clamp(1, 16_384);
+
+        if effective_mode == IndexingMode::Full {
+            store.clear_repository_index_data(repo_id)?;
+            if streaming_snapshot_apply_enabled {
+                store.initialize_empty_csr_snapshot(repo_id)?;
+            }
+        }
 
         let refs = load_refs(&canonical_repo.root)?;
         let indexed_at_epoch = now_epoch_seconds();
-        let fast_mode = index_fast_mode_enabled();
-
-        let tx = conn.transaction()?;
-        if effective_mode == IndexingMode::Full {
-            clear_repository_index_data(&tx, repo_id)?;
-        }
+        let mut ingestion_timing = IngestionPhaseTiming::default();
+        let mut checkpoint_candidate: Option<(i64, String)> = None;
 
         let mut commits_inserted = 0usize;
         let mut edges_inserted = 0usize;
-        let mut file_changes_indexed = 0usize;
-        let mut ingestion_timing = IngestionPhaseTiming::default();
-        let mut checkpoint_candidate: Option<(i64, String)> = None;
-        let pipeline_config = (!fast_mode).then(|| {
-            resolve_file_change_pipeline_config(effective_mode, FILE_CHANGE_COMMIT_BATCH_SIZE)
-        });
-        let file_change_commit_batch_size = pipeline_config
+        let mut commit_batch = Vec::with_capacity(commit_batch_size);
+        let mut streamed_commit_shas = Vec::new();
+        let mut streamed_commit_parents: HashMap<String, Vec<String>> = HashMap::new();
+        let mut streaming_csr_materialized_any = false;
+        let capture_streamed_commit_parents =
+            sync_file_change_extraction && level3_options.topology_aware_extraction;
+
+        let commit_walk_started = Instant::now();
+        let hide_ancestor_sha = checkpoint
             .as_ref()
-            .map(|config| config.commit_batch_size)
-            .unwrap_or(FILE_CHANGE_COMMIT_BATCH_SIZE)
-            .max(1);
-        let fast_mode_commit_batch_size = resolve_fast_mode_commit_batch_size();
-        let commit_upsert_buffer_size = if fast_mode {
-            fast_mode_commit_batch_size
-        } else {
-            file_change_commit_batch_size
-        };
-        let mut pending_commits = Vec::with_capacity(commit_upsert_buffer_size);
-        let mut pending_commit_shas = Vec::with_capacity(file_change_commit_batch_size);
-        let mut pending_extraction_queue_shas = Vec::with_capacity(fast_mode_commit_batch_size);
-        let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
-        let mut file_change_pipeline = pipeline_config
-            .as_ref()
-            .map(|config| FileChangeExtractionPipeline::spawn(&canonical_repo.root, config));
-
-        {
-            tx.execute_batch(
-                r#"
-                CREATE TEMP TABLE IF NOT EXISTS current_pending_commit_edges (
-                  child_sha TEXT NOT NULL,
-                  parent_sha TEXT NOT NULL
-                );
-                DELETE FROM current_pending_commit_edges;
-            "#,
-            )?;
-
-            let edge_stage_batch_size = resolve_pending_edge_stage_batch_size(&tx);
-            let mut pending_edges =
-                Vec::with_capacity(edge_stage_batch_size.saturating_mul(2).max(1));
-
-            let commit_walk_started = Instant::now();
-            let mut commit_callback_elapsed = Duration::default();
-            let hide_ancestor_sha = checkpoint
-                .as_ref()
-                .filter(|_| effective_mode == IndexingMode::Incremental)
-                .map(|checkpoint| checkpoint.last_commit_sha.as_str());
-            let mut on_streamed_commit = |commit: ParsedCommit| -> AppResult<()> {
-                let callback_started = Instant::now();
-
-                for parent in &commit.parents {
-                    pending_edges.push((commit.sha.clone(), parent.clone()));
-                    if pending_edges.len() >= edge_stage_batch_size {
-                        stage_pending_commit_edges(&tx, &mut pending_edges, edge_stage_batch_size)?;
-                    }
-                    edges_inserted += 1;
-                }
-                if fast_mode {
-                    pending_extraction_queue_shas.push(commit.sha.clone());
-                    if pending_extraction_queue_shas.len() >= fast_mode_commit_batch_size {
-                        enqueue_commits_for_file_change_extraction(
-                            &tx,
-                            repo_id,
-                            &pending_extraction_queue_shas,
-                        )?;
-                        pending_extraction_queue_shas.clear();
-                    }
-                } else {
-                    if pending_commit_shas.len() >= file_change_commit_batch_size {
-                        let pipeline = file_change_pipeline.as_mut().ok_or_else(|| {
-                            AppError::Parse(
-                                "file-change extraction pipeline missing in normal index mode"
-                                    .to_string(),
-                            )
-                        })?;
-                        let dispatch_wait =
-                            dispatch_pending_commit_batch(pipeline, &mut pending_commit_shas)?;
-                        ingestion_timing.extraction_dispatch_wait = ingestion_timing
-                            .extraction_dispatch_wait
-                            .saturating_add(dispatch_wait);
-                        let flush_stats = drain_ready_file_change_batches(
-                            &tx,
-                            repo_id,
-                            effective_mode,
-                            pipeline,
-                            &mut pending_file_changes,
-                            FILE_CHANGE_DB_BATCH_SIZE,
-                        )?;
-                        accumulate_flush_stats(
-                            &mut file_changes_indexed,
-                            &mut ingestion_timing,
-                            flush_stats,
-                        );
-                    }
-                    pending_commit_shas.push(commit.sha.clone());
-                }
-
+            .filter(|_| effective_mode == IndexingMode::Incremental)
+            .map(|value| value.last_commit_sha.as_str());
+        let mut on_streamed_commit =
+            |commit: crate::domain::models::ParsedCommit| -> AppResult<()> {
+                edges_inserted = edges_inserted.saturating_add(commit.parents.len());
                 update_checkpoint_candidate(
                     &mut checkpoint_candidate,
                     commit.committer_time,
                     &commit.sha,
                 );
-                pending_commits.push(commit);
-                if pending_commits.len() >= commit_upsert_buffer_size {
-                    let commit_upsert_started = Instant::now();
-                    commits_inserted = commits_inserted.saturating_add(upsert_commits_batch(
-                        &tx,
-                        repo_id,
-                        &pending_commits,
-                    )?);
-                    pending_commits.clear();
-                    ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
+                if capture_streamed_commit_parents {
+                    streamed_commit_parents.insert(commit.sha.clone(), commit.parents.clone());
                 }
-                commit_callback_elapsed += callback_started.elapsed();
-
+                streamed_commit_shas.push(commit.sha.clone());
+                commit_batch.push(commit);
+                if commit_batch.len() >= commit_batch_size {
+                    let batch_shas: Vec<String> =
+                        commit_batch.iter().map(|item| item.sha.clone()).collect();
+                    let upsert_started = Instant::now();
+                    commits_inserted = commits_inserted
+                        .saturating_add(store.persist_commits(repo_id, &commit_batch)?);
+                    ingestion_timing.commit_upsert = ingestion_timing
+                        .commit_upsert
+                        .saturating_add(upsert_started.elapsed());
+                    if streaming_snapshot_apply_enabled {
+                        let materialize_started = Instant::now();
+                        let applied =
+                            store.apply_csr_delta_from_commit_shas(repo_id, &batch_shas)?;
+                        ingestion_timing.edge_materialize = ingestion_timing
+                            .edge_materialize
+                            .saturating_add(materialize_started.elapsed());
+                        if applied.is_some() {
+                            streaming_csr_materialized_any = true;
+                        }
+                    }
+                    commit_batch.clear();
+                }
                 Ok(())
             };
-            let stream_result = if let Some(hide_ancestor_sha) = hide_ancestor_sha {
-                stream_commits_with_hide(
-                    &canonical_repo.root,
-                    since_epoch,
-                    Some(hide_ancestor_sha),
-                    &mut on_streamed_commit,
-                )
-            } else {
-                stream_commits(&canonical_repo.root, since_epoch, &mut on_streamed_commit)
-            };
-            stream_result?;
-            ingestion_timing.commit_walk += commit_walk_started
-                .elapsed()
-                .saturating_sub(commit_callback_elapsed);
-            if !pending_commits.is_empty() {
-                let commit_upsert_started = Instant::now();
-                commits_inserted = commits_inserted.saturating_add(upsert_commits_batch(
-                    &tx,
-                    repo_id,
-                    &pending_commits,
-                )?);
-                pending_commits.clear();
-                ingestion_timing.commit_upsert += commit_upsert_started.elapsed();
-            }
-            if fast_mode && !pending_extraction_queue_shas.is_empty() {
-                enqueue_commits_for_file_change_extraction(
-                    &tx,
-                    repo_id,
-                    &pending_extraction_queue_shas,
-                )?;
-                pending_extraction_queue_shas.clear();
-            }
-            if !pending_edges.is_empty() {
-                stage_pending_commit_edges(&tx, &mut pending_edges, edge_stage_batch_size)?;
-            }
 
-            let edge_materialize_started = Instant::now();
-            tx.execute(
-                r#"
-                INSERT INTO commit_edges (repo_id, child_commit_id, parent_commit_id)
-                SELECT
-                  ?1 AS repo_id,
-                  child.commit_id AS child_commit_id,
-                  parent.commit_id AS parent_commit_id
-                FROM current_pending_commit_edges edge
-                JOIN commits child
-                  ON child.repo_id = ?1
-                 AND child.sha = edge.child_sha
-                JOIN commits parent
-                  ON parent.repo_id = ?1
-                 AND parent.sha = edge.parent_sha
-                ON CONFLICT(repo_id, child_commit_id, parent_commit_id) DO NOTHING
-            "#,
-                params![repo_id],
-            )?;
-            ingestion_timing.edge_materialize += edge_materialize_started.elapsed();
+        let commit_walk_stats = if let Some(hide_ancestor_sha) = hide_ancestor_sha {
+            stream_commits_with_hide(
+                &canonical_repo.root,
+                since_epoch,
+                Some(hide_ancestor_sha),
+                &mut on_streamed_commit,
+            )?
+        } else {
+            stream_commits(&canonical_repo.root, since_epoch, &mut on_streamed_commit)?
+        };
+        ingestion_timing.commit_walk = commit_walk_started.elapsed();
+
+        if !commit_batch.is_empty() {
+            let batch_shas: Vec<String> =
+                commit_batch.iter().map(|item| item.sha.clone()).collect();
+            let upsert_started = Instant::now();
+            commits_inserted =
+                commits_inserted.saturating_add(store.persist_commits(repo_id, &commit_batch)?);
+            ingestion_timing.commit_upsert = ingestion_timing
+                .commit_upsert
+                .saturating_add(upsert_started.elapsed());
+            if streaming_snapshot_apply_enabled {
+                let materialize_started = Instant::now();
+                let applied = store.apply_csr_delta_from_commit_shas(repo_id, &batch_shas)?;
+                ingestion_timing.edge_materialize = ingestion_timing
+                    .edge_materialize
+                    .saturating_add(materialize_started.elapsed());
+                if applied.is_some() {
+                    streaming_csr_materialized_any = true;
+                }
+            }
+            commit_batch.clear();
         }
 
-        if !fast_mode {
-            let pipeline = file_change_pipeline.as_mut().ok_or_else(|| {
-                AppError::Parse(
-                    "file-change extraction pipeline missing in normal index mode".to_string(),
-                )
-            })?;
-            let dispatch_wait = dispatch_pending_commit_batch(pipeline, &mut pending_commit_shas)?;
-            ingestion_timing.extraction_dispatch_wait = ingestion_timing
-                .extraction_dispatch_wait
-                .saturating_add(dispatch_wait);
-            pipeline.close_input();
-            let flush_stats = drain_all_file_change_batches(
-                &tx,
-                repo_id,
-                effective_mode,
-                pipeline,
-                &mut pending_file_changes,
-                FILE_CHANGE_DB_BATCH_SIZE,
-            )?;
-            accumulate_flush_stats(
-                &mut file_changes_indexed,
-                &mut ingestion_timing,
-                flush_stats,
-            );
-            pipeline.join_worker()?;
-            let pipeline_metrics = pipeline.metrics();
-            ingestion_timing.extraction_reorder_buffer_max_depth = ingestion_timing
-                .extraction_reorder_buffer_max_depth
-                .max(pipeline_metrics.reorder_buffer_max_depth);
-            ingestion_timing.extraction_worker_errors = ingestion_timing
-                .extraction_worker_errors
-                .saturating_add(pipeline_metrics.worker_errors);
-            ingestion_timing.extraction_worker_aborts = ingestion_timing
-                .extraction_worker_aborts
-                .saturating_add(pipeline_metrics.worker_aborts);
-            if !pending_file_changes.is_empty() {
-                let file_change_upsert_started = Instant::now();
-                file_changes_indexed = file_changes_indexed.saturating_add(upsert_file_changes(
-                    &tx,
-                    repo_id,
-                    &pending_file_changes,
-                )?);
-                enqueue_file_changes_for_enrichment(&tx, repo_id, &pending_file_changes)?;
-                ingestion_timing.file_change_upsert += file_change_upsert_started.elapsed();
+        let mut file_changes_indexed = 0usize;
+        let mut file_change_commits_enqueued = 0usize;
+        if sync_file_change_extraction {
+            let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
+            for commit_chunk in streamed_commit_shas.chunks(commit_batch_size.max(1)) {
+                let extraction_chunk = if level3_options.topology_aware_extraction {
+                    reorder_commits_topologically_with_parents(
+                        commit_chunk,
+                        &streamed_commit_parents,
+                    )
+                } else {
+                    commit_chunk.to_vec()
+                };
+                if effective_mode == IndexingMode::Incremental {
+                    let delete_started = Instant::now();
+                    store.delete_file_changes_for_commits(repo_id, commit_chunk)?;
+                    ingestion_timing.file_change_delete = ingestion_timing
+                        .file_change_delete
+                        .saturating_add(delete_started.elapsed());
+                }
+
+                let diff_extract_started = Instant::now();
+                let telemetry = stream_file_changes_for_commits(
+                    &canonical_repo.root,
+                    &extraction_chunk,
+                    |change| {
+                        pending_file_changes.push(change);
+                        Ok(())
+                    },
+                )?;
+                ingestion_timing.file_diff_extract = ingestion_timing
+                    .file_diff_extract
+                    .saturating_add(diff_extract_started.elapsed());
+                ingestion_timing.file_diff_build = ingestion_timing
+                    .file_diff_build
+                    .saturating_add(telemetry.diff_build);
+                ingestion_timing.file_diff_rename_find = ingestion_timing
+                    .file_diff_rename_find
+                    .saturating_add(telemetry.rename_find);
+                ingestion_timing.file_diff_delta_emit = ingestion_timing
+                    .file_diff_delta_emit
+                    .saturating_add(telemetry.delta_emit);
+
+                if pending_file_changes.is_empty() {
+                    continue;
+                }
+
+                let upsert_started = Instant::now();
+                let persisted = store.persist_file_changes(repo_id, &pending_file_changes)?;
+                file_changes_indexed = file_changes_indexed.saturating_add(persisted);
+                ingestion_timing.file_change_upsert = ingestion_timing
+                    .file_change_upsert
+                    .saturating_add(upsert_started.elapsed());
+                if coschedule_jit_enrichment_enabled {
+                    let jit_started = Instant::now();
+                    let pending = store.load_pending_file_change_enrichment_for_commits(
+                        repo_id,
+                        &extraction_chunk,
+                        FILE_CHANGE_JIT_ENRICH_BATCH_SIZE,
+                    )?;
+                    let _ = enrich_file_change_stats_batch(
+                        &canonical_repo.root,
+                        &store,
+                        repo_id,
+                        &pending,
+                    )?;
+                    ingestion_timing.jit_enrich_coscheduled = ingestion_timing
+                        .jit_enrich_coscheduled
+                        .saturating_add(jit_started.elapsed());
+                }
                 pending_file_changes.clear();
             }
+        } else if !streamed_commit_shas.is_empty() {
+            let enqueue_started = Instant::now();
+            file_change_commits_enqueued =
+                store.enqueue_commits_for_file_change_extraction(repo_id, &streamed_commit_shas)?;
+            ingestion_timing.extraction_dispatch_wait = ingestion_timing
+                .extraction_dispatch_wait
+                .saturating_add(enqueue_started.elapsed());
         }
 
-        let refs_indexed = synchronize_refs(&tx, repo_id, &refs)?;
-        set_repository_indexed_at(&tx, repo_id, indexed_at_epoch)?;
-
+        let refs_indexed = store.synchronize_refs(repo_id, &refs)?;
+        store.set_repository_indexed_at(repo_id, indexed_at_epoch)?;
         if let Some(checkpoint) = build_checkpoint(checkpoint_candidate, indexed_at_epoch) {
-            upsert_index_checkpoint(&tx, repo_id, &checkpoint)?;
+            store.upsert_index_checkpoint(repo_id, &checkpoint)?;
         }
 
-        let tx_commit_started = Instant::now();
-        tx.commit()?;
-        ingestion_timing.tx_commit += tx_commit_started.elapsed();
-        invalidate_query_graph_cache(&self.db_path);
+        if effective_mode == IndexingMode::Incremental {
+            if !streamed_commit_shas.is_empty() {
+                let snapshot_started = Instant::now();
+                let overlay_metadata = if store.load_graph_snapshot_metadata(repo_id)?.is_some() {
+                    store.persist_graph_overlay_commits(repo_id, &streamed_commit_shas)?
+                } else {
+                    let _ = store.rebuild_csr_snapshot(repo_id)?;
+                    store
+                        .load_graph_snapshot_metadata(repo_id)?
+                        .ok_or_else(|| {
+                            AppError::Parse(
+                            "graph snapshot metadata missing after incremental fallback rebuild"
+                                .to_string(),
+                        )
+                        })?
+                };
+
+                if should_compact_graph_overlay(&overlay_metadata) {
+                    let compacted = store.compact_graph_overlay_into_snapshot(repo_id)?;
+                    if compacted.is_none() {
+                        let _ = store.rebuild_csr_snapshot(repo_id)?;
+                    }
+                }
+
+                ingestion_timing.edge_materialize = ingestion_timing
+                    .edge_materialize
+                    .saturating_add(snapshot_started.elapsed());
+            }
+        } else if !streaming_csr_enabled {
+            let snapshot_started = Instant::now();
+            {
+                let _ = store.rebuild_csr_snapshot(repo_id)?;
+            }
+            ingestion_timing.edge_materialize = ingestion_timing
+                .edge_materialize
+                .saturating_add(snapshot_started.elapsed());
+        } else if !streamed_commit_shas.is_empty() && !streaming_csr_materialized_any {
+            let snapshot_started = Instant::now();
+            let _ = store.rebuild_csr_snapshot(repo_id)?;
+            ingestion_timing.edge_materialize = ingestion_timing
+                .edge_materialize
+                .saturating_add(snapshot_started.elapsed());
+        }
+
+        let commit_throughput = build_commit_throughput_telemetry(
+            streamed_commit_shas.len(),
+            commits_inserted,
+            index_started.elapsed(),
+            &ingestion_timing,
+            commit_walk_stats.scope.as_str(),
+            commit_walk_stats.tip_count,
+            commit_walk_stats.pruned_parent_expansions,
+        );
+        let queue_after_index = store.load_file_change_extraction_queue_metrics(repo_id)?;
 
         Ok(IndexingStats {
             repo_id,
@@ -406,9 +403,13 @@ impl Indexer {
             commits_indexed: commits_inserted,
             edges_indexed: edges_inserted,
             file_changes_indexed,
+            file_change_commits_enqueued,
+            file_change_queue_depth_after_index: queue_after_index.depth,
+            file_change_queue_oldest_age_seconds: queue_after_index.oldest_queue_age_seconds,
             refs_indexed,
             indexed_at_epoch,
             ingestion_phase_timing_ms: ingestion_timing.into_ms(),
+            commit_throughput,
         })
     }
 
@@ -418,144 +419,124 @@ impl Indexer {
         max_commits: Option<usize>,
     ) -> AppResult<FileChangeExtractionDrainStats> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
+        let store = open_store(&self.db_path)?;
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
-        let mut remaining_budget = max_commits.unwrap_or(usize::MAX).max(1);
-        let drain_batch_size = resolve_drain_commit_batch_size();
-        let mut drained_commits = 0usize;
+        let mut phase_timing = FileChangeExtractionDrainPhaseTimingMs::default();
+        let mut batch_stats = FileChangeExtractionDrainBatchStats::default();
+        let level3_options = level3_runtime_options();
+
+        let queue_fetch_started = Instant::now();
+        let _queue_before = store.load_file_change_extraction_queue_metrics(repo_id)?;
+        phase_timing.queue_fetch = duration_ms(queue_fetch_started.elapsed());
+
+        let mut remaining = max_commits
+            .unwrap_or(FILE_CHANGE_JIT_ENRICH_BATCH_SIZE)
+            .max(1);
+        let extraction_commit_batch_size =
+            parse_positive_env_usize(FILE_CHANGE_COMMIT_BATCH_SIZE_ENV)
+                .unwrap_or(FILE_CHANGE_COMMIT_BATCH_SIZE)
+                .clamp(1, 16_384);
+        let mut drained_commits_set: HashSet<String> = HashSet::new();
         let mut failed_commits = 0usize;
         let mut file_changes_indexed = 0usize;
+        let mut total_file_changes_processed = 0usize;
         let mut batches = 0usize;
-        let mut total_commits_queried = 0usize;
 
-        let mut queue_fetch = Duration::default();
-        let mut diff_extract = Duration::default();
-        let mut stage_insert = Duration::default();
-        let mut delete_old_rows = Duration::default();
-        let mut file_change_merge_upsert = Duration::default();
-        let mut enrichment_enqueue = Duration::default();
-        let mut queue_clear = Duration::default();
-        let mut tx_commit = Duration::default();
-
-        loop {
-            if remaining_budget == 0 {
-                break;
-            }
-            let batch_limit = remaining_budget.clamp(1, drain_batch_size);
-            let queue_fetch_started = Instant::now();
+        while remaining > 0 {
+            let batch_limit = remaining.clamp(1, extraction_commit_batch_size);
+            let fetch_started = Instant::now();
             let pending_commits =
-                load_pending_file_change_extraction_commits(&conn, repo_id, batch_limit)?;
-            queue_fetch = queue_fetch.saturating_add(queue_fetch_started.elapsed());
+                store.load_pending_file_change_extraction_commits(repo_id, batch_limit)?;
+            phase_timing.queue_fetch += duration_ms(fetch_started.elapsed());
             if pending_commits.is_empty() {
                 break;
             }
-            batches = batches.saturating_add(1);
-            total_commits_queried = total_commits_queried.saturating_add(pending_commits.len());
 
-            let tx = conn.transaction()?;
-            prepare_file_change_drain_stage(&tx)?;
+            let extraction_chunk = if level3_options.topology_aware_extraction {
+                reorder_commits_topologically(&canonical_repo.root, &pending_commits)
+                    .unwrap_or_else(|_| pending_commits.clone())
+            } else {
+                pending_commits.clone()
+            };
+            let mut pending_file_changes = Vec::with_capacity(FILE_CHANGE_DB_BATCH_SIZE);
 
-            let mut batch_stage_insert = Duration::default();
+            let delete_started = Instant::now();
+            store.delete_file_changes_for_commits(repo_id, &extraction_chunk)?;
+            phase_timing.delete_old_rows += duration_ms(delete_started.elapsed());
+
             let diff_extract_started = Instant::now();
-            let extraction_result = stream_file_changes_for_commits_drain(
+            let extraction = stream_file_changes_for_commits_drain(
                 &canonical_repo.root,
-                &pending_commits,
+                &extraction_chunk,
                 |change| {
-                    let stage_insert_started = Instant::now();
-                    stage_file_change_for_drain(&tx, &change)?;
-                    batch_stage_insert =
-                        batch_stage_insert.saturating_add(stage_insert_started.elapsed());
+                    pending_file_changes.push(change);
                     Ok(())
                 },
             );
-            let batch_diff_extract_elapsed = diff_extract_started.elapsed();
-            stage_insert = stage_insert.saturating_add(batch_stage_insert);
-            diff_extract = diff_extract
-                .saturating_add(batch_diff_extract_elapsed.saturating_sub(batch_stage_insert));
+            phase_timing.diff_extract += duration_ms(diff_extract_started.elapsed());
 
-            match extraction_result {
-                Ok(_) => {
-                    let delete_started = Instant::now();
-                    delete_file_changes_for_commits(&tx, repo_id, &pending_commits)?;
-                    delete_old_rows = delete_old_rows.saturating_add(delete_started.elapsed());
-
-                    let merge_started = Instant::now();
-                    let merged = merge_file_changes_from_drain_stage(&tx, repo_id)?;
-                    file_change_merge_upsert =
-                        file_change_merge_upsert.saturating_add(merge_started.elapsed());
-                    file_changes_indexed = file_changes_indexed.saturating_add(merged);
-
-                    let enqueue_started = Instant::now();
-                    let _ = enqueue_file_changes_for_enrichment_from_drain_stage(&tx, repo_id)?;
-                    enrichment_enqueue =
-                        enrichment_enqueue.saturating_add(enqueue_started.elapsed());
-
-                    let queue_clear_started = Instant::now();
-                    clear_file_change_extraction_queue_for_commits(&tx, repo_id, &pending_commits)?;
-                    queue_clear = queue_clear.saturating_add(queue_clear_started.elapsed());
-
-                    let tx_commit_started = Instant::now();
-                    tx.commit()?;
-                    tx_commit = tx_commit.saturating_add(tx_commit_started.elapsed());
-                    drained_commits = drained_commits.saturating_add(pending_commits.len());
-                }
+            let telemetry = match extraction {
+                Ok(telemetry) => telemetry,
                 Err(error) => {
-                    drop(tx);
-                    let tx = conn.transaction()?;
-                    mark_file_change_extraction_failed(
-                        &tx,
+                    let error_message = error.to_string();
+                    let failure_started = Instant::now();
+                    let _ = store.mark_file_change_extraction_commits_failed(
                         repo_id,
                         &pending_commits,
-                        error.to_string().as_str(),
+                        &error_message,
                     )?;
-                    tx.commit()?;
+                    phase_timing.queue_clear += duration_ms(failure_started.elapsed());
                     failed_commits = failed_commits.saturating_add(pending_commits.len());
+                    remaining = remaining.saturating_sub(pending_commits.len());
+                    continue;
                 }
+            };
+            phase_timing.stage_insert += duration_ms(telemetry.total());
+
+            let merge_upsert_started = Instant::now();
+            let persisted = store.persist_file_changes(repo_id, &pending_file_changes)?;
+            let merge_upsert_elapsed = merge_upsert_started.elapsed();
+            phase_timing.file_change_merge_upsert += duration_ms(merge_upsert_elapsed);
+            phase_timing.enrichment_enqueue += duration_ms(merge_upsert_elapsed);
+
+            let queue_clear_started = Instant::now();
+            let _ = store.remove_file_change_extraction_commits(repo_id, &pending_commits)?;
+            phase_timing.queue_clear += duration_ms(queue_clear_started.elapsed());
+
+            for commit_sha in &pending_commits {
+                drained_commits_set.insert(commit_sha.clone());
             }
 
-            if max_commits.is_some() {
-                remaining_budget = remaining_budget.saturating_sub(pending_commits.len());
-            }
+            batches = batches.saturating_add(1);
+            total_file_changes_processed =
+                total_file_changes_processed.saturating_add(pending_file_changes.len());
+            file_changes_indexed = file_changes_indexed.saturating_add(persisted);
+            remaining = remaining.saturating_sub(pending_commits.len());
         }
 
-        let queue = load_file_change_extraction_queue_metrics(&conn, repo_id)?;
+        if batches > 0 {
+            batch_stats.batches = batches;
+            batch_stats.commits_per_batch_mean = drained_commits_set.len() as f64 / batches as f64;
+            batch_stats.file_changes_per_batch_mean =
+                total_file_changes_processed as f64 / batches as f64;
+        }
+
+        let queue_after_started = Instant::now();
+        let queue = store.load_file_change_extraction_queue_metrics(repo_id)?;
+        phase_timing.queue_clear += duration_ms(queue_after_started.elapsed());
+
         Ok(FileChangeExtractionDrainStats {
-            drained_commits,
+            drained_commits: drained_commits_set.len(),
             failed_commits,
             file_changes_indexed,
             queue,
-            phase_timing_ms: FileChangeExtractionDrainPhaseTimingMs {
-                queue_fetch: duration_ms(queue_fetch),
-                diff_extract: duration_ms(diff_extract),
-                stage_insert: duration_ms(stage_insert),
-                delete_old_rows: duration_ms(delete_old_rows),
-                file_change_merge_upsert: duration_ms(file_change_merge_upsert),
-                enrichment_enqueue: duration_ms(enrichment_enqueue),
-                queue_clear: duration_ms(queue_clear),
-                tx_commit: duration_ms(tx_commit),
-            },
-            batch_stats: FileChangeExtractionDrainBatchStats {
-                batches,
-                commits_per_batch_mean: if batches == 0 {
-                    0.0
-                } else {
-                    total_commits_queried as f64 / batches as f64
-                },
-                file_changes_per_batch_mean: if batches == 0 {
-                    0.0
-                } else {
-                    file_changes_indexed as f64 / batches as f64
-                },
-            },
+            phase_timing_ms: phase_timing,
+            batch_stats,
         })
     }
 
@@ -565,22 +546,18 @@ impl Indexer {
         max_items: Option<usize>,
     ) -> AppResult<usize> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
+        let store = open_store(&self.db_path)?;
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
         let batch_size = max_items
             .unwrap_or(FILE_CHANGE_JIT_ENRICH_BATCH_SIZE)
             .max(1);
-        let pending = load_pending_file_change_enrichment(&conn, repo_id, batch_size)?;
-        enrich_file_change_stats_batch(&canonical_repo.root, &mut conn, repo_id, &pending)
+        let pending = store.load_pending_file_change_enrichment(repo_id, batch_size)?;
+        enrich_file_change_stats_batch(&canonical_repo.root, &store, repo_id, &pending)
     }
 
     pub fn ensure_file_change_stats_for_commits(
@@ -594,27 +571,22 @@ impl Indexer {
         }
 
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
+        let store = open_store(&self.db_path)?;
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
         let batch_size = max_items
             .unwrap_or(FILE_CHANGE_JIT_ENRICH_BATCH_SIZE)
             .max(1);
-        let pending = load_pending_file_change_enrichment_for_commits(
-            &conn,
+        let pending = store.load_pending_file_change_enrichment_for_commits(
             repo_id,
             commit_shas,
             batch_size,
         )?;
-        enrich_file_change_stats_batch(&canonical_repo.root, &mut conn, repo_id, &pending)
+        enrich_file_change_stats_batch(&canonical_repo.root, &store, repo_id, &pending)
     }
 
     pub fn get_commit_window(
@@ -624,22 +596,18 @@ impl Indexer {
         cursor: Option<CommitWindowCursor>,
     ) -> AppResult<CommitWindowResponse> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
+        let store = open_store(&self.db_path)?;
 
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
 
         let bounded_limit = normalize_window_limit(limit);
         let fetch_limit = bounded_limit.saturating_add(1);
-
-        let mut commits = load_commit_window(&conn, repo_id, fetch_limit, cursor.as_ref())?;
+        let mut commits = store.load_commit_window(repo_id, fetch_limit, cursor.as_ref())?;
         let has_more = commits.len() > bounded_limit;
         if has_more {
             commits.truncate(bounded_limit);
@@ -670,29 +638,19 @@ impl Indexer {
         max_nodes: usize,
     ) -> AppResult<GraphTraversalResponse> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
+        let store = open_store(&self.db_path)?;
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
-        if query_runtime_cache_enabled() {
-            let graph = load_or_hydrate_query_graph(&conn, &self.db_path, repo_id)?;
-            return graph.traverse(start_sha, strategy, direction, max_nodes);
-        }
 
-        let Some(start_rowid) = load_commit_rowid(&conn, repo_id, start_sha)? else {
-            return Err(AppError::InvalidArgument(format!(
-                "start commit not indexed for repository: {start_sha}"
-            )));
-        };
-
-        graph_queries::traverse_graph(&conn, repo_id, start_rowid, strategy, direction, max_nodes)
+        let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
+            AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
+        })?;
+        QueryGraph::from_graph_state(graph_state)?
+            .traverse(start_sha, strategy, direction, max_nodes)
     }
 
     pub fn shortest_path(
@@ -703,125 +661,99 @@ impl Indexer {
         direction: GraphDirection,
     ) -> AppResult<ShortestPathResponse> {
         let canonical_repo = validate_repository(path)?;
-        let mut conn = open_database(&self.db_path)?;
-        run_migrations(&mut conn)?;
-
-        let repo_path = canonical_repo.root.display().to_string();
-        let git_dir = canonical_repo.git_dir.display().to_string();
+        let store = open_store(&self.db_path)?;
         let repo_id = resolve_repository_id_for_read(
-            &conn,
-            repo_path.as_str(),
-            canonical_repo.name.as_str(),
-            git_dir.as_str(),
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
         )?;
-        if query_runtime_cache_enabled() {
-            let graph = load_or_hydrate_query_graph(&conn, &self.db_path, repo_id)?;
-            return graph.shortest_path(from_sha, to_sha, direction);
+
+        let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
+            AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
+        })?;
+        QueryGraph::from_graph_state(graph_state)?.shortest_path(from_sha, to_sha, direction)
+    }
+
+    pub fn benchmark_in_memory_queries(
+        &self,
+        path: &Path,
+        start_sha: &str,
+        root_sha: &str,
+        pre_merge_main_sha: &str,
+        query_runs: usize,
+        max_nodes: usize,
+    ) -> AppResult<InMemoryQueryBenchmarkStats> {
+        let canonical_repo = validate_repository(path)?;
+        let store = open_store(&self.db_path)?;
+        let repo_id = resolve_repository_id_for_read(
+            &store,
+            &canonical_repo.root.display().to_string(),
+            &canonical_repo.name,
+            &canonical_repo.git_dir.display().to_string(),
+        )?;
+
+        let hydration_started = Instant::now();
+        let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
+            AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
+        })?;
+        let query_graph = QueryGraph::from_graph_state(graph_state)?;
+        let hydration = hydration_started.elapsed();
+
+        let runs = query_runs.max(1);
+        let mut bfs_parents_total = Duration::default();
+        let mut shortest_path_parents_total = Duration::default();
+        let mut shortest_path_both_total = Duration::default();
+        let query_started = Instant::now();
+        for _ in 0..runs {
+            let bfs_started = Instant::now();
+            let _ = query_graph.traverse(
+                start_sha,
+                GraphTraversalStrategy::Bfs,
+                GraphDirection::Parents,
+                max_nodes,
+            )?;
+            bfs_parents_total = bfs_parents_total.saturating_add(bfs_started.elapsed());
+
+            let shortest_parents_started = Instant::now();
+            let _ = query_graph.shortest_path(start_sha, root_sha, GraphDirection::Parents)?;
+            shortest_path_parents_total =
+                shortest_path_parents_total.saturating_add(shortest_parents_started.elapsed());
+
+            let shortest_both_started = Instant::now();
+            let _ =
+                query_graph.shortest_path(start_sha, pre_merge_main_sha, GraphDirection::Both)?;
+            shortest_path_both_total =
+                shortest_path_both_total.saturating_add(shortest_both_started.elapsed());
         }
 
-        let Some(from_rowid) = load_commit_rowid(&conn, repo_id, from_sha)? else {
-            return Err(AppError::InvalidArgument(format!(
-                "source commit not indexed for repository: {from_sha}"
-            )));
-        };
-        let Some(to_rowid) = load_commit_rowid(&conn, repo_id, to_sha)? else {
-            return Err(AppError::InvalidArgument(format!(
-                "target commit not indexed for repository: {to_sha}"
-            )));
-        };
-
-        graph_queries::shortest_path(
-            &conn, repo_id, from_sha, to_sha, direction, from_rowid, to_rowid,
-        )
+        Ok(InMemoryQueryBenchmarkStats {
+            hydration,
+            query_benchmark: query_started.elapsed(),
+            adjacency_latency_ms: InMemoryAdjacencyQueryLatencyMs {
+                bfs_parents: duration_ms(bfs_parents_total) / runs as f64,
+                shortest_path_parents: duration_ms(shortest_path_parents_total) / runs as f64,
+                shortest_path_both: duration_ms(shortest_path_both_total) / runs as f64,
+            },
+        })
     }
 }
 
-fn parse_env_bool_enabled(key: &str) -> bool {
-    std::env::var(key)
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            matches!(normalized.as_str(), "1" | "true" | "on" | "yes")
-        })
-        .unwrap_or(false)
-}
-
-fn parse_positive_env_usize(key: &str) -> Option<usize> {
-    std::env::var(key)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
-fn index_fast_mode_enabled() -> bool {
-    parse_env_bool_enabled(INDEX_FAST_MODE_ENV)
-}
-
-fn resolve_fast_mode_commit_batch_size() -> usize {
-    parse_positive_env_usize(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_ENV)
-        .unwrap_or(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_FAST_DEFAULT)
-        .max(1)
-}
-
-fn resolve_drain_commit_batch_size() -> usize {
-    parse_positive_env_usize(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_ENV)
-        .unwrap_or(FILE_CHANGE_EXTRACTION_QUEUE_BATCH_SIZE_DRAIN_DEFAULT)
-        .max(1)
-}
-
-fn query_runtime_cache_enabled() -> bool {
-    std::env::var("GITGRAPH_QUERY_RUNTIME_CACHE")
-        .map(|raw| {
-            let normalized = raw.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(true)
-}
-
 fn resolve_repository_id_for_read(
-    conn: &rusqlite::Connection,
+    store: &GraphStore,
     repo_path: &str,
     repo_name: &str,
     repo_git_dir: &str,
 ) -> AppResult<i64> {
-    if let Some(repo_id) = load_repository_id_by_path(conn, repo_path)? {
+    if let Some(repo_id) = store.load_repository_id_by_path(repo_path)? {
         return Ok(repo_id);
     }
-
-    upsert_repository(conn, repo_path, repo_name, repo_git_dir)
-}
-
-fn accumulate_flush_stats(
-    file_changes_indexed: &mut usize,
-    ingestion_timing: &mut IngestionPhaseTiming,
-    stats: FileChangeFlushStats,
-) {
-    *file_changes_indexed = file_changes_indexed.saturating_add(stats.file_changes_indexed);
-    ingestion_timing.file_diff_extract = ingestion_timing
-        .file_diff_extract
-        .saturating_add(stats.file_diff_extract);
-    ingestion_timing.file_diff_build = ingestion_timing
-        .file_diff_build
-        .saturating_add(stats.file_diff_build);
-    ingestion_timing.file_diff_rename_find = ingestion_timing
-        .file_diff_rename_find
-        .saturating_add(stats.file_diff_rename_find);
-    ingestion_timing.file_diff_delta_emit = ingestion_timing
-        .file_diff_delta_emit
-        .saturating_add(stats.file_diff_delta_emit);
-    ingestion_timing.extraction_worker_busy = ingestion_timing
-        .extraction_worker_busy
-        .saturating_add(stats.extraction_worker_busy);
-    ingestion_timing.file_change_delete = ingestion_timing
-        .file_change_delete
-        .saturating_add(stats.file_change_delete);
-    ingestion_timing.file_change_upsert = ingestion_timing
-        .file_change_upsert
-        .saturating_add(stats.file_change_upsert);
+    store.upsert_repository(repo_path, repo_name, repo_git_dir)
 }
 
 fn enrich_file_change_stats_batch(
     repo_root: &Path,
-    conn: &mut rusqlite::Connection,
+    store: &GraphStore,
     repo_id: i64,
     pending: &[PendingFileChangeEnrichment],
 ) -> AppResult<usize> {
@@ -832,17 +764,16 @@ fn enrich_file_change_stats_batch(
     let updates = match load_file_change_line_stats_for_targets(repo_root, pending) {
         Ok(updates) => updates,
         Err(error) => {
-            let tx = conn.transaction()?;
-            mark_file_change_enrichment_failed(&tx, repo_id, pending, error.to_string().as_str())?;
-            tx.commit()?;
+            store.mark_file_change_enrichment_failed(
+                repo_id,
+                pending,
+                error.to_string().as_str(),
+            )?;
             return Err(error);
         }
     };
 
-    let tx = conn.transaction()?;
-    let applied = apply_file_change_line_stats_updates(&tx, repo_id, &updates)?;
-    tx.commit()?;
-    Ok(applied)
+    store.apply_file_change_line_stats_updates(repo_id, &updates)
 }
 
 fn update_checkpoint_candidate(
@@ -876,73 +807,919 @@ fn build_checkpoint(
     })
 }
 
+fn parse_env_bool_enabled(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn parse_positive_env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
-fn resolve_pending_edge_stage_batch_size(conn: &rusqlite::Connection) -> usize {
-    let max_bind_parameters = conn
-        .query_row("PRAGMA max_variable_number", [], |row| row.get::<_, i64>(0))
-        .ok()
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(SQLITE_MAX_BIND_PARAMETERS_FALLBACK);
-
-    max_bind_parameters
-        .checked_div(PENDING_EDGE_STAGE_COLUMNS)
-        .unwrap_or(1)
-        .max(1)
+fn throughput_per_sec(commits: usize, duration: Duration) -> f64 {
+    if commits == 0 {
+        return 0.0;
+    }
+    let seconds = duration.as_secs_f64();
+    if seconds <= 0.0 {
+        return 0.0;
+    }
+    commits as f64 / seconds
 }
 
-fn stage_pending_commit_edges(
-    tx: &rusqlite::Connection,
-    pending_edges: &mut Vec<(String, String)>,
-    batch_size: usize,
-) -> AppResult<()> {
-    if pending_edges.is_empty() {
-        return Ok(());
+fn ms_per_commit(commits: usize, duration: Duration) -> f64 {
+    if commits == 0 {
+        return 0.0;
+    }
+    duration_ms(duration) / commits as f64
+}
+
+fn build_commit_throughput_telemetry(
+    commits_seen: usize,
+    commits_indexed: usize,
+    end_to_end: Duration,
+    ingestion_timing: &IngestionPhaseTiming,
+    commit_walk_scope: &str,
+    commit_walk_tip_count: usize,
+    commit_walk_pruned_parent_expansions: usize,
+) -> CommitThroughputTelemetry {
+    let tracked_phases: [(&str, Duration); 8] = [
+        ("commit_walk", ingestion_timing.commit_walk),
+        ("commit_upsert", ingestion_timing.commit_upsert),
+        ("edge_materialize", ingestion_timing.edge_materialize),
+        ("file_diff_extract", ingestion_timing.file_diff_extract),
+        ("file_change_delete", ingestion_timing.file_change_delete),
+        ("file_change_upsert", ingestion_timing.file_change_upsert),
+        (
+            "jit_enrich_coscheduled",
+            ingestion_timing.jit_enrich_coscheduled,
+        ),
+        ("tx_commit", ingestion_timing.tx_commit),
+    ];
+
+    let mut tracked_total = Duration::ZERO;
+    let mut bottleneck_phase = "none";
+    let mut bottleneck_duration = Duration::ZERO;
+    for (phase_name, phase_duration) in tracked_phases {
+        tracked_total = tracked_total.saturating_add(phase_duration);
+        if phase_duration > bottleneck_duration {
+            bottleneck_phase = phase_name;
+            bottleneck_duration = phase_duration;
+        }
     }
 
-    let effective_batch_size = batch_size.max(1);
-    let mut chunks = pending_edges.chunks_exact(effective_batch_size);
-    if pending_edges.len() >= effective_batch_size {
-        let full_sql = build_pending_edge_stage_insert_sql(effective_batch_size);
-        let mut full_stmt = tx.prepare_cached(&full_sql)?;
-        for chunk in &mut chunks {
-            let mut bind_values = Vec::with_capacity(chunk.len() * PENDING_EDGE_STAGE_COLUMNS);
-            for (child_sha, parent_sha) in chunk {
-                bind_values.push(Value::Text(child_sha.clone()));
-                bind_values.push(Value::Text(parent_sha.clone()));
+    let bottleneck_share_of_tracked_time = if tracked_total.as_secs_f64() <= 0.0 {
+        0.0
+    } else {
+        bottleneck_duration.as_secs_f64() / tracked_total.as_secs_f64()
+    };
+
+    CommitThroughputTelemetry {
+        commits_seen,
+        commits_indexed,
+        end_to_end_ms: duration_ms(end_to_end),
+        commits_per_sec_seen: throughput_per_sec(commits_seen, end_to_end),
+        commits_per_sec_indexed: throughput_per_sec(commits_indexed, end_to_end),
+        ms_per_commit_seen: ms_per_commit(commits_seen, end_to_end),
+        ms_per_commit_indexed: ms_per_commit(commits_indexed, end_to_end),
+        commit_walk_scope: commit_walk_scope.to_string(),
+        commit_walk_tip_count,
+        commit_walk_pruned_parent_expansions,
+        commit_walk_ms: duration_ms(ingestion_timing.commit_walk),
+        commit_walk_commits_per_sec_seen: throughput_per_sec(
+            commits_seen,
+            ingestion_timing.commit_walk,
+        ),
+        commit_upsert_ms: duration_ms(ingestion_timing.commit_upsert),
+        commit_upsert_commits_per_sec_seen: throughput_per_sec(
+            commits_seen,
+            ingestion_timing.commit_upsert,
+        ),
+        file_diff_extract_ms: duration_ms(ingestion_timing.file_diff_extract),
+        file_diff_extract_commits_per_sec_seen: throughput_per_sec(
+            commits_seen,
+            ingestion_timing.file_diff_extract,
+        ),
+        file_change_upsert_ms: duration_ms(ingestion_timing.file_change_upsert),
+        file_change_upsert_commits_per_sec_seen: throughput_per_sec(
+            commits_seen,
+            ingestion_timing.file_change_upsert,
+        ),
+        tx_commit_ms: duration_ms(ingestion_timing.tx_commit),
+        tx_commit_commits_per_sec_seen: throughput_per_sec(
+            commits_seen,
+            ingestion_timing.tx_commit,
+        ),
+        bottleneck_phase: bottleneck_phase.to_string(),
+        bottleneck_phase_ms: duration_ms(bottleneck_duration),
+        bottleneck_phase_share_of_tracked_time: bottleneck_share_of_tracked_time,
+    }
+}
+
+type NodeId = usize;
+const BFS_PULL_MIN_FRONTIER: usize = 256;
+const BFS_PULL_MIN_REMAINING: usize = 1_024;
+const BFS_PULL_FRONTIER_TO_REMAINING_RATIO: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BfsMode {
+    Push,
+    Pull,
+}
+
+#[derive(Default)]
+struct DenseSet {
+    words: Vec<u64>,
+    count: usize,
+}
+
+impl DenseSet {
+    fn insert(&mut self, id: NodeId) -> bool {
+        let word_index = id / u64::BITS as usize;
+        let bit_mask = 1u64 << (id % u64::BITS as usize);
+
+        if word_index >= self.words.len() {
+            self.words.resize(word_index + 1, 0);
+        }
+
+        if self.words[word_index] & bit_mask == 0 {
+            self.words[word_index] |= bit_mask;
+            self.count = self.count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, id: NodeId) -> bool {
+        let word_index = id / u64::BITS as usize;
+        let bit_mask = 1u64 << (id % u64::BITS as usize);
+        self.words
+            .get(word_index)
+            .map(|word| *word & bit_mask != 0)
+            .unwrap_or(false)
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    fn union_count(&self, other: &Self) -> usize {
+        let max_len = self.words.len().max(other.words.len());
+        let mut total = 0usize;
+        for index in 0..max_len {
+            let left = self.words.get(index).copied().unwrap_or_default();
+            let right = other.words.get(index).copied().unwrap_or_default();
+            total = total.saturating_add((left | right).count_ones() as usize);
+        }
+        total
+    }
+}
+
+struct SearchSide {
+    frontier: VecDeque<NodeId>,
+    visited: DenseSet,
+    predecessors: Vec<Option<NodeId>>,
+}
+
+impl SearchSide {
+    fn new(start: NodeId) -> Self {
+        let mut side = Self {
+            frontier: VecDeque::from([start]),
+            visited: DenseSet::default(),
+            predecessors: Vec::new(),
+        };
+        side.visited.insert(start);
+        ensure_slot(&mut side.predecessors, start);
+        side
+    }
+}
+
+struct QueryGraph {
+    sha_to_id: HashMap<String, NodeId>,
+    id_to_sha: Vec<String>,
+    base_node_count: usize,
+    parents_offsets: Vec<u32>,
+    parents_neighbors: Vec<u32>,
+    children_offsets: Vec<u32>,
+    children_neighbors: Vec<u32>,
+    overlay_parent_neighbors: Vec<Vec<u32>>,
+    overlay_child_neighbors: HashMap<NodeId, Vec<u32>>,
+}
+
+impl QueryGraph {
+    fn from_graph_state(state: GraphSnapshotState) -> AppResult<Self> {
+        let GraphSnapshotState {
+            snapshot,
+            overlay_parent_rows,
+            overlay_child_rows,
+            ..
+        } = state;
+        let mut graph = Self::from_snapshot(snapshot)?;
+        graph.attach_overlay(overlay_parent_rows, overlay_child_rows)?;
+        Ok(graph)
+    }
+
+    fn from_snapshot(snapshot: CsrSnapshot) -> AppResult<Self> {
+        if snapshot.parents_offsets.len() != snapshot.shas.len().saturating_add(1) {
+            return Err(AppError::Parse(
+                "csr snapshot parent offsets length does not match node count".to_string(),
+            ));
+        }
+        if snapshot.children_offsets.len() != snapshot.shas.len().saturating_add(1) {
+            return Err(AppError::Parse(
+                "csr snapshot child offsets length does not match node count".to_string(),
+            ));
+        }
+
+        let mut sha_to_id = HashMap::with_capacity(snapshot.shas.len());
+        for (index, sha) in snapshot.shas.iter().enumerate() {
+            sha_to_id.insert(sha.clone(), index);
+        }
+
+        Ok(Self {
+            sha_to_id,
+            base_node_count: snapshot.shas.len(),
+            id_to_sha: snapshot.shas,
+            parents_offsets: snapshot.parents_offsets,
+            parents_neighbors: snapshot.parents_neighbors,
+            children_offsets: snapshot.children_offsets,
+            children_neighbors: snapshot.children_neighbors,
+            overlay_parent_neighbors: Vec::new(),
+            overlay_child_neighbors: HashMap::new(),
+        })
+    }
+
+    fn attach_overlay(
+        &mut self,
+        mut overlay_parent_rows: Vec<GraphOverlayParentRow>,
+        overlay_child_rows: HashMap<String, Vec<String>>,
+    ) -> AppResult<()> {
+        if overlay_parent_rows.is_empty() && overlay_child_rows.is_empty() {
+            return Ok(());
+        }
+
+        overlay_parent_rows.sort_unstable_by(|left, right| {
+            right
+                .committer_time
+                .cmp(&left.committer_time)
+                .then_with(|| right.child_sha.cmp(&left.child_sha))
+        });
+
+        let mut unique_overlay = Vec::with_capacity(overlay_parent_rows.len());
+        for row in overlay_parent_rows {
+            if self.sha_to_id.contains_key(row.child_sha.as_str()) {
+                continue;
             }
-            full_stmt.execute(params_from_iter(bind_values.iter()))?;
+            let node_id = self.id_to_sha.len();
+            self.sha_to_id.insert(row.child_sha.clone(), node_id);
+            self.id_to_sha.push(row.child_sha.clone());
+            unique_overlay.push(row);
+        }
+
+        if unique_overlay.is_empty() {
+            return Ok(());
+        }
+
+        self.overlay_parent_neighbors
+            .resize_with(unique_overlay.len(), Vec::new);
+
+        for row in unique_overlay {
+            let Some(&node_id) = self.sha_to_id.get(row.child_sha.as_str()) else {
+                continue;
+            };
+            let overlay_index = node_id.saturating_sub(self.base_node_count);
+
+            let mut parent_ids = Vec::with_capacity(row.parent_shas.len());
+            for parent_sha in &row.parent_shas {
+                let Some(&parent_id) = self.sha_to_id.get(parent_sha.as_str()) else {
+                    continue;
+                };
+                let parent_id_u32 = u32::try_from(parent_id).map_err(|_| {
+                    AppError::Parse(
+                        "graph overlay parent index exceeded u32 capacity during query hydration"
+                            .to_string(),
+                    )
+                })?;
+                parent_ids.push(parent_id_u32);
+            }
+            parent_ids.sort_unstable_by(|left, right| right.cmp(left));
+            parent_ids.dedup();
+
+            self.overlay_parent_neighbors[overlay_index] = parent_ids.clone();
+        }
+
+        for (parent_sha, child_shas) in overlay_child_rows {
+            let Some(&parent_index) = self.sha_to_id.get(parent_sha.as_str()) else {
+                continue;
+            };
+            let mut child_ids = Vec::with_capacity(child_shas.len());
+            for child_sha in child_shas {
+                let Some(&child_index) = self.sha_to_id.get(child_sha.as_str()) else {
+                    continue;
+                };
+                let child_id = u32::try_from(child_index).map_err(|_| {
+                    AppError::Parse(
+                        "graph overlay child index exceeded u32 capacity during query hydration"
+                            .to_string(),
+                    )
+                })?;
+                child_ids.push(child_id);
+            }
+
+            child_ids.sort_unstable_by(|left, right| right.cmp(left));
+            child_ids.dedup();
+            if !child_ids.is_empty() {
+                self.overlay_child_neighbors.insert(parent_index, child_ids);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn node_count(&self) -> usize {
+        self.id_to_sha.len()
+    }
+
+    fn traverse(
+        &self,
+        start_sha: &str,
+        strategy: GraphTraversalStrategy,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<GraphTraversalResponse> {
+        let bounded_max_nodes = normalize_graph_max_nodes(max_nodes);
+        let Some(start_id) = self.sha_to_id.get(start_sha).copied() else {
+            return Err(AppError::InvalidArgument(format!(
+                "start commit not indexed for repository: {start_sha}"
+            )));
+        };
+
+        let (visits, truncated) = match strategy {
+            GraphTraversalStrategy::Bfs => {
+                self.traverse_bfs(start_id, direction, bounded_max_nodes)?
+            }
+            GraphTraversalStrategy::Dfs => {
+                self.traverse_dfs(start_id, direction, bounded_max_nodes)?
+            }
+            GraphTraversalStrategy::Topological => {
+                if direction == GraphDirection::Both {
+                    return Err(AppError::InvalidArgument(
+                        "topological traversal requires direction=parents or direction=children"
+                            .to_string(),
+                    ));
+                }
+                self.traverse_topological(start_id, direction, bounded_max_nodes)?
+            }
+        };
+
+        let nodes = visits
+            .into_iter()
+            .map(|(node_id, depth)| crate::domain::models::GraphNodeVisit {
+                sha: self.id_to_sha[node_id].clone(),
+                depth,
+            })
+            .collect();
+
+        Ok(GraphTraversalResponse {
+            strategy,
+            direction,
+            nodes,
+            truncated,
+        })
+    }
+
+    fn shortest_path(
+        &self,
+        from_sha: &str,
+        to_sha: &str,
+        direction: GraphDirection,
+    ) -> AppResult<ShortestPathResponse> {
+        let Some(from_id) = self.sha_to_id.get(from_sha).copied() else {
+            return Err(AppError::InvalidArgument(format!(
+                "source commit not indexed for repository: {from_sha}"
+            )));
+        };
+        let Some(to_id) = self.sha_to_id.get(to_sha).copied() else {
+            return Err(AppError::InvalidArgument(format!(
+                "target commit not indexed for repository: {to_sha}"
+            )));
+        };
+
+        if from_id == to_id {
+            return Ok(ShortestPathResponse {
+                from_sha: from_sha.to_string(),
+                to_sha: to_sha.to_string(),
+                direction,
+                found: true,
+                path: vec![from_sha.to_string()],
+                visited_nodes: 1,
+            });
+        }
+
+        let reverse_direction = reverse_direction(direction);
+        let mut forward = SearchSide::new(from_id);
+        let mut backward = SearchSide::new(to_id);
+        let mut meeting: Option<NodeId> = None;
+
+        while !forward.frontier.is_empty() && !backward.frontier.is_empty() && meeting.is_none() {
+            let expand_forward = forward.frontier.len() <= backward.frontier.len();
+            if expand_forward {
+                meeting = self.expand_frontier(&mut forward, &backward.visited, direction)?;
+            } else {
+                meeting =
+                    self.expand_frontier(&mut backward, &forward.visited, reverse_direction)?;
+            }
+        }
+
+        let mut path = Vec::new();
+        if let Some(meeting_id) = meeting {
+            let id_path = reconstruct_bidirectional_path(
+                from_id,
+                to_id,
+                meeting_id,
+                &forward.predecessors,
+                &backward.predecessors,
+            )?;
+            path = id_path
+                .into_iter()
+                .map(|node_id| self.id_to_sha[node_id].clone())
+                .collect();
+        }
+
+        Ok(ShortestPathResponse {
+            from_sha: from_sha.to_string(),
+            to_sha: to_sha.to_string(),
+            direction,
+            found: meeting.is_some(),
+            path,
+            visited_nodes: forward.visited.union_count(&backward.visited),
+        })
+    }
+
+    fn traverse_bfs(
+        &self,
+        start_id: NodeId,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<(Vec<(NodeId, usize)>, bool)> {
+        let total_nodes = self.node_count();
+        let mut visits = Vec::new();
+        let mut visited = DenseSet::default();
+        visited.insert(start_id);
+        let mut depth = 0usize;
+        let mut frontier = vec![start_id];
+
+        while !frontier.is_empty() {
+            let remaining_budget = max_nodes.saturating_sub(visits.len());
+            if remaining_budget == 0 {
+                return Ok((visits, true));
+            }
+
+            if frontier.len() > remaining_budget {
+                for node_id in frontier.iter().take(remaining_budget) {
+                    visits.push((*node_id, depth));
+                }
+                return Ok((visits, true));
+            }
+
+            for node_id in &frontier {
+                visits.push((*node_id, depth));
+            }
+
+            let remaining_nodes = total_nodes.saturating_sub(visited.count());
+            frontier = match select_bfs_mode(frontier.len(), remaining_nodes) {
+                BfsMode::Push => self.expand_bfs_frontier_push(&frontier, direction, &mut visited),
+                BfsMode::Pull => self.expand_bfs_frontier_pull(&frontier, direction, &mut visited),
+            };
+            depth = depth.saturating_add(1);
+        }
+
+        Ok((visits, false))
+    }
+
+    fn expand_bfs_frontier_push(
+        &self,
+        frontier: &[NodeId],
+        direction: GraphDirection,
+        visited: &mut DenseSet,
+    ) -> Vec<NodeId> {
+        let mut next_frontier = Vec::new();
+        for source in frontier {
+            self.for_each_neighbor(*source, direction, |neighbor| {
+                if visited.insert(neighbor) {
+                    next_frontier.push(neighbor);
+                }
+            });
+        }
+        next_frontier
+    }
+
+    fn expand_bfs_frontier_pull(
+        &self,
+        frontier: &[NodeId],
+        direction: GraphDirection,
+        visited: &mut DenseSet,
+    ) -> Vec<NodeId> {
+        let mut discovered = Vec::new();
+        for source in frontier {
+            self.for_each_neighbor(*source, direction, |neighbor| discovered.push(neighbor));
+        }
+        discovered.sort_unstable_by(|left, right| right.cmp(left));
+        discovered.dedup();
+
+        let mut next_frontier = Vec::with_capacity(discovered.len());
+        for node_id in discovered {
+            if visited.insert(node_id) {
+                next_frontier.push(node_id);
+            }
+        }
+        next_frontier
+    }
+
+    fn traverse_dfs(
+        &self,
+        start_id: NodeId,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<(Vec<(NodeId, usize)>, bool)> {
+        let mut visits = Vec::new();
+        let mut visited = DenseSet::default();
+        visited.insert(start_id);
+        let mut stack = vec![(start_id, 0usize)];
+
+        while let Some((node_id, depth)) = stack.pop() {
+            visits.push((node_id, depth));
+            if visits.len() >= max_nodes {
+                let has_more =
+                    !stack.is_empty() || self.has_unvisited_neighbors(node_id, direction, &visited);
+                return Ok((visits, has_more));
+            }
+
+            let mut neighbors = Vec::new();
+            self.for_each_neighbor(node_id, direction, |neighbor| neighbors.push(neighbor));
+            for neighbor in neighbors.into_iter().rev() {
+                if visited.insert(neighbor) {
+                    stack.push((neighbor, depth.saturating_add(1)));
+                }
+            }
+        }
+
+        Ok((visits, false))
+    }
+
+    fn traverse_topological(
+        &self,
+        start_id: NodeId,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<(Vec<(NodeId, usize)>, bool)> {
+        let (reachable, reachable_depths, truncated_reachable) =
+            self.collect_reachable_bfs(start_id, direction, max_nodes)?;
+        let reachable_count = reachable.len();
+        let mut local_index_by_node = vec![usize::MAX; self.node_count()];
+        for (local_index, node_id) in reachable.iter().copied().enumerate() {
+            local_index_by_node[node_id] = local_index;
+        }
+
+        let mut indegree = vec![0usize; reachable_count];
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); reachable_count];
+
+        for (source_local_index, source_id) in reachable.iter().copied().enumerate() {
+            self.for_each_neighbor(source_id, direction, |neighbor_id| {
+                if let Some(&neighbor_local_index) = local_index_by_node.get(neighbor_id) {
+                    if neighbor_local_index != usize::MAX {
+                        adjacency[source_local_index].push(neighbor_local_index);
+                    }
+                }
+            });
+
+            adjacency[source_local_index].sort_unstable();
+            adjacency[source_local_index].dedup();
+            for &neighbor_local_index in &adjacency[source_local_index] {
+                indegree[neighbor_local_index] = indegree[neighbor_local_index].saturating_add(1);
+            }
+        }
+
+        let max_depth = reachable_depths.iter().copied().max().unwrap_or_default();
+        let mut ready_depth_buckets: Vec<VecDeque<usize>> = std::iter::repeat_with(VecDeque::new)
+            .take(max_depth.saturating_add(1))
+            .collect();
+        let mut next_ready_depth = ready_depth_buckets.len();
+        for local_index in 0..reachable_count {
+            if indegree[local_index] == 0 {
+                let depth = reachable_depths[local_index];
+                ready_depth_buckets[depth].push_back(local_index);
+                next_ready_depth = next_ready_depth.min(depth);
+            }
+        }
+
+        let mut ordered = Vec::with_capacity(reachable_count);
+        let mut emitted_local = vec![false; reachable_count];
+        while next_ready_depth < ready_depth_buckets.len() {
+            while next_ready_depth < ready_depth_buckets.len()
+                && ready_depth_buckets[next_ready_depth].is_empty()
+            {
+                next_ready_depth = next_ready_depth.saturating_add(1);
+            }
+            if next_ready_depth >= ready_depth_buckets.len() {
+                break;
+            }
+
+            let Some(source_local_index) = ready_depth_buckets[next_ready_depth].pop_front() else {
+                continue;
+            };
+            emitted_local[source_local_index] = true;
+            ordered.push((
+                reachable[source_local_index],
+                reachable_depths[source_local_index],
+            ));
+
+            for &neighbor_local_index in &adjacency[source_local_index] {
+                if indegree[neighbor_local_index] == 0 {
+                    continue;
+                }
+                indegree[neighbor_local_index] -= 1;
+                if indegree[neighbor_local_index] == 0 {
+                    let neighbor_depth = reachable_depths[neighbor_local_index];
+                    ready_depth_buckets[neighbor_depth].push_back(neighbor_local_index);
+                    if neighbor_depth < next_ready_depth {
+                        next_ready_depth = neighbor_depth;
+                    }
+                }
+            }
+        }
+
+        let mut truncated = truncated_reachable || ordered.len() < reachable_count;
+        if ordered.len() < reachable_count {
+            for (local_index, was_emitted) in emitted_local.into_iter().enumerate() {
+                if !was_emitted {
+                    ordered.push((reachable[local_index], reachable_depths[local_index]));
+                }
+            }
+            truncated = true;
+        }
+
+        Ok((ordered, truncated))
+    }
+
+    fn collect_reachable_bfs(
+        &self,
+        start_id: NodeId,
+        direction: GraphDirection,
+        max_nodes: usize,
+    ) -> AppResult<(Vec<NodeId>, Vec<usize>, bool)> {
+        let mut order = Vec::new();
+        let mut reachable_depths = Vec::new();
+        let mut visited = DenseSet::default();
+        visited.insert(start_id);
+
+        let mut queue = VecDeque::from([(start_id, 0usize)]);
+        while !queue.is_empty() {
+            let breadth = queue.len();
+            let mut level_nodes = Vec::with_capacity(breadth);
+            for _ in 0..breadth {
+                if let Some((node_id, depth)) = queue.pop_front() {
+                    level_nodes.push((node_id, depth));
+                }
+            }
+
+            let remaining_budget = max_nodes.saturating_sub(order.len());
+            if remaining_budget == 0 {
+                return Ok((order, reachable_depths, true));
+            }
+
+            if level_nodes.len() > remaining_budget {
+                for (node_id, depth) in level_nodes.iter().take(remaining_budget) {
+                    order.push(*node_id);
+                    reachable_depths.push(*depth);
+                }
+                return Ok((order, reachable_depths, true));
+            }
+
+            for (node_id, depth) in &level_nodes {
+                order.push(*node_id);
+                reachable_depths.push(*depth);
+            }
+
+            for (node_id, depth) in level_nodes {
+                self.for_each_neighbor(node_id, direction, |neighbor| {
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, depth.saturating_add(1)));
+                    }
+                });
+            }
+        }
+
+        Ok((order, reachable_depths, false))
+    }
+
+    fn has_unvisited_neighbors(
+        &self,
+        source: NodeId,
+        direction: GraphDirection,
+        visited: &DenseSet,
+    ) -> bool {
+        let mut has_more = false;
+        self.for_each_neighbor(source, direction, |neighbor| {
+            if !visited.contains(neighbor) {
+                has_more = true;
+            }
+        });
+        has_more
+    }
+
+    fn expand_frontier(
+        &self,
+        current_side: &mut SearchSide,
+        visited_other_side: &DenseSet,
+        direction: GraphDirection,
+    ) -> AppResult<Option<NodeId>> {
+        let breadth = current_side.frontier.len();
+        let mut level_nodes = Vec::with_capacity(breadth);
+        for _ in 0..breadth {
+            if let Some(node_id) = current_side.frontier.pop_front() {
+                level_nodes.push(node_id);
+            }
+        }
+
+        for source_id in level_nodes {
+            let mut neighbors = Vec::new();
+            self.for_each_neighbor(source_id, direction, |neighbor| neighbors.push(neighbor));
+            for neighbor_id in neighbors {
+                if current_side.visited.insert(neighbor_id) {
+                    ensure_slot(&mut current_side.predecessors, neighbor_id);
+                    current_side.predecessors[neighbor_id] = Some(source_id);
+
+                    if visited_other_side.contains(neighbor_id) {
+                        return Ok(Some(neighbor_id));
+                    }
+
+                    current_side.frontier.push_back(neighbor_id);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn for_each_neighbor(
+        &self,
+        source: NodeId,
+        direction: GraphDirection,
+        mut visit: impl FnMut(NodeId),
+    ) {
+        if source >= self.node_count() {
+            return;
+        }
+
+        match direction {
+            GraphDirection::Parents => {
+                self.for_each_parent_neighbor(source, &mut visit);
+            }
+            GraphDirection::Children => {
+                self.for_each_child_neighbor(source, &mut visit);
+            }
+            GraphDirection::Both => {
+                self.for_each_parent_neighbor(source, &mut visit);
+                self.for_each_child_neighbor(source, &mut visit);
+            }
         }
     }
 
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let remainder_sql = build_pending_edge_stage_insert_sql(remainder.len());
-        let mut remainder_stmt = tx.prepare_cached(&remainder_sql)?;
-        let mut bind_values = Vec::with_capacity(remainder.len() * PENDING_EDGE_STAGE_COLUMNS);
-        for (child_sha, parent_sha) in remainder {
-            bind_values.push(Value::Text(child_sha.clone()));
-            bind_values.push(Value::Text(parent_sha.clone()));
+    fn for_each_parent_neighbor(&self, source: NodeId, visit: &mut impl FnMut(NodeId)) {
+        let neighbors = if source < self.base_node_count {
+            csr_neighbor_slice(&self.parents_offsets, &self.parents_neighbors, source)
+        } else {
+            let overlay_index = source.saturating_sub(self.base_node_count);
+            self.overlay_parent_neighbors
+                .get(overlay_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
+
+        for &neighbor in neighbors {
+            if let Ok(id) = usize::try_from(neighbor) {
+                visit(id);
+            }
         }
-        remainder_stmt.execute(params_from_iter(bind_values.iter()))?;
     }
 
-    pending_edges.clear();
-    Ok(())
+    fn for_each_child_neighbor(&self, source: NodeId, visit: &mut impl FnMut(NodeId)) {
+        if source < self.base_node_count {
+            for &neighbor in
+                csr_neighbor_slice(&self.children_offsets, &self.children_neighbors, source)
+            {
+                if let Ok(id) = usize::try_from(neighbor) {
+                    visit(id);
+                }
+            }
+        }
+
+        if let Some(overlay_neighbors) = self.overlay_child_neighbors.get(&source) {
+            for &neighbor in overlay_neighbors {
+                if let Ok(id) = usize::try_from(neighbor) {
+                    visit(id);
+                }
+            }
+        }
+    }
 }
 
-fn build_pending_edge_stage_insert_sql(row_count: usize) -> String {
-    let bounded_row_count = row_count.max(1);
-    let mut sql = String::with_capacity(96 + bounded_row_count * 8);
-    sql.push_str("INSERT INTO current_pending_commit_edges (child_sha, parent_sha) VALUES ");
-    for index in 0..bounded_row_count {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        sql.push_str("(?, ?)");
+fn csr_neighbor_slice<'a>(offsets: &[u32], neighbors: &'a [u32], node_id: usize) -> &'a [u32] {
+    let Some(&start) = offsets.get(node_id) else {
+        return &[];
+    };
+    let Some(&end) = offsets.get(node_id.saturating_add(1)) else {
+        return &[];
+    };
+    let Ok(start_index) = usize::try_from(start) else {
+        return &[];
+    };
+    let Ok(end_index) = usize::try_from(end) else {
+        return &[];
+    };
+    if start_index > end_index || end_index > neighbors.len() {
+        return &[];
     }
-    sql
+    &neighbors[start_index..end_index]
+}
+
+fn select_bfs_mode(frontier_len: usize, remaining_nodes: usize) -> BfsMode {
+    if frontier_len < BFS_PULL_MIN_FRONTIER
+        || remaining_nodes < BFS_PULL_MIN_REMAINING
+        || remaining_nodes == 0
+    {
+        return BfsMode::Push;
+    }
+
+    if frontier_len.saturating_mul(BFS_PULL_FRONTIER_TO_REMAINING_RATIO) >= remaining_nodes {
+        BfsMode::Pull
+    } else {
+        BfsMode::Push
+    }
+}
+
+fn reverse_direction(direction: GraphDirection) -> GraphDirection {
+    match direction {
+        GraphDirection::Parents => GraphDirection::Children,
+        GraphDirection::Children => GraphDirection::Parents,
+        GraphDirection::Both => GraphDirection::Both,
+    }
+}
+
+fn reconstruct_bidirectional_path(
+    from_id: NodeId,
+    to_id: NodeId,
+    meeting_id: NodeId,
+    forward_prev: &[Option<NodeId>],
+    backward_prev: &[Option<NodeId>],
+) -> AppResult<Vec<NodeId>> {
+    let mut left = vec![meeting_id];
+    let mut cursor = meeting_id;
+    while cursor != from_id {
+        let Some(prev) = forward_prev.get(cursor).copied().flatten() else {
+            return Err(AppError::Parse(
+                "path reconstruction failed from source side".to_string(),
+            ));
+        };
+        cursor = prev;
+        left.push(cursor);
+    }
+    left.reverse();
+
+    let mut right = Vec::new();
+    let mut cursor = meeting_id;
+    while cursor != to_id {
+        let Some(next) = backward_prev.get(cursor).copied().flatten() else {
+            return Err(AppError::Parse(
+                "path reconstruction failed from target side".to_string(),
+            ));
+        };
+        cursor = next;
+        right.push(cursor);
+    }
+
+    left.extend(right);
+    Ok(left)
+}
+
+fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize) {
+    if index >= slots.len() {
+        slots.resize_with(index + 1, || None);
+    }
 }

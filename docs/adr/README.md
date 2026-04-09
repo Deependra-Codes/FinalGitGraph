@@ -15,11 +15,21 @@ Use Architecture Decision Records (ADRs) for choices that affect long-term direc
 Use `NNNN-short-title.md`, for example:
 
 1. `0001-rust-workspace-governance.md`
-2. `0002-indexing-checkpoint-strategy.md`
-3. `0006-streaming-libgit2-ingestion.md`
-4. `0012-gitoxide-ingestion-adapter-migration.md`
-5. `0013-quality-perf-workflow-hardening.md`
-6. `0014-runtime-query-graph-cache.md`
+2. `0002-internal-module-boundaries.md`
+3. `0003-phase2-checkpoint-and-window-contracts.md`
+4. `0004-phase2-file-change-ingestion.md`
+5. `0005-integer-graph-query-state.md`
+6. `0006-streaming-libgit2-ingestion.md`
+7. `0007-bounded-rayon-ingestion-compute-single-writer-db.md`
+8. `0008-integer-edge-schema-for-graph-hot-path.md`
+9. `0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md`
+10. `0010-bounded-rename-detection-and-ingestion-phase-telemetry.md`
+11. `0011-core-file-change-ingestion-and-jit-enrichment.md`
+12. `0012-gitoxide-ingestion-adapter-migration.md`
+13. `0013-quality-perf-workflow-hardening.md`
+14. `0014-runtime-query-graph-cache.md`
+15. `0015-lmdb-csr-delta-storage-no-sql.md`
+16. `0016-overlay-adjacency-and-lmdb-map-flooring.md`
 
 ## Template
 

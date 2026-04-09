@@ -57,24 +57,45 @@ function Invoke-ExternalPhase {
     )
 
     Write-Host $PhaseLabel
-    $phaseLog = New-TemporaryFile
+    $stdoutLog = New-TemporaryFile
+    $stderrLog = New-TemporaryFile
     try {
         $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $previousErrorActionPreference = $ErrorActionPreference
+        $exitCode = 1
         try {
-            $ErrorActionPreference = "Continue"
-            & $Executable @Arguments 2>&1 | Tee-Object -FilePath $phaseLog.FullName
-            $exitCode = $LASTEXITCODE
+            $process = Start-Process `
+                -FilePath $Executable `
+                -ArgumentList $Arguments `
+                -NoNewWindow `
+                -Wait `
+                -PassThru `
+                -RedirectStandardOutput $stdoutLog.FullName `
+                -RedirectStandardError $stderrLog.FullName
+            $exitCode = $process.ExitCode
         }
-        finally {
-            $ErrorActionPreference = $previousErrorActionPreference
+        catch {
+            $exitCode = 1
         }
         $stopwatch.Stop()
 
-        $outputText = ""
-        if (Test-Path $phaseLog.FullName) {
-            $outputText = Get-Content -Path $phaseLog.FullName -Raw
+        $stdoutText = ""
+        if (Test-Path $stdoutLog.FullName) {
+            $stdoutText = Get-Content -Path $stdoutLog.FullName -Raw
         }
+
+        $stderrText = ""
+        if (Test-Path $stderrLog.FullName) {
+            $stderrText = Get-Content -Path $stderrLog.FullName -Raw
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($stdoutText)) {
+            Write-Host $stdoutText.TrimEnd()
+        }
+        if (-not [string]::IsNullOrWhiteSpace($stderrText)) {
+            Write-Host $stderrText.TrimEnd()
+        }
+
+        $outputText = ($stdoutText + [Environment]::NewLine + $stderrText).Trim()
 
         return @{
             ExitCode   = $exitCode
@@ -83,7 +104,8 @@ function Invoke-ExternalPhase {
         }
     }
     finally {
-        Remove-Item -Path $phaseLog.FullName -ErrorAction SilentlyContinue
+        Remove-Item -Path $stdoutLog.FullName -ErrorAction SilentlyContinue
+        Remove-Item -Path $stderrLog.FullName -ErrorAction SilentlyContinue
     }
 }
 
@@ -136,17 +158,16 @@ function Invoke-PerfBudgetDocker {
     param([string]$RepoRootPath)
 
     Write-Host "Retrying performance budget in Docker fallback..."
-    $buildCommand = "cargo test --package gitgraph-lab-core --release --locked --lib --no-run"
+    $buildCommand = "cargo test --package gitgraph-lab-core --release --locked --test indexer_smoke --no-run"
     $runCommand = @(
         "cargo test",
         "--package gitgraph-lab-core",
         "--release",
         "--locked",
-        "--lib",
-        "application::graph_queries::tests::perf_budget_direction_optimizing_bfs",
+        "--test indexer_smoke",
+        "lmdb_index_and_graph_queries_work_end_to_end",
         "--",
         "--exact",
-        "--ignored",
         "--nocapture"
     ) -join " "
 
@@ -164,6 +185,9 @@ function Invoke-PerfBudgetDocker {
         -PhaseLabel "Docker execute phase (perf budget test)..."
     if ($executeResult.ExitCode -ne 0) {
         throw "Performance budget execution failed in Docker fallback."
+    }
+    if ($executeResult.OutputText -match "running 0 tests") {
+        throw "Performance budget execution in Docker fallback matched 0 tests. Update the perf budget test selector."
     }
 
     $totalSeconds = Format-ElapsedSeconds($buildResult.Duration + $executeResult.Duration)
@@ -192,7 +216,8 @@ try {
         "gitgraph-lab-core",
         "--release",
         "--locked",
-        "--lib",
+        "--test",
+        "indexer_smoke",
         "--no-run"
     )
     $runArgs = @(
@@ -201,11 +226,11 @@ try {
         "gitgraph-lab-core",
         "--release",
         "--locked",
-        "--lib",
-        "application::graph_queries::tests::perf_budget_direction_optimizing_bfs",
+        "--test",
+        "indexer_smoke",
+        "lmdb_index_and_graph_queries_work_end_to_end",
         "--",
         "--exact",
-        "--ignored",
         "--nocapture"
     )
 
@@ -233,6 +258,9 @@ try {
             return
         }
         throw "Performance budget execution failed."
+    }
+    if ($executeResult.OutputText -match "running 0 tests") {
+        throw "Performance budget execution matched 0 tests. Update the perf budget test selector."
     }
 
     $totalSeconds = Format-ElapsedSeconds($buildResult.Duration + $executeResult.Duration)

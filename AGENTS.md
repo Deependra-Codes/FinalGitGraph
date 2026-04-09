@@ -12,6 +12,7 @@ The goal is simple: ship code that passes quality gates without duct-tape regres
 5. Do not merge changes with unresolved `TODO`, `FIXME`, or `dbg!` in Rust source.
 6. Do not weaken or remove guardrail checks to make a failing change pass.
 7. Do not submit docs-only guardrail changes without corresponding implementation work.
+8. Do not make architecture or performance claims without traceable intent/research/verification.
 
 ## Required Flow Per Change
 
@@ -24,10 +25,11 @@ The goal is simple: ship code that passes quality gates without duct-tape regres
 ## First 5 Minutes Checklist (AI + Human)
 
 1. Read this file (`AGENTS.md`) and `docs/automation-guardrails.md`.
-2. Read `docs/engineering-system.md` and `docs/from-scratch-system.md`.
-3. Read `docs/ai-change-survival-playbook.md` before touching architecture-sensitive paths.
-4. Check `git status --short` and avoid reverting unrelated user changes.
-5. Identify touched layer(s) before writing code.
+2. Read `docs/engineering-system.md`, `docs/from-scratch-system.md`, and `docs/standards/README.md`.
+3. Read `docs/standards/ENGINEERING_EXECUTION_POLICY.md` and `docs/standards/TYPE_TDD_SPEC_AGENTIC_DISCIPLINE.md` for non-trivial changes.
+4. Read `docs/ai-change-survival-playbook.md` before touching architecture-sensitive paths.
+5. Check `git status --short` and avoid reverting unrelated user changes.
+6. Identify touched layer(s) before writing code.
 
 ## Rust Layering Contract
 
@@ -57,9 +59,8 @@ Placement decision rule:
 1. `apps/desktop/src-tauri/src/adapters/git.rs` ingestion and diff extraction path.
 2. `apps/desktop/src-tauri/src/adapters/db.rs` hot graph query + ingestion persistence path.
 3. `apps/desktop/src-tauri/src/application/indexer.rs` transaction and pipeline orchestration.
-4. `apps/desktop/src-tauri/src/application/query_graph_cache.rs` in-memory graph hydration/query path.
-5. `apps/desktop/src-tauri/src/bin/perf-report.rs` telemetry contract consumed by perf gates.
-6. `scripts/*.ps1` automation contracts and cross-platform behavior.
+4. `apps/desktop/src-tauri/src/bin/perf-report.rs` telemetry contract consumed by perf gates.
+5. `scripts/*.ps1` automation contracts and cross-platform behavior.
 
 ## Enforcement
 

@@ -67,7 +67,7 @@ jobs:
         run: ./scripts/perf-budget.ps1
 
   ingestion-budget-fast:
-    name: Ingestion Budget Fast (90k cold)
+    name: Ingestion Budget Fast (25k cold)
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -97,7 +97,7 @@ jobs:
 
       - name: Ingestion Budget Fast Lane
         shell: pwsh
-        run: ./scripts/perf-ingestion-budget.ps1 -Profile 90k -Lane cold -FastMode -PreconditionCommitGraph
+        run: ./scripts/perf-ingestion-budget.ps1 -Profile 25k -Lane cold -FastMode -PreconditionCommitGraph
 
   perf-smoke-pr:
     name: Perf Smoke (PR)

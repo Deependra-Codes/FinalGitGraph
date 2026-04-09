@@ -6,6 +6,17 @@ Date: 2026-03-07
 
 Create a deterministic, industry-grade Rust system from day zero so both humans and AI agents can ship without architecture drift.
 
+## Discipline Standards
+
+Repo-level engineering discipline is defined in `docs/standards/`:
+
+1. `AGENT_GUARDRAIL_SYSTEM.md`
+2. `ENGINEERING_EXECUTION_POLICY.md`
+3. `PERFORMANCE_AND_COMPLEXITY_DISCIPLINE.md`
+4. `REPO_SYNC_POLICY.md`
+5. `TYPE_TDD_SPEC_AGENTIC_DISCIPLINE.md`
+6. `DOCS_INTENT_RESEARCH_PATTERN.md`
+
 ## Phase Model
 
 1. Phase 0 (now): engineering system and guardrails.
@@ -86,7 +97,7 @@ Definition of done:
 ## Performance Governance
 
 1. Performance-sensitive graph query code follows `docs/performance-engineering.md`.
-2. Guardrails reject String-heavy frontier state in `application/graph_queries.rs`.
+2. Guardrails reject legacy SQL runtime modules and enforce LMDB + CSR contracts in active ingestion/query paths.
 3. Rust CI includes dedicated `Performance Budget` gate for direction-optimizing BFS.
 4. Rust CI includes cross-platform `Script Contract Probe` for automation script portability.
 5. Guardrails enforce script platform metadata and portable-script policy.
