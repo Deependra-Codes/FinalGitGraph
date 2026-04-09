@@ -2736,6 +2736,18 @@ fn drain_parallel_channel_capacity() -> usize {
         .clamp(1, FILE_CHANGE_DRAIN_CHANNEL_CAPACITY_MAX)
 }
 
+pub fn configured_file_change_parallel_worker_count() -> usize {
+    configured_parallel_worker_count()
+}
+
+pub fn configured_file_change_drain_parallel_chunk_size() -> usize {
+    drain_parallel_chunk_size()
+}
+
+pub fn configured_file_change_drain_channel_capacity() -> usize {
+    drain_parallel_channel_capacity()
+}
+
 fn parallel_file_change_plan(
     total_commits: usize,
     worker_count: usize,

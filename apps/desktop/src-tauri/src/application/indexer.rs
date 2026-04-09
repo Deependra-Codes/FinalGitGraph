@@ -84,6 +84,33 @@ impl IngestionPhaseTiming {
             file_change_upsert: duration_ms(self.file_change_upsert),
             jit_enrich_coscheduled: duration_ms(self.jit_enrich_coscheduled),
             tx_commit: duration_ms(self.tx_commit),
+            lsm_shadow_write_attempts: 0.0,
+            lsm_shadow_write_success: 0.0,
+            lsm_shadow_write_errors: 0.0,
+            lsm_shadow_commit_batches: 0.0,
+            lsm_shadow_file_change_batches: 0.0,
+            lsm_shadow_disabled_batches: 0.0,
+            lsm_shadow_bytes_written: 0.0,
+            lsm_shadow_write_ms: 0.0,
+            lsm_materialization_batches: 0.0,
+            lsm_materialization_rows: 0.0,
+            lsm_materialization_errors: 0.0,
+            lsm_materialization_ms: 0.0,
+            lsm_materialization_queue_fetch_ms: 0.0,
+            lsm_materialization_decode_ms: 0.0,
+            lsm_materialization_group_ms: 0.0,
+            lsm_materialization_sqlite_write_ms: 0.0,
+            lsm_materialization_queue_cleanup_ms: 0.0,
+            lsm_materialization_checkpoint_update_ms: 0.0,
+            lsm_materialization_empty_check_ms: 0.0,
+            lsm_materialization_keys_scanned: 0.0,
+            lsm_materialization_rows_decoded: 0.0,
+            lsm_materialization_invalid_rows: 0.0,
+            lsm_materialization_rows_applied: 0.0,
+            lsm_materialization_rows_unresolved: 0.0,
+            lsm_materialization_commit_edges_immediate: 0.0,
+            lsm_materialization_commit_edges_resolved: 0.0,
+            lsm_materialization_commit_edges_unresolved_staged: 0.0,
         }
     }
 }
@@ -115,6 +142,11 @@ impl Indexer {
             git_dir: canonical_repo.git_dir.display().to_string(),
             name: canonical_repo.name,
             is_valid: true,
+        };
+
+        Ok(ScanRepositoryResponse {
+            repository,
+            session_plan,
         })
     }
 
@@ -397,6 +429,60 @@ impl Indexer {
         );
         let queue_after_index = store.load_file_change_extraction_queue_metrics(repo_id)?;
 
+        let shadow = lsm_shadow_metrics_snapshot();
+        let mut ingestion_phase_timing_ms = ingestion_timing.into_ms();
+        ingestion_phase_timing_ms.lsm_shadow_write_attempts = shadow.write_attempts as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_success = shadow.write_success as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_errors = shadow.write_errors as f64;
+        ingestion_phase_timing_ms.lsm_shadow_commit_batches = shadow.commit_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_file_change_batches =
+            shadow.file_change_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_disabled_batches = shadow.disabled_batches as f64;
+        ingestion_phase_timing_ms.lsm_shadow_bytes_written = shadow.bytes_written as f64;
+        ingestion_phase_timing_ms.lsm_shadow_write_ms = shadow.write_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_batches =
+            shadow.materialization_batches as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows = shadow.materialization_rows as f64;
+        ingestion_phase_timing_ms.lsm_materialization_errors = shadow.materialization_errors as f64;
+        ingestion_phase_timing_ms.lsm_materialization_ms =
+            shadow.materialization_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_queue_fetch_ms =
+            shadow.materialization_queue_fetch_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_decode_ms =
+            shadow.materialization_decode_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_group_ms =
+            shadow.materialization_group_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_sqlite_write_ms =
+            shadow.materialization_sqlite_write_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_queue_cleanup_ms =
+            shadow.materialization_queue_cleanup_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_checkpoint_update_ms =
+            shadow.materialization_checkpoint_update_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_empty_check_ms =
+            shadow.materialization_empty_check_micros as f64 / 1_000.0;
+        ingestion_phase_timing_ms.lsm_materialization_keys_scanned =
+            shadow.materialization_keys_scanned as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_decoded =
+            shadow.materialization_rows_decoded as f64;
+        ingestion_phase_timing_ms.lsm_materialization_invalid_rows =
+            shadow.materialization_invalid_rows as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_applied =
+            shadow.materialization_rows_applied as f64;
+        ingestion_phase_timing_ms.lsm_materialization_rows_unresolved =
+            shadow.materialization_rows_unresolved as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_immediate =
+            shadow.materialization_commit_edges_immediate as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_resolved =
+            shadow.materialization_commit_edges_resolved as f64;
+        ingestion_phase_timing_ms.lsm_materialization_commit_edges_unresolved_staged =
+            shadow.materialization_commit_edges_unresolved_staged as f64;
+        let ingestion_geometry = build_ingestion_geometry(
+            fast_mode,
+            pipeline_config.as_ref(),
+            fast_mode_commit_batch_size,
+            resolve_drain_commit_batch_size(),
+        );
+
         Ok(IndexingStats {
             repo_id,
             mode: effective_mode,
@@ -411,6 +497,28 @@ impl Indexer {
             ingestion_phase_timing_ms: ingestion_timing.into_ms(),
             commit_throughput,
         })
+    }
+
+    pub fn latest_planner_session(&self, path: &Path) -> AppResult<Option<PlannerSessionRecord>> {
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+        let Some(repo_id) = load_planner_repo_id(&conn, path)? else {
+            return Ok(None);
+        };
+        load_latest_planner_session(&conn, repo_id)
+    }
+
+    pub fn recent_planner_sessions(
+        &self,
+        path: &Path,
+        limit: Option<usize>,
+    ) -> AppResult<Vec<PlannerSessionRecord>> {
+        let mut conn = open_database(&self.db_path)?;
+        run_migrations(&mut conn)?;
+        let Some(repo_id) = load_planner_repo_id(&conn, path)? else {
+            return Ok(Vec::new());
+        };
+        load_recent_planner_sessions(&conn, repo_id, limit.unwrap_or(10))
     }
 
     pub fn drain_file_change_extraction_queue(
@@ -799,11 +907,23 @@ fn update_checkpoint_candidate(
 fn build_checkpoint(
     checkpoint_candidate: Option<(i64, String)>,
     indexed_at_epoch: i64,
+    repository_identity: &RepositoryIdentity,
+    repository_capabilities: &RepositoryCapabilities,
 ) -> Option<IndexCheckpoint> {
     checkpoint_candidate.map(|(last_committer_time, last_commit_sha)| IndexCheckpoint {
         last_committer_time,
         last_commit_sha,
         indexed_at_epoch,
+        repository_state: Some(CheckpointRepositoryState {
+            identity_fingerprint: repository_identity.identity_fingerprint.clone(),
+            topology: repository_identity.topology,
+            is_bare: repository_identity.is_bare,
+            is_shallow: repository_identity.is_shallow,
+            object_hash: repository_capabilities.object_hash.clone(),
+            ref_storage: repository_capabilities.ref_storage,
+            has_sparse_checkout: repository_capabilities.has_sparse_checkout,
+            has_partial_clone: repository_capabilities.has_partial_clone,
+        }),
     })
 }
 

@@ -24,6 +24,24 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($env:OS -eq "Windows_NT") {
+    if (-not (Test-Path "D:\")) {
+        throw "D: drive is required on Windows for this script."
+    }
+    $preferredTempRoot = "D:\temp\gitgraph-lab"
+    if (-not (Test-Path $preferredTempRoot)) {
+        New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
+    }
+    $env:TEMP = $preferredTempRoot
+    $env:TMP = $preferredTempRoot
+}
+
+if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
+    if ($env:OS -eq "Windows_NT") {
+        $CargoTargetRoot = "D:\cargo-target\gitgraph-lab"
+    }
+}
+
 function Get-ReportValue {
     param(
         [string]$Path,
@@ -117,11 +135,29 @@ if (-not $PSBoundParameters.ContainsKey("MaxDiffShareRatio")) {
         $MaxDiffShareRatio = $defaultMaxDiffShareRatio
     }
 }
-if ($FastMode -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
+if ($FastMode -and -not $EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
     $MinFullCommitThroughputPerSec = 12000
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
+    $MinFullCommitThroughputPerSec = 500
 }
 if ($FastMode -and -not $PSBoundParameters.ContainsKey("MaxFileChangeExtractionDrainMs")) {
     $MaxFileChangeExtractionDrainMs = 10000
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinLsmShadowWriteAttempts")) {
+    $MinLsmShadowWriteAttempts = 1
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinLsmShadowWriteSuccessRatio")) {
+    $MinLsmShadowWriteSuccessRatio = 0.95
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmShadowWriteErrors")) {
+    $MaxLsmShadowWriteErrors = 0
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmShadowDisabledBatches")) {
+    $MaxLsmShadowDisabledBatches = 0
+}
+if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmMaterializationErrors")) {
+    $MaxLsmMaterializationErrors = 0
 }
 if (-not $FastMode -and $MinFullCommitThroughputPerSec -lt 0) {
     $MinFullCommitThroughputPerSec = 0
@@ -182,7 +218,9 @@ $previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
 if ($FastMode) {
     $env:GITGRAPH_INDEX_FAST_MODE = "1"
     $env:GITGRAPH_SQLITE_WRITE_PROFILE = "throughput"
-    $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
+    if (-not $EnableLsmRocksdb) {
+        $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
+    }
     if ([string]::IsNullOrWhiteSpace($previousWalkSort)) {
         $env:GITGRAPH_COMMIT_WALK_SORT = "breadth_first"
     }
@@ -214,7 +252,9 @@ try {
         -PreconditionCommitGraph:$PreconditionCommitGraph `
         -OutputPath $OutputPath `
         -FixtureRoot $fixtureRoot `
-        -WarmFixture:($Lane -eq "warm")
+        -WarmFixture:($Lane -eq "warm") `
+        -EnableLsmRocksdb:$EnableLsmRocksdb `
+        -LibclangPath $LibclangPath
     if ($LASTEXITCODE -ne 0) {
         throw "perf-report execution failed for ingestion budget lane."
     }
@@ -360,6 +400,21 @@ if ($FastMode -and $fileChangeExtractionDrainMs -gt $MaxFileChangeExtractionDrai
 }
 if ($FastMode -and $oldestExtractionQueueAgeSeconds -gt $MaxOldestExtractionQueueAgeSeconds) {
     throw ("Ingestion budget fast-mode failed: oldest_file_change_extraction_queue_age_seconds {0} > max {1}" -f $oldestExtractionQueueAgeSeconds, $MaxOldestExtractionQueueAgeSeconds)
+}
+if ($MinLsmShadowWriteAttempts -ge 0 -and $lsmShadowWriteAttempts -lt $MinLsmShadowWriteAttempts) {
+    throw ("Ingestion budget failed: lsm_shadow_write_attempts {0} < min {1}" -f $lsmShadowWriteAttempts, $MinLsmShadowWriteAttempts)
+}
+if ($MinLsmShadowWriteSuccessRatio -ge 0 -and $lsmShadowWriteSuccessRatio -lt $MinLsmShadowWriteSuccessRatio) {
+    throw ("Ingestion budget failed: lsm_shadow_write_success_ratio {0} < min {1}" -f $lsmShadowWriteSuccessRatio, $MinLsmShadowWriteSuccessRatio)
+}
+if ($MaxLsmShadowWriteErrors -ge 0 -and $lsmShadowWriteErrors -gt $MaxLsmShadowWriteErrors) {
+    throw ("Ingestion budget failed: lsm_shadow_write_errors {0} > max {1}" -f $lsmShadowWriteErrors, $MaxLsmShadowWriteErrors)
+}
+if ($MaxLsmShadowDisabledBatches -ge 0 -and $lsmShadowDisabledBatches -gt $MaxLsmShadowDisabledBatches) {
+    throw ("Ingestion budget failed: lsm_shadow_disabled_batches {0} > max {1}" -f $lsmShadowDisabledBatches, $MaxLsmShadowDisabledBatches)
+}
+if ($MaxLsmMaterializationErrors -ge 0 -and $lsmMaterializationErrors -gt $MaxLsmMaterializationErrors) {
+    throw ("Ingestion budget failed: lsm_materialization_errors {0} > max {1}" -f $lsmMaterializationErrors, $MaxLsmMaterializationErrors)
 }
 
 Write-Host "Ingestion budget passed."
