@@ -24,7 +24,7 @@ Status: Accepted
 5. Make requested mode and effective mode explicit so incremental fallback behavior is traceable instead of silent.
 6. Treat degraded execution as a first-class planner outcome, not an implicit side effect of checkpoint invalidation.
 7. Return the selected `IndexSessionPlan` with indexing results so downstream callers can observe the planner decision directly.
-8. Persist planner sessions durably in SQLite, including reason ledgers, disabled feature gates, and ordered trace entries.
+8. Persist planner sessions durably in legacy_relational_engine, including reason ledgers, disabled feature gates, and ordered trace entries.
 9. Return planner-backed scan responses so repository intake and indexing expose the same Level 1 planning surface.
 10. Classify planner health as part of Level 1, including:
    - planner risk level
@@ -66,4 +66,6 @@ Status: Accepted
 4. https://git-scm.com/docs/git-commit-graph/2.46.0.html
 5. https://git-scm.com/docs/git-gc
 6. https://git-scm.com/docs/git-maintenance
-7. https://www.postgresql.org/docs/current/auto-explain.html
+7. https://www.postgres.org/docs/current/auto-explain.html
+
+

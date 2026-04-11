@@ -50,9 +50,9 @@ Desktop/UI remains a Tauri/React shell around the Rust core.
 
 ## Current Runtime Contract
 
-1. No SQL runtime dependency.
-2. No SQL migrations in active runtime.
-3. No legacy SQL-era query modules in active application path.
+1. No relational_query runtime dependency.
+2. No relational_query migrations in active runtime.
+3. No legacy relational_query-era query modules in active application path.
 4. Indexing and query flow must satisfy LMDB + CSR + delta contracts.
 
 ## Delivery Contract
@@ -65,6 +65,7 @@ Desktop/UI remains a Tauri/React shell around the Rust core.
 
 ## Architecture Record
 
-LMDB/CSR/no-SQL runtime decision is documented in:
+LMDB/CSR/no-relational_query runtime decision is documented in:
 
-1. `docs/adr/0015-lmdb-csr-delta-storage-no-sql.md`
+1. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
+

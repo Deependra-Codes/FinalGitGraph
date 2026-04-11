@@ -12,12 +12,12 @@ Baseline snapshot (`tmp/perf-report-90k.txt`):
 1. `phase_timing_ms.query_benchmark = 133723.388`
 2. `phase_timing_ms.full_index = 20335.529`
 3. `phase_timing_ms.incremental_index = 7290.967`
-4. `in_memory_vs_sqlite_median_speedup`
+4. `in_memory_vs_legacy_relational_engine_median_speedup`
    - `bfs_parents = 485.273x`
    - `shortest_path_parents = 396.421x`
    - `shortest_path_both = 1233.180x`
 
-Interpretation: query latency is dominated by SQLite read-path repetition, not graph algorithm complexity.
+Interpretation: query latency is dominated by legacy_relational_engine read-path repetition, not graph algorithm complexity.
 
 ## Hypothesis
 
@@ -25,10 +25,10 @@ If runtime query endpoints use the same in-memory adjacency model already proven
 
 ## Design
 
-1. Hydrate a repository-scoped in-memory graph from SQLite (`commits`, `commit_edges`).
+1. Hydrate a repository-scoped in-memory graph from legacy_relational_engine (`commits`, `commit_edges`).
 2. Cache key: `(db_path, repo_id, repositories.indexed_at)`.
 3. Route `traverse_graph` and `shortest_path` to cached graph by default.
-4. Keep SQL traversal path behind rollback switch:
+4. Keep relational_query traversal path behind rollback switch:
    - `GITGRAPH_QUERY_RUNTIME_CACHE=0|false|off|no`.
 5. Invalidate cache after indexing transaction commit.
 
@@ -45,7 +45,7 @@ If runtime query endpoints use the same in-memory adjacency model already proven
 2. Risk: memory growth on very large repositories.
    - control: single-entry cache for active `(db_path, repo_id)` in current process.
 3. Risk: rollback need after field feedback.
-   - control: env-gated fallback to legacy SQL path without code rollback.
+   - control: env-gated fallback to legacy relational_query path without code rollback.
 
 ## Verification Protocol
 
@@ -57,3 +57,4 @@ If runtime query endpoints use the same in-memory adjacency model already proven
    - `phase_timing_ms.query_benchmark`
    - `query_latency_ms.*` medians
    - `phase_memory_bytes.*` deltas.
+

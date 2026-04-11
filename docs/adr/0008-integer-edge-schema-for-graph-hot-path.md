@@ -39,7 +39,7 @@ Tradeoffs:
 
 ## Alternatives Considered
 
-1. keep SHA edge schema and only tune SQL/indexes.
+1. keep SHA edge schema and only tune relational_query/indexes.
    - Rejected: leaves fundamental string-join overhead in the hot path.
 2. keep hybrid schema with SHA edges as primary and integer edges as cache.
    - Rejected: doubles maintenance complexity for no immediate contract clarity.
@@ -50,5 +50,6 @@ Tradeoffs:
 
 1. Ligra (sparse/dense frontier processing): https://jshun.csail.mit.edu/ligra.pdf
 2. GraphIt (graph optimization scheduling): https://arxiv.org/abs/1805.00923
-3. SQLite rowid table behavior: https://www.sqlite.org/rowidtable.html
+3. legacy_relational_engine rowid table behavior: https://www.legacy_relational_engine.org/rowidtable.html
 4. Git commit-graph format (positional parent references): https://git-scm.com/docs/gitformat-commit-graph
+

@@ -1,4 +1,4 @@
-﻿# Consolidated Perf Report (6k, 90k, 100k)
+# Consolidated Perf Report (6k, 90k, 100k)
 
 Date: 2026-03-15
 
@@ -176,7 +176,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=0.080 median=0.082 p95=0.083 max=0.095 mean=0.082
   shortest_path_both: runs=20 min=0.005 median=0.005 p95=0.005 max=0.006 mean=0.005
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 128.725x
   shortest_path_parents: 137.012x
   shortest_path_both: 1648.765x
@@ -343,7 +343,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=2.309 median=2.974 p95=3.669 max=3.833 mean=2.979
   shortest_path_both: runs=20 min=0.062 median=0.066 p95=0.067 max=0.080 mean=0.065
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 10.003x
   shortest_path_parents: 12.416x
   shortest_path_both: 142.263x
@@ -510,7 +510,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=1.396 median=2.644 p95=3.721 max=3.903 mean=2.439
   shortest_path_both: runs=20 min=0.077 median=0.077 p95=0.078 max=0.098 mean=0.078
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 15.447x
   shortest_path_parents: 15.488x
   shortest_path_both: 112.547x
@@ -522,4 +522,5 @@ commit_throughput_diagnostics:
   effective_commit_throughput_with_drain_per_sec: 635.188
   end_to_end_commit_throughput_per_sec: 486.075
 ```
+
 

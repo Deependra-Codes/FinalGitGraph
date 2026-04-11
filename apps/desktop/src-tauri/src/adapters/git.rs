@@ -22,8 +22,8 @@ use gix_pack::index::File as PackIndexFile;
 use rayon::prelude::*;
 
 use crate::domain::models::{
-    FileChangeLineStatsUpdate, FileChangeStatsState, ParsedCommit, ParsedFileChange, ParsedRef,
-    PendingFileChangeEnrichment,
+    CommitMetadataState, FileChangeLineStatsUpdate, FileChangeStatsState, ParsedCommit,
+    ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
 };
 use crate::support::error::{AppError, AppResult};
 
@@ -98,10 +98,111 @@ enum CommitWalkSortMode {
     CommitTimeCutoff,
 }
 
+impl CommitWalkSortMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitTimeNewest => "commit_time_newest",
+            Self::BreadthFirst => "breadth_first",
+            Self::CommitTimeCutoff => "commit_time_cutoff",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitWalkBackend {
     RevisionWalk,
     PackAwareWired,
+    CommitGraphFastPath,
+}
+
+impl CommitWalkBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RevisionWalk => "revision_walk",
+            Self::PackAwareWired => "pack_aware",
+            Self::CommitGraphFastPath => "commit_graph_fast_path",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CommitWalkPhaseTiming {
+    decode: Duration,
+    parent_resolve: Duration,
+    metadata_parse: Duration,
+    tip_collection: Duration,
+    hide_expansion: Duration,
+    graph_lookup: Duration,
+    ordering: Duration,
+    emit: Duration,
+    graph_lookup_hit_count: usize,
+    graph_lookup_miss_count: usize,
+    graph_fallback_count: usize,
+    graph_partial_fallback_count: usize,
+    nodes_seen_count: usize,
+    nodes_pruned_count: usize,
+    queue_max_depth: usize,
+    metadata_pending_count: usize,
+}
+
+impl CommitWalkPhaseTiming {
+    fn merge_from(&mut self, other: Self) {
+        self.decode = self.decode.saturating_add(other.decode);
+        self.parent_resolve = self.parent_resolve.saturating_add(other.parent_resolve);
+        self.metadata_parse = self.metadata_parse.saturating_add(other.metadata_parse);
+        self.tip_collection = self.tip_collection.saturating_add(other.tip_collection);
+        self.hide_expansion = self.hide_expansion.saturating_add(other.hide_expansion);
+        self.graph_lookup = self.graph_lookup.saturating_add(other.graph_lookup);
+        self.ordering = self.ordering.saturating_add(other.ordering);
+        self.emit = self.emit.saturating_add(other.emit);
+        self.graph_lookup_hit_count = self
+            .graph_lookup_hit_count
+            .saturating_add(other.graph_lookup_hit_count);
+        self.graph_lookup_miss_count = self
+            .graph_lookup_miss_count
+            .saturating_add(other.graph_lookup_miss_count);
+        self.graph_fallback_count = self
+            .graph_fallback_count
+            .saturating_add(other.graph_fallback_count);
+        self.graph_partial_fallback_count = self
+            .graph_partial_fallback_count
+            .saturating_add(other.graph_partial_fallback_count);
+        self.nodes_seen_count = self.nodes_seen_count.saturating_add(other.nodes_seen_count);
+        self.nodes_pruned_count = self
+            .nodes_pruned_count
+            .saturating_add(other.nodes_pruned_count);
+        self.queue_max_depth = self.queue_max_depth.max(other.queue_max_depth);
+        self.metadata_pending_count = self
+            .metadata_pending_count
+            .saturating_add(other.metadata_pending_count);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitWalkOutcome {
+    backend: CommitWalkBackend,
+    pruned_parent_expansions: usize,
+    phase_timing: CommitWalkPhaseTiming,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitGraphWalkResult {
+    outcome: CommitWalkOutcome,
+    missing_tips: Vec<ObjectId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitWalkPolicy {
+    sort_mode: CommitWalkSortMode,
+    sort_reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitWalkContext<'a> {
+    sort_mode: CommitWalkSortMode,
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&'a str>,
+    walk_scope: CommitWalkScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,8 +223,26 @@ impl CommitWalkScope {
 #[derive(Debug, Clone, Default)]
 pub struct CommitWalkExecutionStats {
     pub scope: String,
+    pub backend_effective: String,
+    pub sort_effective: String,
     pub tip_count: usize,
     pub pruned_parent_expansions: usize,
+    pub decode: Duration,
+    pub parent_resolve: Duration,
+    pub metadata_parse: Duration,
+    pub tip_collection: Duration,
+    pub hide_expansion: Duration,
+    pub graph_lookup: Duration,
+    pub ordering: Duration,
+    pub emit: Duration,
+    pub graph_lookup_hit_count: usize,
+    pub graph_lookup_miss_count: usize,
+    pub graph_fallback_count: usize,
+    pub graph_partial_fallback_count: usize,
+    pub nodes_seen_count: usize,
+    pub nodes_pruned_count: usize,
+    pub queue_max_depth: usize,
+    pub metadata_pending_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +430,58 @@ struct PathProbeDictionaryCache {
     by_git_dir: HashMap<PathBuf, RepoPathProbeDictionary>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct PositionBitmap {
+    words: Vec<u64>,
+}
+
+impl PositionBitmap {
+    fn mark(&mut self, position: gix::commitgraph::Position) -> bool {
+        let index = position.0 as usize;
+        let word_index = index / u64::BITS as usize;
+        let bit_mask = 1u64 << (index % u64::BITS as usize);
+        if word_index >= self.words.len() {
+            self.words.resize(word_index + 1, 0);
+        }
+        if self.words[word_index] & bit_mask == 0 {
+            self.words[word_index] |= bit_mask;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, position: gix::commitgraph::Position) -> bool {
+        let index = position.0 as usize;
+        let word_index = index / u64::BITS as usize;
+        let bit_mask = 1u64 << (index % u64::BITS as usize);
+        self.words
+            .get(word_index)
+            .map(|word| *word & bit_mask != 0)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitGraphQueueEntry {
+    committer_time: i64,
+    position: gix::commitgraph::Position,
+}
+
+impl Ord for CommitGraphQueueEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.committer_time
+            .cmp(&other.committer_time)
+            .then_with(|| self.position.0.cmp(&other.position.0))
+    }
+}
+
+impl PartialOrd for CommitGraphQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChangedPathDecision {
     Touched,
@@ -386,96 +557,234 @@ fn walk_commits(
 ) -> AppResult<CommitWalkExecutionStats> {
     let repo = open_repository(repo_root)?;
     let requested_scope = parse_commit_walk_scope();
+    let tip_collection_started = Instant::now();
     let (tips, effective_scope) = collect_revision_tips(&repo, requested_scope)?;
+    let tip_collection_elapsed = tip_collection_started.elapsed();
+    let walk_policy = resolve_commit_walk_policy(since_epoch, hide_ancestor_sha);
+    let walk_context = CommitWalkContext {
+        sort_mode: walk_policy.sort_mode,
+        since_epoch,
+        hide_ancestor_sha,
+        walk_scope: effective_scope,
+    };
     let tip_count = tips.len();
     if tips.is_empty() {
         return Ok(CommitWalkExecutionStats {
             scope: effective_scope.as_str().to_string(),
+            backend_effective: "none".to_string(),
+            sort_effective: format!(
+                "{} ({})",
+                walk_policy.sort_mode.as_str(),
+                walk_policy.sort_reason
+            ),
             tip_count: 0,
             pruned_parent_expansions: 0,
+            decode: Duration::ZERO,
+            parent_resolve: Duration::ZERO,
+            metadata_parse: Duration::ZERO,
+            tip_collection: tip_collection_elapsed,
+            hide_expansion: Duration::ZERO,
+            graph_lookup: Duration::ZERO,
+            ordering: Duration::ZERO,
+            emit: Duration::ZERO,
+            graph_lookup_hit_count: 0,
+            graph_lookup_miss_count: 0,
+            graph_fallback_count: 0,
+            graph_partial_fallback_count: 0,
+            nodes_seen_count: 0,
+            nodes_pruned_count: 0,
+            queue_max_depth: 0,
+            metadata_pending_count: 0,
         });
     }
 
-    let pruned_parent_expansions = match resolve_commit_walk_backend() {
-        CommitWalkBackend::RevisionWalk => walk_commits_revision(
-            &repo,
-            tips,
-            since_epoch,
-            hide_ancestor_sha,
-            effective_scope,
-            &mut on_commit,
-        )?,
-        CommitWalkBackend::PackAwareWired => walk_commits_pack_aware_wired(
-            &repo,
-            tips,
-            since_epoch,
-            hide_ancestor_sha,
-            effective_scope,
-            &mut on_commit,
-        )?,
+    let outcome = match resolve_commit_walk_backend() {
+        CommitWalkBackend::RevisionWalk => {
+            walk_commits_revision(&repo, tips, walk_context, &mut on_commit)?
+        }
+        CommitWalkBackend::PackAwareWired => {
+            walk_commits_pack_aware_wired(&repo, tips, walk_context, &mut on_commit)?
+        }
+        CommitWalkBackend::CommitGraphFastPath => {
+            unreachable!("commit-graph fast-path is selected by pack-aware backend")
+        }
     };
 
     Ok(CommitWalkExecutionStats {
         scope: effective_scope.as_str().to_string(),
+        backend_effective: outcome.backend.as_str().to_string(),
+        sort_effective: format!(
+            "{} ({})",
+            walk_policy.sort_mode.as_str(),
+            walk_policy.sort_reason
+        ),
         tip_count,
-        pruned_parent_expansions,
+        pruned_parent_expansions: outcome.pruned_parent_expansions,
+        decode: outcome.phase_timing.decode,
+        parent_resolve: outcome.phase_timing.parent_resolve,
+        metadata_parse: outcome.phase_timing.metadata_parse,
+        tip_collection: tip_collection_elapsed,
+        hide_expansion: outcome.phase_timing.hide_expansion,
+        graph_lookup: outcome.phase_timing.graph_lookup,
+        ordering: outcome.phase_timing.ordering,
+        emit: outcome.phase_timing.emit,
+        graph_lookup_hit_count: outcome.phase_timing.graph_lookup_hit_count,
+        graph_lookup_miss_count: outcome.phase_timing.graph_lookup_miss_count,
+        graph_fallback_count: outcome.phase_timing.graph_fallback_count,
+        graph_partial_fallback_count: outcome.phase_timing.graph_partial_fallback_count,
+        nodes_seen_count: outcome.phase_timing.nodes_seen_count,
+        nodes_pruned_count: outcome.phase_timing.nodes_pruned_count,
+        queue_max_depth: outcome.phase_timing.queue_max_depth,
+        metadata_pending_count: outcome.phase_timing.metadata_pending_count,
     })
 }
 
 fn walk_commits_pack_aware_wired(
     repo: &Repository,
     tips: Vec<ObjectId>,
-    since_epoch: Option<i64>,
-    hide_ancestor_sha: Option<&str>,
-    walk_scope: CommitWalkScope,
+    context: CommitWalkContext<'_>,
     on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
-) -> AppResult<usize> {
-    let mut pack_state = match build_pack_aware_traversal_state(repo)? {
+) -> AppResult<CommitWalkOutcome> {
+    let mut graph_attempted = false;
+    let mut pack_state = build_pack_aware_traversal_state(repo)?;
+    if let Some(graph) = load_commit_graph_cached(repo)? {
+        graph_attempted = true;
+        let mut emitted_shas = HashSet::new();
+        if let Some(graph_result) = walk_commits_from_commit_graph(
+            graph.as_ref(),
+            tips.clone(),
+            context,
+            &mut emitted_shas,
+            on_commit,
+        )? {
+            if graph_result.missing_tips.is_empty() {
+                return Ok(graph_result.outcome);
+            }
+
+            let mut missing_tips = Vec::with_capacity(graph_result.missing_tips.len());
+            let mut seen_missing_tips = HashSet::with_capacity(graph_result.missing_tips.len());
+            for tip in graph_result.missing_tips {
+                if seen_missing_tips.insert(tip) {
+                    missing_tips.push(tip);
+                }
+            }
+
+            let mut deduped_emit = |commit: ParsedCommit| -> AppResult<()> {
+                if emitted_shas.insert(commit.sha.clone()) {
+                    on_commit(commit)?;
+                }
+                Ok(())
+            };
+            let graph_contributed = graph_result.outcome.phase_timing.nodes_seen_count > 0
+                || graph_result.outcome.phase_timing.graph_lookup_hit_count > 0;
+            let fallback_context = if graph_contributed {
+                CommitWalkContext {
+                    hide_ancestor_sha: None,
+                    ..context
+                }
+            } else {
+                context
+            };
+            let fallback_outcome = walk_commits_from_missing_tips(
+                repo,
+                missing_tips,
+                fallback_context,
+                pack_state.as_mut(),
+                &mut deduped_emit,
+            )?;
+
+            let mut phase_timing = graph_result.outcome.phase_timing;
+            phase_timing.merge_from(fallback_outcome.phase_timing);
+            let pruned_parent_expansions = graph_result
+                .outcome
+                .pruned_parent_expansions
+                .saturating_add(fallback_outcome.pruned_parent_expansions);
+
+            if graph_contributed {
+                phase_timing.graph_partial_fallback_count =
+                    phase_timing.graph_partial_fallback_count.saturating_add(1);
+                return Ok(CommitWalkOutcome {
+                    backend: CommitWalkBackend::CommitGraphFastPath,
+                    pruned_parent_expansions,
+                    phase_timing,
+                });
+            }
+
+            phase_timing.graph_fallback_count = phase_timing.graph_fallback_count.saturating_add(1);
+            return Ok(CommitWalkOutcome {
+                backend: fallback_outcome.backend,
+                pruned_parent_expansions,
+                phase_timing,
+            });
+        }
+    }
+
+    let mut pack_state = match pack_state.take() {
         Some(state) => state,
         None => {
-            return walk_commits_revision(
-                repo,
-                tips,
-                since_epoch,
-                hide_ancestor_sha,
-                walk_scope,
-                on_commit,
-            );
+            return walk_commits_revision(repo, tips, context, on_commit);
         }
     };
     if pack_state.object_locations.is_empty() {
-        return walk_commits_revision(
-            repo,
-            tips,
-            since_epoch,
-            hide_ancestor_sha,
-            walk_scope,
-            on_commit,
-        );
+        return walk_commits_revision(repo, tips, context, on_commit);
     }
-    walk_commits_from_pack_frontier(
-        repo,
-        tips,
-        since_epoch,
-        hide_ancestor_sha,
-        walk_scope,
-        &mut pack_state,
-        on_commit,
-    )
+    let (pruned_parent_expansions, phase_timing) =
+        walk_commits_from_pack_frontier(repo, tips, context, &mut pack_state, on_commit)?;
+    let mut phase_timing = phase_timing;
+    if graph_attempted {
+        phase_timing.graph_lookup_miss_count =
+            phase_timing.graph_lookup_miss_count.saturating_add(1);
+        phase_timing.graph_fallback_count = phase_timing.graph_fallback_count.saturating_add(1);
+    }
+    Ok(CommitWalkOutcome {
+        backend: CommitWalkBackend::PackAwareWired,
+        pruned_parent_expansions,
+        phase_timing,
+    })
+}
+
+fn walk_commits_from_missing_tips(
+    repo: &Repository,
+    tips: Vec<ObjectId>,
+    context: CommitWalkContext<'_>,
+    pack_state: Option<&mut PackAwareTraversalState>,
+    on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<CommitWalkOutcome> {
+    if tips.is_empty() {
+        return Ok(CommitWalkOutcome {
+            backend: CommitWalkBackend::CommitGraphFastPath,
+            pruned_parent_expansions: 0,
+            phase_timing: CommitWalkPhaseTiming::default(),
+        });
+    }
+
+    if let Some(pack_state) = pack_state {
+        if !pack_state.object_locations.is_empty() {
+            let (pruned_parent_expansions, phase_timing) =
+                walk_commits_from_pack_frontier(repo, tips, context, pack_state, on_commit)?;
+            return Ok(CommitWalkOutcome {
+                backend: CommitWalkBackend::PackAwareWired,
+                pruned_parent_expansions,
+                phase_timing,
+            });
+        }
+    }
+
+    walk_commits_revision(repo, tips, context, on_commit)
 }
 
 fn walk_commits_revision(
     repo: &Repository,
     tips: Vec<ObjectId>,
-    since_epoch: Option<i64>,
-    hide_ancestor_sha: Option<&str>,
-    _walk_scope: CommitWalkScope,
+    context: CommitWalkContext<'_>,
     on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
-) -> AppResult<usize> {
-    let mut revwalk = repo
-        .rev_walk(tips)
-        .sorting(resolve_commit_walk_sorting(since_epoch));
-    if let Some(hide_sha) = hide_ancestor_sha {
+) -> AppResult<CommitWalkOutcome> {
+    let mut phase_timing = CommitWalkPhaseTiming::default();
+    let mut revwalk = repo.rev_walk(tips).sorting(resolve_commit_walk_sorting(
+        context.sort_mode,
+        context.since_epoch,
+    ));
+    if let Some(hide_sha) = context.hide_ancestor_sha {
         let hide_oid = parse_hex_object_id(hide_sha, "parse revision walk hide commit sha")?;
         revwalk = revwalk.with_hidden([hide_oid]);
     }
@@ -484,8 +793,13 @@ fn walk_commits_revision(
         .all()
         .map_err(|error| map_git_error("create revision walk", error))?
     {
+        let parent_resolve_started = Instant::now();
         let info = walked.map_err(|error| map_git_error("read walked commit id", error))?;
-        if let Some(since) = since_epoch {
+        phase_timing.parent_resolve = phase_timing
+            .parent_resolve
+            .saturating_add(parent_resolve_started.elapsed());
+        phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
+        if let Some(since) = context.since_epoch {
             if info
                 .commit_time
                 .is_some_and(|commit_time| commit_time < since)
@@ -494,108 +808,146 @@ fn walk_commits_revision(
             }
         }
 
+        let decode_started = Instant::now();
         let commit = repo
             .find_commit(info.id)
             .map_err(|error| map_git_error("resolve walked commit", error))?;
-        if let Some(since) = since_epoch {
-            if commit
-                .committer()
-                .map(|committer| committer.seconds())
-                .unwrap_or_default()
-                < since
-            {
-                continue;
-            }
-        }
+        phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
 
-        on_commit(build_parsed_commit(&commit))?;
+        let parsed = build_pending_parsed_commit_from_commit(&commit, info.commit_time);
+        phase_timing.metadata_pending_count = phase_timing.metadata_pending_count.saturating_add(1);
+        let emit_started = Instant::now();
+        on_commit(parsed)?;
+        phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
     }
-    Ok(0)
+    Ok(CommitWalkOutcome {
+        backend: CommitWalkBackend::RevisionWalk,
+        pruned_parent_expansions: 0,
+        phase_timing,
+    })
 }
 
 fn walk_commits_from_pack_frontier(
     repo: &Repository,
     tips: Vec<ObjectId>,
-    since_epoch: Option<i64>,
-    hide_ancestor_sha: Option<&str>,
-    walk_scope: CommitWalkScope,
+    context: CommitWalkContext<'_>,
     pack_state: &mut PackAwareTraversalState,
     on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
-) -> AppResult<usize> {
+) -> AppResult<(usize, CommitWalkPhaseTiming)> {
+    let mut phase_timing = CommitWalkPhaseTiming::default();
     let mut hidden = HashSet::new();
-    if let Some(hide_sha) = hide_ancestor_sha {
+    if let Some(hide_sha) = context.hide_ancestor_sha {
+        let hide_started = Instant::now();
         let hide_oid = parse_hex_object_id(hide_sha, "parse pack-aware hide commit sha")?;
         let mut hide_stack = vec![hide_oid];
         while let Some(oid) = hide_stack.pop() {
             if !hidden.insert(oid) {
                 continue;
             }
-            ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+            ensure_pack_aware_commit_cached(repo, pack_state, &oid, &mut phase_timing)?;
             if let Some(commit) = pack_state.commit_cache.get(&oid) {
                 hide_stack.extend(commit.parent_ids.iter().cloned());
             }
         }
+        phase_timing.hide_expansion = phase_timing
+            .hide_expansion
+            .saturating_add(hide_started.elapsed());
     }
 
-    let sort_mode = resolve_commit_walk_sort_mode(since_epoch);
     let mut pruned_parent_expansions = 0usize;
-    if sort_mode == CommitWalkSortMode::BreadthFirst {
+    if context.sort_mode == CommitWalkSortMode::BreadthFirst {
         let mut queue: VecDeque<ObjectId> = tips.into_iter().collect();
         let mut emitted = HashSet::new();
+        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
         while let Some(oid) = queue.pop_front() {
             if !emitted.insert(oid) || hidden.contains(&oid) {
                 continue;
             }
-            ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+            phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
+            let parent_resolve_started = Instant::now();
+            ensure_pack_aware_commit_cached(repo, pack_state, &oid, &mut phase_timing)?;
             let Some(commit) = pack_state.commit_cache.get(&oid) else {
+                phase_timing.parent_resolve = phase_timing
+                    .parent_resolve
+                    .saturating_add(parent_resolve_started.elapsed());
                 continue;
             };
-            let under_since_cutoff = since_epoch
+            let under_since_cutoff = context
+                .since_epoch
                 .map(|since| commit.parsed.committer_time < since)
                 .unwrap_or(false);
-            if under_since_cutoff && walk_scope == CommitWalkScope::Frontier {
+            if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
                 pruned_parent_expansions =
                     pruned_parent_expansions.saturating_add(commit.parent_ids.len());
+                phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
+                phase_timing.parent_resolve = phase_timing
+                    .parent_resolve
+                    .saturating_add(parent_resolve_started.elapsed());
                 continue;
             }
             queue.extend(commit.parent_ids.iter().cloned());
-            if since_epoch
+            phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+            if context
+                .since_epoch
                 .map(|since| commit.parsed.committer_time >= since)
                 .unwrap_or(true)
             {
+                phase_timing.metadata_pending_count =
+                    phase_timing.metadata_pending_count.saturating_add(1);
+                let emit_started = Instant::now();
                 on_commit(commit.parsed.clone())?;
+                phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
             }
         }
-        return Ok(pruned_parent_expansions);
+        return Ok((pruned_parent_expansions, phase_timing));
     }
 
     let mut reachable = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = tips.clone();
+    phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(stack.len());
     while let Some(oid) = stack.pop() {
         if !seen.insert(oid) || hidden.contains(&oid) {
             continue;
         }
-        ensure_pack_aware_commit_cached(repo, pack_state, &oid)?;
+        phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
+        let parent_resolve_started = Instant::now();
+        ensure_pack_aware_commit_cached(repo, pack_state, &oid, &mut phase_timing)?;
         let Some(commit) = pack_state.commit_cache.get(&oid) else {
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
             continue;
         };
-        let under_since_cutoff = since_epoch
+        let under_since_cutoff = context
+            .since_epoch
             .map(|since| commit.parsed.committer_time < since)
             .unwrap_or(false);
-        if under_since_cutoff && walk_scope == CommitWalkScope::Frontier {
+        if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
             pruned_parent_expansions =
                 pruned_parent_expansions.saturating_add(commit.parent_ids.len());
+            phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
             continue;
         }
         stack.extend(commit.parent_ids.iter().cloned());
+        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(stack.len());
         reachable.push(oid);
+        phase_timing.parent_resolve = phase_timing
+            .parent_resolve
+            .saturating_add(parent_resolve_started.elapsed());
     }
 
     let mut ordered = Vec::with_capacity(reachable.len());
     for oid in reachable {
         if let Some(commit) = pack_state.commit_cache.get(&oid) {
-            if since_epoch
+            if context
+                .since_epoch
                 .map(|since| commit.parsed.committer_time >= since)
                 .unwrap_or(true)
             {
@@ -603,41 +955,387 @@ fn walk_commits_from_pack_frontier(
             }
         }
     }
+    let ordering_started = Instant::now();
     ordered.sort_unstable_by(|left, right| {
         right
             .committer_time
             .cmp(&left.committer_time)
             .then_with(|| right.sha.cmp(&left.sha))
     });
+    phase_timing.ordering = phase_timing
+        .ordering
+        .saturating_add(ordering_started.elapsed());
     for commit in ordered {
+        phase_timing.metadata_pending_count = phase_timing.metadata_pending_count.saturating_add(1);
+        let emit_started = Instant::now();
         on_commit(commit)?;
+        phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
     }
-    Ok(pruned_parent_expansions)
+    Ok((pruned_parent_expansions, phase_timing))
+}
+
+fn walk_commits_from_commit_graph(
+    graph: &gix::commitgraph::Graph,
+    tips: Vec<ObjectId>,
+    context: CommitWalkContext<'_>,
+    emitted_shas: &mut HashSet<String>,
+    on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
+) -> AppResult<Option<CommitGraphWalkResult>> {
+    if tips.is_empty() {
+        return Ok(Some(CommitGraphWalkResult {
+            outcome: CommitWalkOutcome {
+                backend: CommitWalkBackend::CommitGraphFastPath,
+                pruned_parent_expansions: 0,
+                phase_timing: CommitWalkPhaseTiming::default(),
+            },
+            missing_tips: Vec::new(),
+        }));
+    }
+
+    let mut phase_timing = CommitWalkPhaseTiming::default();
+    let mut missing_tips = Vec::new();
+    let mut tip_positions = Vec::with_capacity(tips.len());
+    for tip in tips {
+        if let Some(commit) = commit_graph_commit_by_id(graph, tip, &mut phase_timing) {
+            tip_positions.push(gix::commitgraph::Position(commit.position().0));
+        } else {
+            missing_tips.push(tip);
+        }
+    }
+    if tip_positions.is_empty() {
+        return Ok(Some(CommitGraphWalkResult {
+            outcome: CommitWalkOutcome {
+                backend: CommitWalkBackend::CommitGraphFastPath,
+                pruned_parent_expansions: 0,
+                phase_timing,
+            },
+            missing_tips,
+        }));
+    }
+
+    let mut hidden = PositionBitmap::default();
+    if let Some(hide_sha) = context.hide_ancestor_sha {
+        let hide_started = Instant::now();
+        let hide_oid = parse_hex_object_id(hide_sha, "parse commit-graph hide commit sha")?;
+        let Some(hide_commit) = commit_graph_commit_by_id(graph, hide_oid, &mut phase_timing)
+        else {
+            return Ok(None);
+        };
+        let mut hide_stack = vec![gix::commitgraph::Position(hide_commit.position().0)];
+        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(hide_stack.len());
+        while let Some(position) = hide_stack.pop() {
+            if !hidden.mark(position) {
+                continue;
+            }
+            let parent_resolve_started = Instant::now();
+            let Some(commit) = commit_graph_commit_by_position(graph, position, &mut phase_timing)
+            else {
+                return Ok(None);
+            };
+            let Some(parent_positions) = commit_graph_parent_positions(graph, commit)? else {
+                return Ok(None);
+            };
+            hide_stack.extend(parent_positions);
+            phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(hide_stack.len());
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+        }
+        phase_timing.hide_expansion = phase_timing
+            .hide_expansion
+            .saturating_add(hide_started.elapsed());
+    }
+
+    let mut pruned_parent_expansions = 0usize;
+    if context.sort_mode == CommitWalkSortMode::BreadthFirst {
+        let mut queue: VecDeque<gix::commitgraph::Position> = tip_positions.into_iter().collect();
+        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
+        let mut seen = PositionBitmap::default();
+        while let Some(position) = queue.pop_front() {
+            if !seen.mark(position) {
+                continue;
+            }
+            phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
+            if hidden.contains(position) {
+                continue;
+            }
+            let parent_resolve_started = Instant::now();
+            let Some(commit) = commit_graph_commit_by_position(graph, position, &mut phase_timing)
+            else {
+                return Ok(None);
+            };
+            let Some(parent_positions) = commit_graph_parent_positions(graph, commit)? else {
+                return Ok(None);
+            };
+            let committer_time = commit_graph_committer_time(commit);
+            let under_since_cutoff = context
+                .since_epoch
+                .map(|since| committer_time < since)
+                .unwrap_or(false);
+            if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
+                pruned_parent_expansions =
+                    pruned_parent_expansions.saturating_add(parent_positions.len());
+                phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
+                phase_timing.parent_resolve = phase_timing
+                    .parent_resolve
+                    .saturating_add(parent_resolve_started.elapsed());
+                continue;
+            }
+            queue.extend(parent_positions.iter().copied());
+            phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+            if context
+                .since_epoch
+                .map(|since| committer_time >= since)
+                .unwrap_or(true)
+            {
+                phase_timing.metadata_pending_count =
+                    phase_timing.metadata_pending_count.saturating_add(1);
+                let parsed = build_pending_parsed_commit_from_graph_positions(
+                    graph,
+                    commit,
+                    parent_positions.as_slice(),
+                );
+                let emit_started = Instant::now();
+                if emitted_shas.insert(parsed.sha.clone()) {
+                    on_commit(parsed)?;
+                }
+                phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
+            }
+        }
+        return Ok(Some(CommitGraphWalkResult {
+            outcome: CommitWalkOutcome {
+                backend: CommitWalkBackend::CommitGraphFastPath,
+                pruned_parent_expansions,
+                phase_timing,
+            },
+            missing_tips,
+        }));
+    }
+
+    let mut seen = PositionBitmap::default();
+    let mut commit_time_cache = vec![None; graph.num_commits() as usize];
+    let mut queue = BinaryHeap::new();
+    let seed_ordering_started = Instant::now();
+    for tip_position in tip_positions {
+        let Some(committer_time) = commit_graph_cached_committer_time(
+            graph,
+            tip_position,
+            commit_time_cache.as_mut_slice(),
+            &mut phase_timing,
+        ) else {
+            return Ok(None);
+        };
+        queue.push(CommitGraphQueueEntry {
+            committer_time,
+            position: tip_position,
+        });
+    }
+    phase_timing.ordering = phase_timing
+        .ordering
+        .saturating_add(seed_ordering_started.elapsed());
+    phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
+
+    while let Some(entry) = queue.pop() {
+        if !seen.mark(entry.position) {
+            continue;
+        }
+        phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
+        if hidden.contains(entry.position) {
+            continue;
+        }
+        let parent_resolve_started = Instant::now();
+        let Some(commit) =
+            commit_graph_commit_by_position(graph, entry.position, &mut phase_timing)
+        else {
+            return Ok(None);
+        };
+        let Some(parent_positions) = commit_graph_parent_positions(graph, commit)? else {
+            return Ok(None);
+        };
+        let committer_time = entry.committer_time;
+        let under_since_cutoff = context
+            .since_epoch
+            .map(|since| committer_time < since)
+            .unwrap_or(false);
+        if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
+            pruned_parent_expansions =
+                pruned_parent_expansions.saturating_add(parent_positions.len());
+            phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
+            phase_timing.parent_resolve = phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+            continue;
+        }
+        let ordering_started = Instant::now();
+        for parent_position in parent_positions.iter().copied() {
+            if seen.contains(parent_position) || hidden.contains(parent_position) {
+                continue;
+            }
+            let Some(parent_time) = commit_graph_cached_committer_time(
+                graph,
+                parent_position,
+                commit_time_cache.as_mut_slice(),
+                &mut phase_timing,
+            ) else {
+                return Ok(None);
+            };
+            queue.push(CommitGraphQueueEntry {
+                committer_time: parent_time,
+                position: parent_position,
+            });
+        }
+        phase_timing.ordering = phase_timing
+            .ordering
+            .saturating_add(ordering_started.elapsed());
+        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
+        if context
+            .since_epoch
+            .map(|since| committer_time >= since)
+            .unwrap_or(true)
+        {
+            phase_timing.metadata_pending_count =
+                phase_timing.metadata_pending_count.saturating_add(1);
+            let parsed = build_pending_parsed_commit_from_graph_positions(
+                graph,
+                commit,
+                parent_positions.as_slice(),
+            );
+            let emit_started = Instant::now();
+            if emitted_shas.insert(parsed.sha.clone()) {
+                on_commit(parsed)?;
+            }
+            phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
+        }
+        phase_timing.parent_resolve = phase_timing
+            .parent_resolve
+            .saturating_add(parent_resolve_started.elapsed());
+    }
+
+    Ok(Some(CommitGraphWalkResult {
+        outcome: CommitWalkOutcome {
+            backend: CommitWalkBackend::CommitGraphFastPath,
+            pruned_parent_expansions,
+            phase_timing,
+        },
+        missing_tips,
+    }))
+}
+
+fn commit_graph_parent_positions(
+    graph: &gix::commitgraph::Graph,
+    commit: gix::commitgraph::file::Commit<'_>,
+) -> AppResult<Option<Vec<gix::commitgraph::Position>>> {
+    let mut parents = Vec::new();
+    for parent in commit.iter_parents() {
+        let parent_position = match parent {
+            Ok(position) => position,
+            Err(_) => return Ok(None),
+        };
+        if parent_position.0 >= graph.num_commits() {
+            return Ok(None);
+        }
+        parents.push(gix::commitgraph::Position(parent_position.0));
+    }
+    Ok(Some(parents))
+}
+
+fn commit_graph_commit_by_id<'a>(
+    graph: &'a gix::commitgraph::Graph,
+    oid: ObjectId,
+    phase_timing: &mut CommitWalkPhaseTiming,
+) -> Option<gix::commitgraph::file::Commit<'a>> {
+    let graph_lookup_started = Instant::now();
+    let commit = graph.commit_by_id(oid);
+    phase_timing.graph_lookup = phase_timing
+        .graph_lookup
+        .saturating_add(graph_lookup_started.elapsed());
+    if commit.is_some() {
+        phase_timing.graph_lookup_hit_count = phase_timing.graph_lookup_hit_count.saturating_add(1);
+    } else {
+        phase_timing.graph_lookup_miss_count =
+            phase_timing.graph_lookup_miss_count.saturating_add(1);
+    }
+    commit
+}
+
+fn commit_graph_commit_by_position<'a>(
+    graph: &'a gix::commitgraph::Graph,
+    position: gix::commitgraph::Position,
+    phase_timing: &mut CommitWalkPhaseTiming,
+) -> Option<gix::commitgraph::file::Commit<'a>> {
+    let graph_lookup_started = Instant::now();
+    let commit = if position.0 < graph.num_commits() {
+        Some(graph.commit_at(position))
+    } else {
+        None
+    };
+    phase_timing.graph_lookup = phase_timing
+        .graph_lookup
+        .saturating_add(graph_lookup_started.elapsed());
+    if commit.is_some() {
+        phase_timing.graph_lookup_hit_count = phase_timing.graph_lookup_hit_count.saturating_add(1);
+    } else {
+        phase_timing.graph_lookup_miss_count =
+            phase_timing.graph_lookup_miss_count.saturating_add(1);
+    }
+    commit
+}
+
+fn commit_graph_cached_committer_time(
+    graph: &gix::commitgraph::Graph,
+    position: gix::commitgraph::Position,
+    cache: &mut [Option<i64>],
+    phase_timing: &mut CommitWalkPhaseTiming,
+) -> Option<i64> {
+    let index = position.0 as usize;
+    if let Some(Some(cached)) = cache.get(index) {
+        return Some(*cached);
+    }
+    let commit = commit_graph_commit_by_position(graph, position, phase_timing)?;
+    let committer_time = commit_graph_committer_time(commit);
+    if let Some(slot) = cache.get_mut(index) {
+        *slot = Some(committer_time);
+    }
+    Some(committer_time)
+}
+
+fn commit_graph_committer_time(commit: gix::commitgraph::file::Commit<'_>) -> i64 {
+    i64::try_from(commit.committer_timestamp()).unwrap_or(i64::MAX)
 }
 
 fn ensure_pack_aware_commit_cached(
     repo: &Repository,
     pack_state: &mut PackAwareTraversalState,
     oid: &ObjectId,
+    phase_timing: &mut CommitWalkPhaseTiming,
 ) -> AppResult<()> {
     if pack_state.commit_cache.contains_key(oid) || pack_state.missing_commits.contains(oid) {
         return Ok(());
     }
 
     if let Some(location) = pack_state.object_locations.get(oid).copied() {
+        let decode_started = Instant::now();
         if let Some(commit) = decode_pack_aware_commit(repo, pack_state, oid, location)? {
+            phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
             pack_state.commit_cache.insert(*oid, commit);
             return Ok(());
         }
+        phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
     }
 
+    let decode_started = Instant::now();
     let commit = match repo.find_commit(*oid) {
         Ok(commit) => commit,
         Err(_) => {
+            phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
             pack_state.missing_commits.insert(*oid);
             return Ok(());
         }
     };
+    phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
     let parsed = build_pack_aware_commit_from_commit(&commit);
     pack_state.commit_cache.insert(*oid, parsed);
     Ok(())
@@ -966,7 +1664,7 @@ fn collect_frontier_reference_tips(repo: &Repository) -> AppResult<Vec<ObjectId>
     Ok(tips)
 }
 
-fn build_parsed_commit(commit: &gix::Commit<'_>) -> ParsedCommit {
+fn build_ready_parsed_commit_from_commit(commit: &gix::Commit<'_>) -> ParsedCommit {
     let parents = commit.parent_ids().map(|id| id.to_string()).collect();
     let author = commit.author().ok();
     let committer = commit.committer().ok();
@@ -997,41 +1695,81 @@ fn build_parsed_commit(commit: &gix::Commit<'_>) -> ParsedCommit {
             .map(|signature| signature.seconds())
             .unwrap_or_default(),
         subject,
+        metadata_state: CommitMetadataState::Ready,
     }
 }
 
+fn build_pending_parsed_commit_from_commit(
+    commit: &gix::Commit<'_>,
+    committer_time_hint: Option<i64>,
+) -> ParsedCommit {
+    ParsedCommit {
+        sha: commit.id().to_string(),
+        parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+        tree_sha: commit
+            .tree_id()
+            .map(|tree_id| tree_id.to_string())
+            .unwrap_or_default(),
+        author_name: String::new(),
+        author_email: String::new(),
+        author_time: 0,
+        committer_time: committer_time_hint.unwrap_or_default(),
+        subject: String::new(),
+        metadata_state: CommitMetadataState::Pending,
+    }
+}
+
+fn build_pending_parsed_commit_from_graph(
+    commit: gix::commitgraph::file::Commit<'_>,
+    parent_ids: &[ObjectId],
+) -> ParsedCommit {
+    ParsedCommit {
+        sha: commit.id().to_string(),
+        parents: parent_ids.iter().map(|parent| parent.to_string()).collect(),
+        tree_sha: commit.root_tree_id().to_string(),
+        author_name: String::new(),
+        author_email: String::new(),
+        author_time: 0,
+        committer_time: commit_graph_committer_time(commit),
+        subject: String::new(),
+        metadata_state: CommitMetadataState::Pending,
+    }
+}
+
+fn build_pending_parsed_commit_from_graph_positions(
+    graph: &gix::commitgraph::Graph,
+    commit: gix::commitgraph::file::Commit<'_>,
+    parent_positions: &[gix::commitgraph::Position],
+) -> ParsedCommit {
+    let parent_ids = parent_positions
+        .iter()
+        .map(|position| graph.commit_at(*position).id().to_owned())
+        .collect::<Vec<_>>();
+    build_pending_parsed_commit_from_graph(commit, parent_ids.as_slice())
+}
+
 fn build_pack_aware_commit_from_commit(commit: &gix::Commit<'_>) -> PackAwareCommitRecord {
-    let parsed = build_parsed_commit(commit);
+    let parsed = build_pending_parsed_commit_from_commit(commit, None);
     let parent_ids = commit.parent_ids().map(|parent| parent.detach()).collect();
     PackAwareCommitRecord { parsed, parent_ids }
 }
 
 fn build_parsed_commit_from_ref(sha: String, commit: &gix::objs::CommitRef<'_>) -> ParsedCommit {
-    let author = commit.author().ok();
-    let committer = commit.committer().ok();
-    let subject = commit
-        .message
-        .lines()
-        .next()
-        .map(|line| line.to_str_lossy().into_owned())
+    let committer = commit
+        .committer()
+        .ok()
+        .map(|signature| signature.seconds())
         .unwrap_or_default();
     ParsedCommit {
         sha,
         parents: commit.parents().map(|parent| parent.to_string()).collect(),
         tree_sha: commit.tree().to_string(),
-        author_name: author
-            .map(|signature| signature.name.to_str_lossy().into_owned())
-            .unwrap_or_default(),
-        author_email: author
-            .map(|signature| signature.email.to_str_lossy().into_owned())
-            .unwrap_or_default(),
-        author_time: author
-            .map(|signature| signature.seconds())
-            .unwrap_or_default(),
-        committer_time: committer
-            .map(|signature| signature.seconds())
-            .unwrap_or_default(),
-        subject,
+        author_name: String::new(),
+        author_email: String::new(),
+        author_time: 0,
+        committer_time: committer,
+        subject: String::new(),
+        metadata_state: CommitMetadataState::Pending,
     }
 }
 
@@ -1042,6 +1780,39 @@ fn build_pack_aware_commit_from_ref(
     let parsed = build_parsed_commit_from_ref(oid.to_string(), commit);
     let parent_ids = commit.parents().map(|parent| parent.to_owned()).collect();
     PackAwareCommitRecord { parsed, parent_ids }
+}
+
+pub fn hydrate_commit_metadata_for_shas(
+    repo_root: &Path,
+    commit_shas: &[String],
+) -> AppResult<(Vec<ParsedCommit>, Vec<String>)> {
+    if commit_shas.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let repo = open_repository(repo_root)?;
+    let mut hydrated = Vec::with_capacity(commit_shas.len());
+    let mut failed = Vec::new();
+
+    for commit_sha in commit_shas {
+        let oid = match parse_hex_object_id(commit_sha, "parse commit sha for metadata hydrate") {
+            Ok(oid) => oid,
+            Err(_) => {
+                failed.push(commit_sha.clone());
+                continue;
+            }
+        };
+        let commit = match repo.find_commit(oid) {
+            Ok(commit) => commit,
+            Err(_) => {
+                failed.push(commit_sha.clone());
+                continue;
+            }
+        };
+        hydrated.push(build_ready_parsed_commit_from_commit(&commit));
+    }
+
+    Ok((hydrated, failed))
 }
 
 pub fn load_refs(repo_root: &Path) -> AppResult<Vec<ParsedRef>> {
@@ -1190,15 +1961,32 @@ fn parse_commit_walk_scope() -> CommitWalkScope {
         .unwrap_or(CommitWalkScope::Frontier)
 }
 
-fn resolve_commit_walk_sort_mode(since_epoch: Option<i64>) -> CommitWalkSortMode {
-    let explicit = parse_commit_walk_sort_mode();
-    let _ = since_epoch;
-    explicit.unwrap_or(CommitWalkSortMode::BreadthFirst)
+fn resolve_commit_walk_policy(
+    since_epoch: Option<i64>,
+    hide_ancestor_sha: Option<&str>,
+) -> CommitWalkPolicy {
+    if let Some(explicit) = parse_commit_walk_sort_mode() {
+        return CommitWalkPolicy {
+            sort_mode: explicit,
+            sort_reason: "env_override",
+        };
+    }
+
+    if since_epoch.is_some() || hide_ancestor_sha.is_some() {
+        return CommitWalkPolicy {
+            sort_mode: CommitWalkSortMode::CommitTimeNewest,
+            sort_reason: "incremental_default_newest",
+        };
+    }
+
+    CommitWalkPolicy {
+        sort_mode: CommitWalkSortMode::CommitTimeNewest,
+        sort_reason: "full_default",
+    }
 }
 
-fn resolve_commit_walk_sorting(since_epoch: Option<i64>) -> Sorting {
-    let selected = resolve_commit_walk_sort_mode(since_epoch);
-    match selected {
+fn resolve_commit_walk_sorting(sort_mode: CommitWalkSortMode, since_epoch: Option<i64>) -> Sorting {
+    match sort_mode {
         CommitWalkSortMode::CommitTimeNewest => Sorting::ByCommitTime(CommitTimeOrder::NewestFirst),
         CommitWalkSortMode::BreadthFirst => Sorting::BreadthFirst,
         CommitWalkSortMode::CommitTimeCutoff => {
@@ -3445,7 +4233,7 @@ mod tests {
         normalize_repo_relative_path, object_cache_bytes_for_workers, parallel_file_change_plan,
         parallel_min_commits_threshold_for_workers, parse_commit_walk_scope, parse_hex_object_id,
         rename_detection_policy, rename_limit_for_bins, rename_threshold_for_bins,
-        reorder_commits_topologically_with_parents, resolve_commit_walk_sort_mode,
+        reorder_commits_topologically_with_parents, resolve_commit_walk_policy,
         resolve_parallel_worker_count, should_probe_max_file_size, should_run_rename_detection,
         should_use_parallel_file_change_extraction, validate_repository, BloomFilterView,
         CommitWalkScope, CommitWalkSortMode, FileChangeExtractionMode, FileChangeParallelProfile,
@@ -3789,19 +4577,27 @@ mod tests {
     }
 
     #[test]
-    fn commit_walk_sort_defaults_to_breadth_first_without_flags() {
+    fn commit_walk_sort_policy_defaults_to_adaptive_auto_without_flags() {
         let _guard = env_lock().lock().expect("lock env");
         let previous_sort = std::env::var(COMMIT_WALK_SORT_ENV).ok();
 
         std::env::remove_var(COMMIT_WALK_SORT_ENV);
         assert_eq!(
-            resolve_commit_walk_sort_mode(Some(123)),
-            CommitWalkSortMode::BreadthFirst
+            resolve_commit_walk_policy(None, None).sort_mode,
+            CommitWalkSortMode::CommitTimeNewest
+        );
+        assert_eq!(
+            resolve_commit_walk_policy(Some(123), None).sort_mode,
+            CommitWalkSortMode::CommitTimeNewest
+        );
+        assert_eq!(
+            resolve_commit_walk_policy(None, Some("abc")).sort_mode,
+            CommitWalkSortMode::CommitTimeNewest
         );
 
         std::env::set_var(COMMIT_WALK_SORT_ENV, "commit_time_cutoff");
         assert_eq!(
-            resolve_commit_walk_sort_mode(Some(123)),
+            resolve_commit_walk_policy(None, None).sort_mode,
             CommitWalkSortMode::CommitTimeCutoff
         );
 

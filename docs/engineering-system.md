@@ -97,7 +97,7 @@ Definition of done:
 ## Performance Governance
 
 1. Performance-sensitive graph query code follows `docs/performance-engineering.md`.
-2. Guardrails reject legacy SQL runtime modules and enforce LMDB + CSR contracts in active ingestion/query paths.
+2. Guardrails reject legacy relational_query runtime modules and enforce LMDB + CSR contracts in active ingestion/query paths.
 3. Rust CI includes dedicated `Performance Budget` gate for direction-optimizing BFS.
 4. Rust CI includes cross-platform `Script Contract Probe` for automation script portability.
 5. Guardrails enforce script platform metadata and portable-script policy.
@@ -147,3 +147,4 @@ Inference applied for this repo:
 13. https://pnpm.io/installation
 14. https://rustsec.org/
 15. https://github.com/EmbarkStudios/cargo-deny
+

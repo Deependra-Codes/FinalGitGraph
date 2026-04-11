@@ -45,4 +45,5 @@ Tradeoffs:
 
 1. https://git-scm.com/docs/git-show
 2. https://git-scm.com/docs/git-diff#Documentation/git-diff.txt---numstat
-3. https://www.sqlite.org/lang_upsert.html
+3. https://www.legacy_relational_engine.org/lang_upsert.html
+

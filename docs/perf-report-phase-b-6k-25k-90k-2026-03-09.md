@@ -2,7 +2,7 @@
 
 Date: 2026-03-09
 Owner: Desktop Core
-Context: Post-Phase-B SQLite fallback staging + plan-guard integration
+Context: Post-Phase-B legacy_relational_engine fallback staging + plan-guard integration
 
 ## 1. Commands Executed
 
@@ -59,7 +59,7 @@ test application::indexer_pipeline::tests::pipeline_config_uses_bounded_worker_a
 test adapters::db::tests::neighbor_batch_lookup_returns_repo_scoped_neighbors ... ok
 test adapters::git::tests::unknown_repo_returns_error ... ok
 test adapters::db::tests::migrations_are_idempotent ... ok
-test adapters::db::tests::sqlite_graph_query_plan_guard_accepts_indexed_staged_queries ... ok
+test adapters::db::tests::legacy_relational_engine_graph_query_plan_guard_accepts_indexed_staged_queries ... ok
 test adapters::db::tests::enqueue_file_changes_handles_parameter_chunk_boundaries ... ok
 test adapters::db::tests::upsert_file_changes_handles_parameter_chunk_boundaries ... ok
 test application::indexer_pipeline::tests::pipeline_join_succeeds_without_in_flight_work ... ok
@@ -119,7 +119,7 @@ Phase timing:
 5. `phase_timing_ms.full_index`: full indexing duration.
 6. `phase_timing_ms.incremental_fixture_append`: time adding incremental commits to fixture.
 7. `phase_timing_ms.incremental_index`: incremental indexing duration.
-8. `phase_timing_ms.query_benchmark`: SQLite-backed query benchmark phase duration.
+8. `phase_timing_ms.query_benchmark`: legacy_relational_engine-backed query benchmark phase duration.
 9. `phase_timing_ms.jit_file_change_enrichment`: selective line-stat enrichment phase duration.
 10. `phase_timing_ms.in_memory_graph_hydration`: time to load in-memory adjacency graph.
 11. `phase_timing_ms.in_memory_query_benchmark`: in-memory graph query benchmark duration.
@@ -198,7 +198,7 @@ In-memory adjacency:
 1. `in_memory_adjacency_graph.nodes`: nodes loaded into memory graph cache.
 2. `in_memory_adjacency_graph.directed_edges`: directed edges loaded into memory graph cache.
 3. `in_memory_adjacency_query_latency_ms.*`: in-memory query latency stats with same tuple semantics.
-4. `in_memory_vs_sqlite_median_speedup.*`: SQLite median divided by in-memory median.
+4. `in_memory_vs_legacy_relational_engine_median_speedup.*`: legacy_relational_engine median divided by in-memory median.
 
 ## 5. Consolidated Metrics (6k / 25k / 90k)
 
@@ -235,7 +235,7 @@ In-memory adjacency:
 | shortest_path_parents | 0.116 | 0.232 | 4.661 |
 | shortest_path_both | 0.005 | 0.009 | 0.057 |
 
-### In-Memory vs SQLite Median Speedup
+### In-Memory vs legacy_relational_engine Median Speedup
 
 | Query | 6k | 25k | 90k |
 |---|---:|---:|---:|
@@ -402,7 +402,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=0.079 median=0.116 p95=0.278 max=0.340 mean=0.132
   shortest_path_both: runs=20 min=0.004 median=0.005 p95=0.005 max=0.005 mean=0.005
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 135.573x
   shortest_path_parents: 75.469x
   shortest_path_both: 1963.826x
@@ -544,7 +544,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=0.227 median=0.232 p95=0.259 max=0.278 mean=0.237
   shortest_path_both: runs=20 min=0.009 median=0.009 p95=0.009 max=0.009 mean=0.009
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 84.176x
   shortest_path_parents: 52.238x
   shortest_path_both: 668.202x
@@ -686,8 +686,9 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=3.040 median=4.661 p95=6.463 max=6.707 mean=4.720
   shortest_path_both: runs=20 min=0.050 median=0.057 p95=0.140 max=0.143 mean=0.075
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 8.124x
   shortest_path_parents: 5.780x
   shortest_path_both: 158.442x
 ```
+

@@ -36,12 +36,12 @@ Positive:
 5. CI prevents silent performance drift in hot traversal paths
 6. ordered batched rowid decoding (`Vec<Vec<i64>>`) removes repeated per-source hash lookups in frontier expansion
 7. ordered SHA materialization from rowids removes per-node map lookups/cloning in traversal/shortest-path response assembly
-8. prepared-statement caching lowers repeated SQL parse overhead in graph query hot loops
+8. prepared-statement caching lowers repeated relational_query parse overhead in graph query hot loops
 
 Tradeoffs:
 
 1. additional adapter/query complexity (rowid conversion + batch tables)
-2. tighter coupling to current SQLite storage semantics in adapter layer
+2. tighter coupling to current legacy_relational_engine storage semantics in adapter layer
 3. dedicated perf test maintenance cost (fixture tuning, threshold review)
 4. performance budget fallback adds Docker dependency for policy-restricted host environments
 
@@ -49,7 +49,7 @@ Tradeoffs:
 
 1. Added `load_commit_shas_for_rowids` for ordered rowid-to-sha conversion used directly by graph traversal/path response mapping.
 2. Added `load_neighbor_rowids_for_sources` returning source-order-aligned neighbor vectors for BFS/topological/shortest-path expansion.
-3. Enabled SQLite prepared statement cache and switched hot graph query paths to `prepare_cached`.
+3. Enabled legacy_relational_engine prepared statement cache and switched hot graph query paths to `prepare_cached`.
 4. Hardened performance gate script with host-policy detection and Docker retry fallback to keep perf validation deterministic.
 
 ## Alternatives Considered
@@ -61,8 +61,9 @@ Tradeoffs:
 
 ## References
 
-1. SQLite rowid tables: https://www.sqlite.org/rowidtable.html
+1. legacy_relational_engine rowid tables: https://www.legacy_relational_engine.org/rowidtable.html
 2. petgraph node index model: https://docs.rs/petgraph/latest/petgraph/graph/struct.NodeIndex.html
 3. Boost CSR graph representation: https://www.boost.org/libs/graph/doc/compressed_sparse_row.html
 4. Ligra graph docs: https://jshun.github.io/ligra/docs/graph.html
 5. Direction-Optimizing BFS (Beamer et al., SC'12): https://www.scottbeamer.net/pubs/beamer-sc2012.pdf
+

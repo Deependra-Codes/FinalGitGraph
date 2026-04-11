@@ -130,8 +130,9 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=14.298 median=16.053 p95=16.532 max=16.558 mean=15.899
   shortest_path_both: runs=20 min=1.609 median=2.111 p95=2.386 max=2.587 mean=2.005
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 11.145x
   shortest_path_parents: 233.525x
   shortest_path_both: 64.867x
 ```
+

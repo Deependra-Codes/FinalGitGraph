@@ -207,7 +207,7 @@ if ($Lane -eq "warm") {
 }
 
 $previousFastMode = $env:GITGRAPH_INDEX_FAST_MODE
-$previousWriteProfile = $env:GITGRAPH_SQLITE_WRITE_PROFILE
+$previousWriteProfile = $env:GITGRAPH_INGEST_WRITE_PROFILE
 $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
 $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
 $previousDrainChunkSize = $env:GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE
@@ -217,7 +217,7 @@ $previousRenameLimitLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE
 $previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
 if ($FastMode) {
     $env:GITGRAPH_INDEX_FAST_MODE = "1"
-    $env:GITGRAPH_SQLITE_WRITE_PROFILE = "throughput"
+    $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
     if (-not $EnableLsmRocksdb) {
         $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
     }
@@ -266,9 +266,9 @@ finally {
         $env:GITGRAPH_INDEX_FAST_MODE = $previousFastMode
     }
     if ($null -eq $previousWriteProfile) {
-        Remove-Item Env:GITGRAPH_SQLITE_WRITE_PROFILE -ErrorAction SilentlyContinue
+        Remove-Item Env:GITGRAPH_INGEST_WRITE_PROFILE -ErrorAction SilentlyContinue
     } else {
-        $env:GITGRAPH_SQLITE_WRITE_PROFILE = $previousWriteProfile
+        $env:GITGRAPH_INGEST_WRITE_PROFILE = $previousWriteProfile
     }
     if ($null -eq $previousWalkSort) {
         Remove-Item Env:GITGRAPH_COMMIT_WALK_SORT -ErrorAction SilentlyContinue
@@ -418,3 +418,4 @@ if ($MaxLsmMaterializationErrors -ge 0 -and $lsmMaterializationErrors -gt $MaxLs
 }
 
 Write-Host "Ingestion budget passed."
+

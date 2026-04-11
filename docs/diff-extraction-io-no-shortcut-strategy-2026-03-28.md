@@ -28,7 +28,7 @@ Primary interpretation:
 1. No false negatives in changed-path filtering.
 2. No unbounded rename/copy exhaustive phase on large diffs.
 3. No random object materialization before low-cost reject gates run.
-4. No SQL sidecar or fallback runtime path.
+4. No relational_query sidecar or fallback runtime path.
 5. Every optimization must have measurable phase impact (`commit_walk`, `diff_extract`, `file_change_upsert`, RSS, throughput).
 
 ## 3) Research-Backed Strategy Pillars
@@ -231,7 +231,7 @@ Inference note:
 2. Always-materialize commit/tree before low-cost reject tests.
 3. Bloom mode that silently degrades to permissive always-true without telemetry.
 4. Any optimization with no measurable phase-level evidence.
-5. SQL-era fallback paths for ingestion/query runtime.
+5. relational_query-era fallback paths for ingestion/query runtime.
 
 ## 7) Source List
 
@@ -250,3 +250,4 @@ Inference note:
 13. https://www.informatik.tu-darmstadt.de/media/systems/pdf_publications/iouring_vldb.pdf
 14. https://www.kernel.org/doc/html/latest/admin-guide/mm/transhuge.html
 15. https://www.intel.com/content/www/us/en/docs/vtune-profiler/cookbook/2023-1/top-down-microarchitecture-analysis-method.html
+

@@ -95,7 +95,7 @@ The fourth Level 1 implementation checkpoint is now complete.
 
 Delivered in code:
 
-1. planner sessions are now persisted durably in SQLite with normalized trace, reason, and disabled-feature tables
+1. planner sessions are now persisted durably in legacy_relational_engine with normalized trace, reason, and disabled-feature tables
 2. scan now returns a dedicated response that includes the selected session plan directly
 3. planner sessions now carry a durable session id and entrypoint (`scan` or `index`)
 4. capability detection now includes changed-path Bloom filters, alternates, split-index, and worktree-config signals in addition to the earlier commit-graph/MIDX/sparse/promisor checks
@@ -113,8 +113,8 @@ Delivered in code:
    - `gc.log` present
    - commit-graph older than pack metadata
    - multi-pack-index older than pack metadata
-3. Planner-session persistence now stores planner health durably through migration `0009_planner_session_health.sql`.
-4. SQLite now exposes read-side planner history APIs:
+3. Planner-session persistence now stores planner health durably through migration `0009_planner_session_health.relational_query`.
+4. legacy_relational_engine now exposes read-side planner history APIs:
    - latest planner session
    - recent planner sessions
    - plan signature reconstruction for quick diffing/debugging
@@ -146,8 +146,8 @@ The new hardening work follows these source-backed patterns:
 
 1. Git maintenance tasks are explicit and separable (`commit-graph`, `gc`, `incremental-repack`), so Level 1 should recommend concrete repair actions instead of vague "metadata stale" messages.
 2. Git GC behavior records state in `gc.log`, which is a useful early warning signal that repo maintenance is blocked or failed.
-3. PostgreSQL `auto_explain` demonstrates the value of persisting plan diagnostics after the fact instead of limiting them to transient logs.
-4. SQLite WAL keeps write publication and checkpointing conceptually separate, which reinforces our Level 1 design of persisting planner sessions as an auditable control-plane artifact.
+3. Postgres `auto_explain` demonstrates the value of persisting plan diagnostics after the fact instead of limiting them to transient logs.
+4. legacy_relational_engine WAL keeps write publication and checkpointing conceptually separate, which reinforces our Level 1 design of persisting planner sessions as an auditable control-plane artifact.
 
 ## Level 1 Problem Statement
 
@@ -243,7 +243,7 @@ How should Level 1 transform repository facts and user intent into a stable, exp
    - negative facts
    - forced fallbacks
    - final selected plan
-5. Repository cache state in SQLite should be explicitly labeled as derived metadata, not treated as canonical truth.
+5. Repository cache state in legacy_relational_engine should be explicitly labeled as derived metadata, not treated as canonical truth.
 
 ### New Patterns Worth Evaluating For This Repo
 
@@ -271,7 +271,7 @@ How should Level 1 decide whether an existing checkpoint is trustworthy enough t
 ### Key Findings
 
 1. ARIES shows that recovery correctness depends on more than "there is a checkpoint"; checkpoints must identify active work, dirty state, and a safe restart point.
-2. SQLite WAL provides snapshot isolation for readers, single-writer semantics, append-first commit, and checkpointing as a separate concern. This suggests Level 1 should separate:
+2. legacy_relational_engine WAL provides snapshot isolation for readers, single-writer semantics, append-first commit, and checkpointing as a separate concern. This suggests Level 1 should separate:
    - plan barrier
    - write barrier
    - checkpoint publication
@@ -319,7 +319,7 @@ How should Level 1 decide whether an existing checkpoint is trustworthy enough t
 1. What exact repo facts should be hashed into checkpoint identity?
 2. Which failures should downgrade to verification and which should force full?
 3. Should Level 1 persist planner trace and session outcome separately from the main checkpoint?
-4. How much checkpoint metadata belongs in SQLite vs a sidecar session journal?
+4. How much checkpoint metadata belongs in legacy_relational_engine vs a sidecar session journal?
 
 ## Iteration 4 Summary
 
@@ -339,7 +339,7 @@ What repository metadata should Level 1 compute eagerly, what should it cache, a
    These should be treated as capability signals, not recreated as bespoke metadata.
 2. Sparse-index docs show Git uses guarded rollout with `command_requires_full_index` and carefully expands the sparse index for unsupported commands. This is a strong pattern for us: acceleration should be enabled only when the command path is proven safe.
 3. Multi-pack-index chain design shows append-friendly metadata layering can reduce refresh cost without invalidating prior layers. This is a useful pattern for future Level 1 capability caches and repo-state journals.
-4. Sourcegraph explicitly treats repository metadata as a persistent cache, not truth. This aligns with our Level 1 architecture: Git is source of truth; SQLite-held repo facts are derived and refreshable.
+4. Sourcegraph explicitly treats repository metadata as a persistent cache, not truth. This aligns with our Level 1 architecture: Git is source of truth; legacy_relational_engine-held repo facts are derived and refreshable.
 5. Sourcegraph also uses a smart heuristic based on past commit frequency to schedule update work. Inference: capability refresh policy does not need to be constant-frequency; it can be freshness-sensitive.
 6. Blackbird optimizes metadata and ingest order using delta encoding and similarity. Inference: repo metadata can be valuable if it materially changes future work choice; otherwise it is just overhead.
 7. Git sparse-checkout and sparse-index docs repeatedly show that some expensive or advanced metadata should be lazily activated only for supported operations. This supports a minimal eager-facts model.
@@ -362,7 +362,7 @@ What repository metadata should Level 1 compute eagerly, what should it cache, a
    - MIDX chain details
    - advanced maintenance freshness
    - optional worktree/sparse-index nuances
-4. `DerivedCacheFacts` may persist in SQLite, but must always be versioned and invalidatable:
+4. `DerivedCacheFacts` may persist in legacy_relational_engine, but must always be versioned and invalidatable:
    - last capability snapshot
    - last planner trace summary
    - last successful publish boundary
@@ -435,8 +435,8 @@ What repository metadata should Level 1 compute eagerly, what should it cache, a
 3. GitHub Blackbird architecture: https://github.blog/engineering/the-technology-behind-githubs-new-code-search/
 4. Volcano optimizer generator: https://www.cs.cornell.edu/~mshong/DDG_Fall05/Volcano.pdf
 5. Planning-based optimizer control: https://sigmod.org/publications/dblp/db/conf/vldb/MitchellDZ93.html
-6. SQLite WAL: https://www.sqlite.org/wal.html
-7. SQLite transactions: https://www.sqlite.org/lang_transaction.html
+6. legacy_relational_engine WAL: https://www.legacy_relational_engine.org/wal.html
+7. legacy_relational_engine transactions: https://www.legacy_relational_engine.org/lang_transaction.html
 8. ARIES: https://web.stanford.edu/class/cs345d-01/rl/aries.pdf
 9. RocksDB recovery notes: https://rocksdb.org/blog/2022/10/05/lost-buffered-write-recovery.html
 10. RocksDB WAL notes: https://rocksdb.org/blog/2014/03/27/how-to-persist-in-memory-rocksdb-database.html
@@ -445,7 +445,7 @@ What repository metadata should Level 1 compute eagerly, what should it cache, a
 13. Git index format docs: https://git-scm.com/docs/gitformat-index.html
 14. Sourcegraph repo update policy: https://sourcegraph.com/docs/admin/repo/update-frequency
 15. Git GC docs: https://git-scm.com/docs/git-gc
-16. PostgreSQL `auto_explain`: https://www.postgresql.org/docs/current/auto-explain.html
+16. Postgres `auto_explain`: https://www.postgres.org/docs/current/auto-explain.html
 
 ## Iteration 5 Summary
 
@@ -548,7 +548,7 @@ Required properties:
 ### Frozen Design Principles
 
 1. Git is the source of truth.
-2. SQLite-held repository facts are a cache, not truth.
+2. legacy_relational_engine-held repository facts are a cache, not truth.
 3. Planner output must be deterministic for the same repo state and requested mode.
 4. Incremental mode is earned, not assumed.
 5. Acceleration is guarded, not globally enabled.
@@ -623,3 +623,5 @@ Recommended next move in the next implementation phase:
 1. create Level 1 domain types
 2. create planner entrypoint
 3. route `scan_repository` and `index_repository` through that planner
+
+

@@ -1,7 +1,7 @@
 # Topological Query God-Tier Research Plan (2026-03-09)
 
 Owner: Desktop Core  
-Scope: `topological_parents` hot path (`query_benchmark`) with SQLite fallback and in-memory runtime path
+Scope: `topological_parents` hot path (`query_benchmark`) with legacy_relational_engine fallback and in-memory runtime path
 
 ## 1. What the current data says
 
@@ -33,7 +33,7 @@ Conclusion: topological traversal is now a primary query bottleneck at scale.
 Topological has two execution lanes:
 
 1. Runtime cache lane (default enabled) in [apps/desktop/src-tauri/src/application/indexer.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/indexer.rs:480)
-2. SQLite lane (fallback) in [apps/desktop/src-tauri/src/application/graph_queries.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/graph_queries.rs:462)
+2. legacy_relational_engine lane (fallback) in [apps/desktop/src-tauri/src/application/graph_queries.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/graph_queries.rs:462)
 
 The in-memory lane also uses a Kahn-style topo phase with hash maps + BTreeSet in [apps/desktop/src-tauri/src/application/query_graph_cache.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/query_graph_cache.rs:428).
 
@@ -43,7 +43,7 @@ Important: default behavior is cache-enabled (`GITGRAPH_QUERY_RUNTIME_CACHE` def
 
 1. Kahn-style topological ordering is still the baseline DAG method; cost is linear in graph size plus ordering data-structure overhead.
    - Source: https://cacm.acm.org/research/topological-sorting-of-large-networks/
-2. Recursive SQL speed improves when selection/projection/dedup are pushed as early as possible.
+2. Recursive relational_query speed improves when selection/projection/dedup are pushed as early as possible.
    - Source: https://www2.cs.uh.edu/~ordonez/pdfwww/w-2010-TKDE-lrq.pdf
 3. Recursive graph queries in RDBMS benefit strongly from physical layout + pushdown choices (row vs column/array behavior differs by workload).
    - Source: https://www2.cs.uh.edu/~ordonez/pdfwww/f-2017-IS-Graph-comparison.pdf
@@ -53,12 +53,12 @@ Important: default behavior is cache-enabled (`GITGRAPH_QUERY_RUNTIME_CACHE` def
    - Source: https://link.springer.com/article/10.1007/s00778-024-00892-7
 6. Differential maintenance of recursive graph state is viable for dynamic updates, reducing repeated full recomputation.
    - Source: https://vldb.org/pvldb/vol15/p3186-ammar.pdf
-7. SQLite-specific constraints and levers:
-   - recursive CTE semantics, materialization hints, and DFS/BFS order controls: https://www.sqlite.org/lang_with.html
-   - query plan verification (`SCAN` vs `SEARCH`, temp b-tree detection): https://www.sqlite.org/eqp.html
-   - planner/index behavior: https://www.sqlite.org/queryplanner.html and https://www.sqlite.org/optoverview.html
-   - host parameter limits and compile-time tuning: https://www.sqlite.org/limits.html and https://www.sqlite.org/compile.html
-   - maintenance guidance (`PRAGMA optimize`): https://www.sqlite.org/pragma.html#pragma_optimize
+7. legacy_relational_engine-specific constraints and levers:
+   - recursive CTE semantics, materialization hints, and DFS/BFS order controls: https://www.legacy_relational_engine.org/lang_with.html
+   - query plan verification (`SCAN` vs `SEARCH`, temp b-tree detection): https://www.legacy_relational_engine.org/eqp.html
+   - planner/index behavior: https://www.legacy_relational_engine.org/queryplanner.html and https://www.legacy_relational_engine.org/optoverview.html
+   - host parameter limits and compile-time tuning: https://www.legacy_relational_engine.org/limits.html and https://www.legacy_relational_engine.org/compile.html
+   - maintenance guidance (`PRAGMA optimize`): https://www.legacy_relational_engine.org/pragma.html#pragma_optimize
 
 ## 4. God-tier execution plan for this codebase
 
@@ -81,7 +81,7 @@ Why this is valid:
 1. Current graph is already compact-ID based.
 2. This directly cuts allocator pressure and branchy map/tree overhead.
 
-### Phase B (SQLite fallback hardening): reduce SQL path overhead
+### Phase B (legacy_relational_engine fallback hardening): reduce relational_query path overhead
 
 Target files:
 
@@ -120,4 +120,5 @@ For `250k` profile:
 1. No Windows workflow breakage.
 2. No mandatory Linux-only benchmarking requirement for local dev.
 3. No unsafe Rust introduction.
+
 

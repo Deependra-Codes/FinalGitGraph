@@ -16,6 +16,49 @@ impl IndexingMode {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Incremental => "incremental",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerRiskLevel {
+    #[default]
+    Low,
+    Medium,
+    High,
+}
+
+impl PlannerRiskLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerDegradedPolicy {
+    #[default]
+    None,
+    FallbackToFull,
+}
+
+impl PlannerDegradedPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FallbackToFull => "fallback_to_full",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +173,18 @@ pub struct RepositorySummary {
 pub struct IndexingStats {
     pub repo_id: i64,
     pub mode: IndexingMode,
+    pub planner_session_id: u64,
+    pub planner_requested_mode: IndexingMode,
+    pub planner_effective_mode: IndexingMode,
+    pub planner_checkpoint_trusted: bool,
+    pub planner_risk_level: PlannerRiskLevel,
+    pub planner_degraded_policy: PlannerDegradedPolicy,
+    pub planner_trace_count: usize,
+    pub lmdb_effective_map_size_bytes: usize,
+    pub lmdb_no_readahead: bool,
+    pub lmdb_write_map: bool,
+    pub lmdb_map_async: bool,
+    pub lmdb_no_mem_init: bool,
     pub commits_indexed: usize,
     pub edges_indexed: usize,
     pub file_changes_indexed: usize,
@@ -138,6 +193,34 @@ pub struct IndexingStats {
     pub file_change_queue_oldest_age_seconds: i64,
     pub refs_indexed: usize,
     pub indexed_at_epoch: i64,
+    pub commit_walk_total_ms: f64,
+    pub commit_callback_ms: f64,
+    pub commit_walk_decode_ms: f64,
+    pub commit_walk_parent_resolve_ms: f64,
+    pub commit_walk_metadata_parse_ms: f64,
+    pub commit_walk_tip_collection_ms: f64,
+    pub commit_walk_hide_expansion_ms: f64,
+    pub commit_walk_graph_lookup_ms: f64,
+    pub commit_walk_ordering_ms: f64,
+    pub commit_walk_emit_ms: f64,
+    pub commit_walk_graph_lookup_hit_count: usize,
+    pub commit_walk_graph_lookup_miss_count: usize,
+    pub commit_walk_graph_fallback_count: usize,
+    pub commit_walk_graph_partial_fallback_count: usize,
+    pub commit_walk_nodes_seen_count: usize,
+    pub commit_walk_nodes_pruned_count: usize,
+    pub commit_walk_queue_max_depth: usize,
+    pub commit_metadata_pending_count: usize,
+    pub commit_window_jit_hydrated_rows: usize,
+    pub query_commit_window_prewarm_hydrated_rows: usize,
+    pub incremental_csr_streaming_mode_effective: String,
+    pub commit_write_wave_txn_count: usize,
+    pub commit_write_wave_batch_median: f64,
+    pub commit_ingest_queue_max_depth: usize,
+    pub commit_ingest_queue_wait_ms: f64,
+    pub commit_csr_delta_apply_ms: f64,
+    pub commit_csr_overlay_upsert_ms: f64,
+    pub commit_csr_compaction_ms: f64,
     pub ingestion_phase_timing_ms: IngestionPhaseTimingMs,
     pub commit_throughput: CommitThroughputTelemetry,
 }
@@ -204,6 +287,33 @@ impl FileChangeStatsState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitMetadataState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl CommitMetadataState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse_db(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "ready" => Some(Self::Ready),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct FileChangeStatsStateCounts {
     pub pending: usize,
@@ -214,6 +324,24 @@ pub struct FileChangeStatsStateCounts {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct IngestionPhaseTimingMs {
     pub commit_walk: f64,
+    pub commit_walk_total: f64,
+    pub commit_callback: f64,
+    pub commit_walk_decode: f64,
+    pub commit_walk_parent_resolve: f64,
+    pub commit_walk_metadata_parse: f64,
+    pub commit_walk_tip_collection: f64,
+    pub commit_walk_hide_expansion: f64,
+    pub commit_walk_graph_lookup: f64,
+    pub commit_walk_ordering: f64,
+    pub commit_walk_emit: f64,
+    pub commit_walk_graph_lookup_hit_count: f64,
+    pub commit_walk_graph_lookup_miss_count: f64,
+    pub commit_walk_graph_fallback_count: f64,
+    pub commit_walk_graph_partial_fallback_count: f64,
+    pub commit_walk_nodes_seen_count: f64,
+    pub commit_walk_nodes_pruned_count: f64,
+    pub commit_walk_queue_max_depth: f64,
+    pub commit_metadata_pending_count: f64,
     pub commit_upsert: f64,
     pub edge_materialize: f64,
     pub file_diff_extract: f64,
@@ -228,11 +356,26 @@ pub struct IngestionPhaseTimingMs {
     pub file_change_delete: f64,
     pub file_change_upsert: f64,
     pub jit_enrich_coscheduled: f64,
+    pub commit_ingest_queue_wait: f64,
+    pub commit_ingest_queue_max_depth: f64,
+    pub commit_write_wave_txn_count: f64,
+    pub commit_write_wave_batch_median: f64,
+    pub commit_csr_delta_apply: f64,
+    pub commit_csr_overlay_upsert: f64,
+    pub commit_csr_compaction: f64,
+    pub query_commit_window_prewarm_hydrated_rows: f64,
     pub tx_commit: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CommitThroughputTelemetry {
+    pub planner_session_id: u64,
+    pub planner_requested_mode: IndexingMode,
+    pub planner_effective_mode: IndexingMode,
+    pub planner_checkpoint_trusted: bool,
+    pub planner_risk_level: PlannerRiskLevel,
+    pub planner_degraded_policy: PlannerDegradedPolicy,
+    pub planner_trace_count: usize,
     pub commits_seen: usize,
     pub commits_indexed: usize,
     pub end_to_end_ms: f64,
@@ -241,12 +384,42 @@ pub struct CommitThroughputTelemetry {
     pub ms_per_commit_seen: f64,
     pub ms_per_commit_indexed: f64,
     pub commit_walk_scope: String,
+    pub commit_walk_backend_effective: String,
+    pub commit_walk_sort_effective: String,
     pub commit_walk_tip_count: usize,
     pub commit_walk_pruned_parent_expansions: usize,
+    pub commit_walk_total_ms: f64,
+    pub commit_callback_ms: f64,
+    pub commit_walk_decode_ms: f64,
+    pub commit_walk_parent_resolve_ms: f64,
+    pub commit_walk_metadata_parse_ms: f64,
+    pub commit_walk_tip_collection_ms: f64,
+    pub commit_walk_hide_expansion_ms: f64,
+    pub commit_walk_graph_lookup_ms: f64,
+    pub commit_walk_ordering_ms: f64,
+    pub commit_walk_emit_ms: f64,
+    pub commit_walk_graph_lookup_hit_count: usize,
+    pub commit_walk_graph_lookup_miss_count: usize,
+    pub commit_walk_graph_fallback_count: usize,
+    pub commit_walk_graph_partial_fallback_count: usize,
+    pub commit_walk_nodes_seen_count: usize,
+    pub commit_walk_nodes_pruned_count: usize,
+    pub commit_walk_queue_max_depth: usize,
+    pub commit_metadata_pending_count: usize,
+    pub commit_window_jit_hydrated_rows: usize,
+    pub query_commit_window_prewarm_hydrated_rows: usize,
+    pub incremental_csr_streaming_mode_effective: String,
     pub commit_walk_ms: f64,
     pub commit_walk_commits_per_sec_seen: f64,
     pub commit_upsert_ms: f64,
     pub commit_upsert_commits_per_sec_seen: f64,
+    pub commit_write_wave_txn_count: usize,
+    pub commit_write_wave_batch_median: f64,
+    pub commit_ingest_queue_max_depth: usize,
+    pub commit_ingest_queue_wait_ms: f64,
+    pub commit_csr_delta_apply_ms: f64,
+    pub commit_csr_overlay_upsert_ms: f64,
+    pub commit_csr_compaction_ms: f64,
     pub file_diff_extract_ms: f64,
     pub file_diff_extract_commits_per_sec_seen: f64,
     pub file_change_upsert_ms: f64,
@@ -266,6 +439,7 @@ pub struct CommitWindowItem {
     pub committer_time: i64,
     pub subject: String,
     pub tree_sha: String,
+    pub metadata_state: CommitMetadataState,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -273,6 +447,7 @@ pub struct CommitWindowResponse {
     pub commits: Vec<CommitWindowItem>,
     pub next_cursor: Option<CommitWindowCursor>,
     pub has_more: bool,
+    pub jit_hydrated_rows: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,6 +491,7 @@ pub struct ParsedCommit {
     pub author_time: i64,
     pub committer_time: i64,
     pub subject: String,
+    pub metadata_state: CommitMetadataState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

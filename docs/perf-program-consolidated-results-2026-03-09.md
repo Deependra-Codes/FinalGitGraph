@@ -45,10 +45,10 @@ Primary scale baseline: `docs/perf-report-consolidated-500-6k-50k-100k-500k-2026
 Patch scope in `apps/desktop/src-tauri/src/adapters/db.rs`:
 
 1. Cached `PRAGMA max_variable_number` lookup.
-2. Cached generated bulk SQL templates by row count:
-   - file-change upsert SQL
-   - commit upsert SQL
-   - enrichment enqueue SQL
+2. Cached generated bulk relational_query templates by row count:
+   - file-change upsert relational_query
+   - commit upsert relational_query
+   - enrichment enqueue relational_query
 3. Reused chunk bind vectors (`clear()` reuse) to cut hot-loop allocations.
 
 ## 4.1) P1 Slice-B Patch (Implemented)
@@ -199,3 +199,4 @@ Interpretation:
 1. Move priority to `P3 Query Runtime + Memory` to recover `500k` traversal medians (`bfs`, `topological`).
 2. Keep `P2` focused on `ingest_file_diff_extract_ms` and `ingest_tx_commit_ms` since both remain off target at 500k.
 3. Re-run the same Docker deep suite after P2/P3 and update section `8.3` in-place for trend continuity.
+

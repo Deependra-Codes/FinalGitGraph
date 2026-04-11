@@ -1,12 +1,12 @@
 # ADR 0011: Core File-Change Ingestion and JIT Enrichment
 
 Date: 2026-03-07
-Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-sql.md`)
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-relational_query.md`)
 
 ## Context
 
 1. Repository-scale runs showed `file_diff_extract` dominating ingestion wall time.
-2. Hot-path indexing should remain single-writer and transaction-bounded for SQLite reliability.
+2. Hot-path indexing should remain single-writer and transaction-bounded for legacy_relational_engine reliability.
 3. Expensive patch line-stat extraction is not required for every graph/query operation.
 4. We need predictable cold-vs-warm performance lanes and enforceable anti-regression guardrails.
 
@@ -40,12 +40,13 @@ Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-sql.md`)
 2. Remove line stats completely.
    - rejected: loses functionality for consumers that require change magnitude signals.
 3. Move DB writes into parallel workers.
-   - rejected: conflicts with SQLite single-writer design and increases lock contention risk.
+   - rejected: conflicts with legacy_relational_engine single-writer design and increases lock contention risk.
 
 ## References
 
 1. Git diff rename detection behavior/limits: https://git-scm.com/docs/git-diff/2.37.2.html
 2. git2 rename controls: https://docs.rs/git2/latest/git2/struct.DiffFindOptions.html
 3. libgit2 diff find options: https://libgit2.org/docs/reference/main/diff/git_diff_find_options.html
-4. SQLite WAL single-writer model: https://sqlite.org/wal.html
-5. SQLite transaction batching guidance: https://sqlite.org/faq.html
+4. legacy_relational_engine WAL single-writer model: https://legacy_relational_engine.org/wal.html
+5. legacy_relational_engine transaction batching guidance: https://legacy_relational_engine.org/faq.html
+

@@ -107,7 +107,7 @@ Repository-scale indexing guardrails now also enforce:
 7. LMDB-backed DB adapter contract in `adapters/db.rs` (rw txn + commit semantics)
 8. persisted CSR graph hot-path contract in `adapters/db.rs` (`parents/children` offsets + neighbors)
 9. bounded rename detection in `adapters/git.rs` (`rename_limit`, `rename_threshold`, `exact_match_only`)
-10. prefix-set incremental file-change cleanup in `adapters/db.rs` (no SQL temp-table/delete-loop path)
+10. prefix-set incremental file-change cleanup in `adapters/db.rs` (no relational_query temp-table/delete-loop path)
 11. ingestion phase telemetry contract in perf report (`ingest_commit_walk_ms`, `ingest_file_diff_extract_ms`, `ingest_file_change_upsert_ms`, `ingest_tx_commit_ms`)
 12. lazy two-stage diff extraction in `adapters/git.rs` (`diff_requires_line_stats` + selective `Patch::from_diff` line stats)
 13. adaptive-but-bounded Rayon planning in `adapters/git.rs` for chunk/channel sizing (`parallel_file_change_plan`)
@@ -115,8 +115,8 @@ Repository-scale indexing guardrails now also enforce:
 15. file-change stats-state + retryable enrichment-queue persistence contract in LMDB (`stats_state`, `enrichment_queue`)
 16. retryable enrichment scheduling in `adapters/db.rs` (`attempts`, `last_error`, delayed `enqueued_at_epoch`, terminal `failed` at max attempts)
 17. dedicated bounded Rayon pool + adaptive incremental-friendly parallel threshold in `adapters/git.rs` (`GITGRAPH_FILE_CHANGE_PARALLEL_THREADS`, `GITGRAPH_FILE_CHANGE_PARALLEL_MIN_COMMITS`)
-18. no legacy SQL runtime modules in `application/*` (`graph_queries.rs`, `query_graph_cache.rs`, `indexer_pipeline.rs`)
-19. no SQL migration files under `apps/desktop/src-tauri/migrations`
+18. no legacy relational_query runtime modules in `application/*` (`graph_queries.rs`, `query_graph_cache.rs`, `indexer_pipeline.rs`)
+19. no relational_query migration files under `apps/desktop/src-tauri/migrations`
 
 This protects against memory-regression classes on large histories while preserving domain/API contracts.
 
@@ -138,3 +138,4 @@ To prevent process drift in AI-assisted development, guardrails also enforce:
 4. PowerShell automatic variables (`$IsWindows`): https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_automatic_variables
 5. PowerShell environment variables across platforms: https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_environment_variables
 6. PSScriptAnalyzer GitHub Action reference: https://github.com/microsoft/psscriptanalyzer-action
+

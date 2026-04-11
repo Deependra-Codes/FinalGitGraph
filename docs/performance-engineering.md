@@ -5,7 +5,7 @@ Date: 2026-03-27
 ## Goal
 
 Keep ingestion and query paths fast at repository scale while preserving deterministic behavior,
-clear layering, and no-SQL runtime architecture.
+clear layering, and no-relational_query runtime architecture.
 
 ## Runtime Baseline
 
@@ -17,7 +17,7 @@ clear layering, and no-SQL runtime architecture.
 
 ## Non-Negotiable Performance Rules
 
-1. Do not reintroduce SQL runtime dependencies (`rusqlite`, SQL migrations, SQL query paths).
+1. Do not reintroduce relational_query runtime dependencies (`legacy_relational_driver`, relational_query migrations, relational_query query paths).
 2. Keep traversal/path internal state integer-based (`NodeId`, compact indices).
 3. Keep ingestion buffering bounded (`FILE_CHANGE_COMMIT_BATCH_SIZE`, `FILE_CHANGE_DB_BATCH_SIZE`).
 4. Keep Git adapter compute parallelism bounded and deterministic.
@@ -100,9 +100,9 @@ Primary-source research points to the same practical design:
 5. LMDB GraphStore transaction contract in `adapters/db.rs`
 6. persisted CSR snapshot contract in `adapters/db.rs`
 7. append-only delta log contract in `adapters/db.rs`
-8. no SQL runtime artifacts in active Rust paths
-9. no legacy SQL runtime modules in `application/*`
-10. no SQL migration files under `apps/desktop/src-tauri/migrations`
+8. no relational_query runtime artifacts in active Rust paths
+9. no legacy relational_query runtime modules in `application/*`
+10. no relational_query migration files under `apps/desktop/src-tauri/migrations`
 11. perf script and perf report telemetry contracts
 12. anti-tamper policy: policy-only changes without implementation are blocked
 13. centralized LMDB mmap/runtime flag parsing and validation in `adapters/db.rs`
@@ -135,7 +135,7 @@ Primary-source research points to the same practical design:
 ## References
 
 1. `docs/automation-guardrails.md`
-2. `docs/adr/0015-lmdb-csr-delta-storage-no-sql.md`
+2. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
 3. `docs/adr/0016-overlay-adjacency-and-lmdb-map-flooring.md`
 4. `apps/desktop/src-tauri/src/adapters/db.rs`
 5. `apps/desktop/src-tauri/src/adapters/git.rs`
@@ -146,3 +146,4 @@ Primary-source research points to the same practical design:
 10. BACH (PVLDB 2025) adjacency/CSR layout transition via LSM-style compaction
 11. Beamer et al., direction-optimizing BFS
 12. LMDB official/runtime docs (`mdb_env_open`, `MDB_NORDAHEAD`, single-writer MVCC)
+

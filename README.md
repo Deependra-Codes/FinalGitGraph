@@ -3,7 +3,7 @@
 This repository now contains the Phase-1 kickoff foundation for GitGraph Lab:
 
 1. Rust core scaffolding under `apps/desktop/src-tauri`
-2. SQLite migration pipeline with the SDD baseline schema
+2. LMDB migration pipeline with the SDD baseline schema
 3. Repository scan and commit indexing foundation using safe Git plumbing command execution
 4. Engineering system and governance baseline in `docs/engineering-system.md`
 5. Industry approach and Phase 2 plan in `docs/industry-approach.md`

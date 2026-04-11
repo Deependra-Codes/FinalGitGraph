@@ -11,16 +11,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::models::{
-    CommitWindowCursor, CommitWindowItem, FileChangeExtractionQueueMetrics,
+    CommitMetadataState, CommitWindowCursor, CommitWindowItem, FileChangeExtractionQueueMetrics,
     FileChangeLineStatsUpdate, FileChangeStatsState, FileChangeStatsStateCounts, IndexCheckpoint,
-    ParsedCommit, ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
+    IndexingMode, ParsedCommit, ParsedFileChange, ParsedRef, PendingFileChangeEnrichment,
+    PlannerDegradedPolicy, PlannerRiskLevel,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
 
 const LMDB_DEFAULT_MAP_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const LMDB_MIN_MAP_SIZE_BYTES: usize = 512 * 1024 * 1024;
-const LMDB_MAX_DBS: u32 = 16;
+const LMDB_MAX_DBS: u32 = 17;
 const LMDB_NO_READAHEAD_ENV: &str = "GITGRAPH_LMDB_NO_READAHEAD";
 const LMDB_WRITE_MAP_ENV: &str = "GITGRAPH_LMDB_WRITE_MAP";
 const LMDB_MAP_ASYNC_ENV: &str = "GITGRAPH_LMDB_MAP_ASYNC";
@@ -34,12 +35,15 @@ const FILE_CHANGE_ENRICHMENT_RETRY_MAX_DELAY_SECONDS: i64 = 300;
 const FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS: i64 = 5;
 const FILE_CHANGE_EXTRACTION_RETRY_BASE_DELAY_SECONDS: i64 = 5;
 const FILE_CHANGE_EXTRACTION_RETRY_MAX_DELAY_SECONDS: i64 = 300;
-const GRAPH_OVERLAY_MAX_COMMITS_DEFAULT: usize = 512;
-const GRAPH_OVERLAY_MAX_EDGES_DEFAULT: usize = 2_048;
+const GRAPH_OVERLAY_MAX_COMMITS_DEFAULT: usize = 20_000;
+const GRAPH_OVERLAY_MAX_EDGES_DEFAULT: usize = 80_000;
 
 const META_NEXT_REPOSITORY_ID: &str = "next_repository_id";
 const META_NEXT_DELTA_SEQUENCE: &str = "next_delta_sequence";
+const META_NEXT_PLANNER_SESSION_ID: &str = "next_planner_session_id";
+const META_COMMIT_WINDOW_INDEX_VERSION_PREFIX: &str = "commit_window_index_version:";
 const DELTA_LOG_RETENTION_DEFAULT_EVENTS: u64 = 200_000;
+const COMMIT_WINDOW_INDEX_VERSION_V2: u64 = 2;
 const COMMIT_WINDOW_TIME_COMPONENT_WIDTH: usize = 20;
 const DUE_TIME_COMPONENT_WIDTH: usize = 20;
 
@@ -105,6 +109,15 @@ impl LmdbRuntimeOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LmdbRuntimeContract {
+    pub effective_map_size_bytes: usize,
+    pub no_readahead: bool,
+    pub write_map: bool,
+    pub map_async: bool,
+    pub no_mem_init: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RepositoryRecord {
     id: i64,
@@ -124,6 +137,13 @@ pub struct CommitRecord {
     pub author_time: i64,
     pub committer_time: i64,
     pub subject: String,
+    #[serde(default = "default_commit_metadata_state")]
+    pub metadata_state: CommitMetadataState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommitWindowIndexRefV2 {
+    sha: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +169,31 @@ struct ExtractionQueueCommitEntry {
     attempts: i64,
     last_error: Option<String>,
     enqueued_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannerSessionRecord {
+    pub session_id: u64,
+    pub repo_id: i64,
+    pub requested_mode: String,
+    pub effective_mode: String,
+    pub checkpoint_trusted: bool,
+    pub degraded_policy: String,
+    pub risk_level: String,
+    pub trace_count: usize,
+    pub planned_at_epoch: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlannerSessionWriteInput {
+    pub repo_id: i64,
+    pub requested_mode: IndexingMode,
+    pub effective_mode: IndexingMode,
+    pub checkpoint_trusted: bool,
+    pub degraded_policy: PlannerDegradedPolicy,
+    pub risk_level: PlannerRiskLevel,
+    pub trace_count: usize,
+    pub planned_at_epoch: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +277,7 @@ struct Databases {
     graph_snapshot_metadata: Database,
     graph_overlay_parent_rows: Database,
     graph_overlay_child_rows: Database,
+    planner_sessions: Database,
     delta_log: Database,
 }
 
@@ -239,6 +285,8 @@ pub struct GraphStore {
     env: Environment,
     dbs: Databases,
     store_dir: PathBuf,
+    effective_map_size_bytes: usize,
+    runtime_options: LmdbRuntimeOptions,
 }
 
 impl GraphStore {
@@ -247,10 +295,11 @@ impl GraphStore {
         fs::create_dir_all(&store_dir)?;
 
         let runtime_options = resolve_lmdb_runtime_options()?;
+        let effective_map_size_bytes = resolve_map_size_bytes(&store_dir)?;
         let mut builder = Environment::new();
         builder
             .set_max_dbs(LMDB_MAX_DBS)
-            .set_map_size(resolve_map_size_bytes(&store_dir))
+            .set_map_size(effective_map_size_bytes)
             .set_flags(runtime_options.environment_flags());
         let env = builder.open(&store_dir)?;
 
@@ -276,12 +325,14 @@ impl GraphStore {
                 .create_db(Some("graph_overlay_parent_rows"), DatabaseFlags::empty())?,
             graph_overlay_child_rows: env
                 .create_db(Some("graph_overlay_child_rows"), DatabaseFlags::empty())?,
+            planner_sessions: env.create_db(Some("planner_sessions"), DatabaseFlags::empty())?,
             delta_log: env.create_db(Some("delta_log"), DatabaseFlags::empty())?,
         };
         {
             let mut txn = env.begin_rw_txn()?;
             ensure_u64_meta(&mut txn, dbs.metadata, META_NEXT_REPOSITORY_ID, 1)?;
             ensure_u64_meta(&mut txn, dbs.metadata, META_NEXT_DELTA_SEQUENCE, 1)?;
+            ensure_u64_meta(&mut txn, dbs.metadata, META_NEXT_PLANNER_SESSION_ID, 1)?;
             txn.commit()?;
         }
 
@@ -289,11 +340,23 @@ impl GraphStore {
             env,
             dbs,
             store_dir,
+            effective_map_size_bytes,
+            runtime_options,
         })
     }
 
     pub fn store_directory(&self) -> &Path {
         &self.store_dir
+    }
+
+    pub fn lmdb_runtime_contract(&self) -> LmdbRuntimeContract {
+        LmdbRuntimeContract {
+            effective_map_size_bytes: self.effective_map_size_bytes,
+            no_readahead: self.runtime_options.no_readahead,
+            write_map: self.runtime_options.write_map,
+            map_async: self.runtime_options.map_async,
+            no_mem_init: self.runtime_options.no_mem_init,
+        }
     }
 
     pub fn upsert_repository(&self, path: &str, name: &str, git_dir: &str) -> AppResult<i64> {
@@ -415,6 +478,7 @@ impl GraphStore {
         }
 
         let mut txn = self.env.begin_rw_txn()?;
+        ensure_commit_window_index_v2(&mut txn, self.dbs, repo_id)?;
         for commit in commits {
             let key = repository_commit_key(repo_id, commit.sha.as_str());
             let value = CommitRecord {
@@ -426,22 +490,18 @@ impl GraphStore {
                 author_time: commit.author_time,
                 committer_time: commit.committer_time,
                 subject: commit.subject.clone(),
+                metadata_state: commit.metadata_state,
             };
             let raw = serialize(&value, "serialize commit record")?;
             txn.put(self.dbs.commits, &key, &raw, WriteFlags::empty())?;
 
             let commit_window_key =
                 commit_window_index_key(repo_id, commit.committer_time, commit.sha.as_str())?;
-            let commit_window_item = CommitWindowItem {
+            let commit_window_ref = CommitWindowIndexRefV2 {
                 sha: commit.sha.clone(),
-                author_name: commit.author_name.clone(),
-                author_email: commit.author_email.clone(),
-                committer_time: commit.committer_time,
-                subject: commit.subject.clone(),
-                tree_sha: commit.tree_sha.clone(),
             };
             let commit_window_raw =
-                serialize(&commit_window_item, "serialize commit-window index item")?;
+                serialize(&commit_window_ref, "serialize commit-window v2 index ref")?;
             txn.put(
                 self.dbs.commit_window_index,
                 &commit_window_key,
@@ -458,6 +518,97 @@ impl GraphStore {
         )?;
         txn.commit()?;
         Ok(commits.len())
+    }
+
+    pub fn persist_commit_metadata_updates(
+        &self,
+        repo_id: i64,
+        hydrated: &[ParsedCommit],
+        failed_shas: &[String],
+    ) -> AppResult<usize> {
+        if hydrated.is_empty() && failed_shas.is_empty() {
+            return Ok(0);
+        }
+
+        let mut txn = self.env.begin_rw_txn()?;
+        let mut updated = 0usize;
+
+        for commit in hydrated {
+            let key = repository_commit_key(repo_id, commit.sha.as_str());
+            let raw = match txn.get(self.dbs.commits, &key) {
+                Ok(raw) => raw,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut record: CommitRecord = deserialize(
+                raw,
+                "deserialize commit record for metadata hydration update",
+            )?;
+            record.parents = if commit.parents.is_empty() {
+                record.parents
+            } else {
+                commit.parents.clone()
+            };
+            record.tree_sha = if commit.tree_sha.is_empty() {
+                record.tree_sha
+            } else {
+                commit.tree_sha.clone()
+            };
+            record.author_name = commit.author_name.clone();
+            record.author_email = commit.author_email.clone();
+            record.author_time = commit.author_time;
+            record.committer_time = if commit.committer_time == 0 {
+                record.committer_time
+            } else {
+                commit.committer_time
+            };
+            record.subject = commit.subject.clone();
+            record.metadata_state = CommitMetadataState::Ready;
+
+            let updated_raw =
+                serialize(&record, "serialize hydrated commit metadata commit record")?;
+            txn.put(self.dbs.commits, &key, &updated_raw, WriteFlags::empty())?;
+            updated = updated.saturating_add(1);
+        }
+
+        for sha in failed_shas {
+            let key = repository_commit_key(repo_id, sha.as_str());
+            let raw = match txn.get(self.dbs.commits, &key) {
+                Ok(raw) => raw,
+                Err(lmdb::Error::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let mut record: CommitRecord = deserialize(
+                raw,
+                "deserialize commit record for metadata hydration failure",
+            )?;
+            if record.metadata_state == CommitMetadataState::Ready {
+                continue;
+            }
+            record.metadata_state = CommitMetadataState::Failed;
+            let updated_raw = serialize(
+                &record,
+                "serialize failed commit metadata state update commit record",
+            )?;
+            txn.put(self.dbs.commits, &key, &updated_raw, WriteFlags::empty())?;
+            updated = updated.saturating_add(1);
+        }
+
+        if updated > 0 {
+            append_delta_event(
+                &mut txn,
+                self.dbs,
+                Some(repo_id),
+                format!(
+                    "commit_metadata_hydrate hydrated={} failed={}",
+                    hydrated.len(),
+                    failed_shas.len()
+                ),
+            )?;
+        }
+
+        txn.commit()?;
+        Ok(updated)
     }
 
     pub fn synchronize_refs(&self, repo_id: i64, refs: &[ParsedRef]) -> AppResult<usize> {
@@ -1127,6 +1278,64 @@ impl GraphStore {
         }
     }
 
+    pub fn persist_planner_session(&self, input: PlannerSessionWriteInput) -> AppResult<u64> {
+        let mut txn = self.env.begin_rw_txn()?;
+        let next_session_id = read_u64_meta(&txn, self.dbs.metadata, META_NEXT_PLANNER_SESSION_ID)?
+            .unwrap_or(1)
+            .max(1);
+        write_u64_meta(
+            &mut txn,
+            self.dbs.metadata,
+            META_NEXT_PLANNER_SESSION_ID,
+            next_session_id.saturating_add(1),
+        )?;
+
+        let key = planner_session_key(input.repo_id, next_session_id);
+        let record = PlannerSessionRecord {
+            session_id: next_session_id,
+            repo_id: input.repo_id,
+            requested_mode: input.requested_mode.as_str().to_string(),
+            effective_mode: input.effective_mode.as_str().to_string(),
+            checkpoint_trusted: input.checkpoint_trusted,
+            degraded_policy: input.degraded_policy.as_str().to_string(),
+            risk_level: input.risk_level.as_str().to_string(),
+            trace_count: input.trace_count,
+            planned_at_epoch: input.planned_at_epoch,
+        };
+        let raw = serialize(&record, "serialize planner session record")?;
+        txn.put(self.dbs.planner_sessions, &key, &raw, WriteFlags::empty())?;
+        append_delta_event(
+            &mut txn,
+            self.dbs,
+            Some(input.repo_id),
+            format!("planner_session_persist id={next_session_id}"),
+        )?;
+        txn.commit()?;
+        Ok(next_session_id)
+    }
+
+    pub fn load_recent_planner_sessions(
+        &self,
+        repo_id: i64,
+        limit: usize,
+    ) -> AppResult<Vec<PlannerSessionRecord>> {
+        let bounded_limit = limit.max(1);
+        let txn = self.env.begin_ro_txn()?;
+        let prefix = planner_session_prefix(repo_id);
+        let cursor = txn.open_ro_cursor(self.dbs.planner_sessions)?;
+        let mut rows = Vec::new();
+        for_each_prefixed_cursor(&cursor, prefix.as_bytes(), |_key, value| {
+            let row: PlannerSessionRecord = deserialize(value, "deserialize planner session row")?;
+            rows.push(row);
+            Ok(true)
+        })?;
+        rows.sort_unstable_by(|left, right| right.session_id.cmp(&left.session_id));
+        if rows.len() > bounded_limit {
+            rows.truncate(bounded_limit);
+        }
+        Ok(rows)
+    }
+
     pub fn set_repository_indexed_at(&self, repo_id: i64, indexed_at_epoch: i64) -> AppResult<()> {
         let mut txn = self.env.begin_rw_txn()?;
         let Some(mut repository) = self.load_repository_record_from_rw(&txn, repo_id)? else {
@@ -1165,6 +1374,14 @@ impl GraphStore {
     ) -> AppResult<Vec<CommitWindowItem>> {
         let bounded_limit = limit.max(1);
         let txn = self.env.begin_ro_txn()?;
+        let version_key = commit_window_index_version_key(repo_id);
+        let version =
+            read_u64_meta(&txn, self.dbs.metadata, version_key.as_str())?.unwrap_or_default();
+        if version != COMMIT_WINDOW_INDEX_VERSION_V2 {
+            return Err(AppError::InvalidArgument(format!(
+                "commit-window index requires reindex for repo {repo_id}: expected version {COMMIT_WINDOW_INDEX_VERSION_V2}, found {version}"
+            )));
+        }
         let prefix = repository_prefix(repo_id);
         let cursor_db = txn.open_ro_cursor(self.dbs.commit_window_index)?;
         let start_key = cursor
@@ -1186,56 +1403,22 @@ impl GraphStore {
                     return Ok(true);
                 }
 
-                let item: CommitWindowItem =
-                    deserialize(value, "deserialize commit-window index item")?;
-                results.push(item);
+                let window_ref: CommitWindowIndexRefV2 =
+                    deserialize(value, "deserialize commit-window v2 index ref")?;
+                let commit_key = repository_commit_key(repo_id, window_ref.sha.as_str());
+                let commit_raw = match txn.get(self.dbs.commits, &commit_key) {
+                    Ok(raw) => raw,
+                    Err(lmdb::Error::NotFound) => return Ok(results.len() < bounded_limit),
+                    Err(error) => return Err(error.into()),
+                };
+                let commit: CommitRecord = deserialize(
+                    commit_raw,
+                    "deserialize commit record for commit-window lookup",
+                )?;
+                results.push(commit_window_item_from_commit_record(commit));
                 Ok(results.len() < bounded_limit)
             },
         )?;
-
-        if results.is_empty() {
-            return self.load_commit_window_legacy(repo_id, bounded_limit, cursor);
-        }
-
-        Ok(results)
-    }
-
-    fn load_commit_window_legacy(
-        &self,
-        repo_id: i64,
-        limit: usize,
-        cursor: Option<&CommitWindowCursor>,
-    ) -> AppResult<Vec<CommitWindowItem>> {
-        let mut commits = self.load_all_commits(repo_id)?;
-        commits.sort_unstable_by(|left, right| {
-            right
-                .committer_time
-                .cmp(&left.committer_time)
-                .then_with(|| right.sha.cmp(&left.sha))
-        });
-
-        let mut results = Vec::with_capacity(limit.min(commits.len()));
-        for commit in commits {
-            if cursor.as_ref().is_some_and(|cursor_value| {
-                commit.committer_time > cursor_value.committer_time
-                    || (commit.committer_time == cursor_value.committer_time
-                        && commit.sha >= cursor_value.sha)
-            }) {
-                continue;
-            }
-
-            results.push(CommitWindowItem {
-                sha: commit.sha,
-                author_name: commit.author_name,
-                author_email: commit.author_email,
-                committer_time: commit.committer_time,
-                subject: commit.subject,
-                tree_sha: commit.tree_sha,
-            });
-            if results.len() >= limit {
-                break;
-            }
-        }
 
         Ok(results)
     }
@@ -1390,21 +1573,26 @@ impl GraphStore {
             )));
         }
 
-        let txn = self.env.begin_ro_txn()?;
-        let mut unique_shas = HashSet::new();
-        let mut delta_commits = Vec::with_capacity(commit_shas.len());
-        for sha in commit_shas {
-            if !unique_shas.insert(sha.as_str()) {
-                continue;
+        let delta_commits = {
+            let txn = self.env.begin_ro_txn()?;
+            let mut unique_shas = HashSet::new();
+            let mut delta_commits = Vec::with_capacity(commit_shas.len());
+            for sha in commit_shas {
+                if !unique_shas.insert(sha.as_str()) {
+                    continue;
+                }
+                let key = repository_commit_key(repo_id, sha.as_str());
+                let commit = match txn.get(self.dbs.commits, &key) {
+                    Ok(raw) => {
+                        deserialize::<CommitRecord>(raw, "deserialize commit for csr delta")?
+                    }
+                    Err(lmdb::Error::NotFound) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                delta_commits.push(commit);
             }
-            let key = repository_commit_key(repo_id, sha.as_str());
-            let commit = match txn.get(self.dbs.commits, &key) {
-                Ok(raw) => deserialize::<CommitRecord>(raw, "deserialize commit for csr delta")?,
-                Err(lmdb::Error::NotFound) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            delta_commits.push(commit);
-        }
+            delta_commits
+        };
 
         let (next_snapshot, changed) =
             build_incremental_csr_snapshot(existing_snapshot, delta_commits)?;
@@ -1921,13 +2109,30 @@ fn resolve_store_directory(db_path: &Path) -> PathBuf {
     db_path.to_path_buf()
 }
 
-fn resolve_map_size_bytes(store_dir: &Path) -> usize {
-    let configured = env::var("GITGRAPH_LMDB_MAP_SIZE_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|value| *value >= LMDB_MIN_MAP_SIZE_BYTES)
-        .unwrap_or(LMDB_DEFAULT_MAP_SIZE_BYTES);
-    effective_map_size_bytes(configured, current_lmdb_data_file_size_bytes(store_dir))
+fn resolve_map_size_bytes(store_dir: &Path) -> AppResult<usize> {
+    let configured =
+        parse_configured_map_size_bytes(env::var("GITGRAPH_LMDB_MAP_SIZE_BYTES").ok().as_deref())?;
+    Ok(effective_map_size_bytes(
+        configured,
+        current_lmdb_data_file_size_bytes(store_dir),
+    ))
+}
+
+fn parse_configured_map_size_bytes(raw: Option<&str>) -> AppResult<usize> {
+    let Some(value) = raw else {
+        return Ok(LMDB_DEFAULT_MAP_SIZE_BYTES);
+    };
+    let parsed = value.trim().parse::<usize>().map_err(|error| {
+        AppError::InvalidArgument(format!(
+            "GITGRAPH_LMDB_MAP_SIZE_BYTES must be an integer: {error}"
+        ))
+    })?;
+    if parsed < LMDB_MIN_MAP_SIZE_BYTES {
+        return Err(AppError::InvalidArgument(format!(
+            "GITGRAPH_LMDB_MAP_SIZE_BYTES must be >= {LMDB_MIN_MAP_SIZE_BYTES}"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn effective_map_size_bytes(configured_map_size: usize, observed_data_file_bytes: usize) -> usize {
@@ -2032,6 +2237,18 @@ fn repository_extraction_commit_key(repo_id: i64, commit_sha: &str) -> String {
     format!("{}{}", repository_prefix(repo_id), commit_sha)
 }
 
+fn commit_window_index_version_key(repo_id: i64) -> String {
+    format!("{META_COMMIT_WINDOW_INDEX_VERSION_PREFIX}{repo_id}")
+}
+
+fn planner_session_prefix(repo_id: i64) -> String {
+    format!("{}planner:", repository_prefix(repo_id))
+}
+
+fn planner_session_key(repo_id: i64, session_id: u64) -> String {
+    format!("{}{session_id:020}", planner_session_prefix(repo_id))
+}
+
 fn commit_window_index_key(repo_id: i64, committer_time: i64, sha: &str) -> AppResult<Vec<u8>> {
     let prefix = repository_prefix(repo_id);
     let desc_time_component = descending_time_component(committer_time);
@@ -2048,6 +2265,95 @@ fn commit_window_index_key(repo_id: i64, committer_time: i64, sha: &str) -> AppR
     key.push(b':');
     key.extend(invert_sha_bytes(sha)?);
     Ok(key)
+}
+
+fn default_commit_metadata_state() -> CommitMetadataState {
+    CommitMetadataState::Ready
+}
+
+fn commit_window_item_from_commit_record(commit: CommitRecord) -> CommitWindowItem {
+    let metadata_state = commit.metadata_state;
+    let is_ready = metadata_state == CommitMetadataState::Ready;
+    let pending_placeholder = "[metadata pending]";
+    let failed_placeholder = "[metadata unavailable]";
+    let placeholder = if metadata_state == CommitMetadataState::Failed {
+        failed_placeholder
+    } else {
+        pending_placeholder
+    };
+
+    CommitWindowItem {
+        sha: commit.sha,
+        author_name: if is_ready {
+            commit.author_name
+        } else {
+            placeholder.to_string()
+        },
+        author_email: if is_ready {
+            commit.author_email
+        } else {
+            placeholder.to_string()
+        },
+        committer_time: commit.committer_time,
+        subject: if is_ready {
+            commit.subject
+        } else {
+            placeholder.to_string()
+        },
+        tree_sha: commit.tree_sha,
+        metadata_state,
+    }
+}
+
+fn ensure_commit_window_index_v2(
+    txn: &mut RwTransaction<'_>,
+    dbs: Databases,
+    repo_id: i64,
+) -> AppResult<()> {
+    let version_key = commit_window_index_version_key(repo_id);
+    let version = read_u64_meta(txn, dbs.metadata, version_key.as_str())?.unwrap_or_default();
+    if version == COMMIT_WINDOW_INDEX_VERSION_V2 {
+        return Ok(());
+    }
+
+    let repo_prefix = repository_prefix(repo_id);
+    let _ = delete_prefixed_entries(txn, dbs.commit_window_index, repo_prefix.as_str())?;
+
+    let mut index_rows: Vec<(i64, String)> = Vec::new();
+    {
+        let commit_cursor = txn.open_ro_cursor(dbs.commits)?;
+        for_each_prefixed_cursor(&commit_cursor, repo_prefix.as_bytes(), |_key, value| {
+            let commit: CommitRecord =
+                deserialize(value, "deserialize commit during commit-window v2 rebuild")?;
+            index_rows.push((commit.committer_time, commit.sha));
+            Ok(true)
+        })?;
+    }
+
+    let rebuilt_rows = index_rows.len();
+    for (committer_time, sha) in index_rows {
+        let key = commit_window_index_key(repo_id, committer_time, sha.as_str())?;
+        let value = CommitWindowIndexRefV2 { sha };
+        let raw = serialize(
+            &value,
+            "serialize commit-window v2 index ref during rebuild",
+        )?;
+        txn.put(dbs.commit_window_index, &key, &raw, WriteFlags::empty())?;
+    }
+
+    write_u64_meta(
+        txn,
+        dbs.metadata,
+        version_key.as_str(),
+        COMMIT_WINDOW_INDEX_VERSION_V2,
+    )?;
+    append_delta_event(
+        txn,
+        dbs,
+        Some(repo_id),
+        format!("commit_window_index_rebuild_v2 rows={rebuilt_rows}"),
+    )?;
+    Ok(())
 }
 
 fn enrichment_due_index_key(
@@ -2638,8 +2944,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        effective_map_size_bytes, open_store, LmdbRuntimeOptions,
-        FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, LMDB_MIN_MAP_SIZE_BYTES,
+        effective_map_size_bytes, open_store, parse_configured_map_size_bytes, LmdbRuntimeOptions,
+        PlannerSessionWriteInput, FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, LMDB_MIN_MAP_SIZE_BYTES,
+    };
+    use crate::domain::models::{
+        CommitMetadataState, CommitWindowCursor, IndexingMode, ParsedCommit, PlannerDegradedPolicy,
+        PlannerRiskLevel,
     };
 
     #[test]
@@ -2697,6 +3007,18 @@ mod tests {
         let effective = effective_map_size_bytes(configured, observed);
 
         assert_eq!(effective, configured);
+    }
+
+    #[test]
+    fn map_size_env_rejects_invalid_integer_values() {
+        let result = parse_configured_map_size_bytes(Some("not-a-number"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn map_size_env_rejects_values_below_floor() {
+        let result = parse_configured_map_size_bytes(Some("1024"));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -2784,5 +3106,133 @@ mod tests {
             .load_file_change_extraction_queue_metrics(repo_id)
             .unwrap_or_else(|error| panic!("load extraction queue metrics after failure: {error}"));
         assert_eq!(metrics.depth, 0);
+    }
+
+    #[test]
+    fn planner_sessions_are_persisted_with_monotonic_sequence_and_recent_ordering() {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+        let db_path = temp.path().join("graph-store");
+        let store = open_store(&db_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let repo_id = 88_i64;
+
+        let first = store
+            .persist_planner_session(PlannerSessionWriteInput {
+                repo_id,
+                requested_mode: IndexingMode::Full,
+                effective_mode: IndexingMode::Full,
+                checkpoint_trusted: false,
+                degraded_policy: PlannerDegradedPolicy::None,
+                risk_level: PlannerRiskLevel::Low,
+                trace_count: 1,
+                planned_at_epoch: 100,
+            })
+            .unwrap_or_else(|error| panic!("persist first planner session: {error}"));
+        let second = store
+            .persist_planner_session(PlannerSessionWriteInput {
+                repo_id,
+                requested_mode: IndexingMode::Incremental,
+                effective_mode: IndexingMode::Full,
+                checkpoint_trusted: false,
+                degraded_policy: PlannerDegradedPolicy::FallbackToFull,
+                risk_level: PlannerRiskLevel::Medium,
+                trace_count: 2,
+                planned_at_epoch: 101,
+            })
+            .unwrap_or_else(|error| panic!("persist second planner session: {error}"));
+
+        assert!(second > first);
+
+        let sessions = store
+            .load_recent_planner_sessions(repo_id, 8)
+            .unwrap_or_else(|error| panic!("load recent planner sessions: {error}"));
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, second);
+        assert_eq!(sessions[1].session_id, first);
+        assert_eq!(sessions[0].requested_mode, "incremental");
+        assert_eq!(sessions[0].effective_mode, "full");
+        assert_eq!(sessions[0].degraded_policy, "fallback_to_full");
+        assert_eq!(sessions[0].risk_level, "medium");
+        assert_eq!(sessions[1].requested_mode, "full");
+        assert_eq!(sessions[1].effective_mode, "full");
+    }
+
+    #[test]
+    fn commit_window_v2_requires_reindex_then_serves_stable_ordered_rows() {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+        let db_path = temp.path().join("graph-store");
+        let store = open_store(&db_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let repo_id = 99_i64;
+
+        let before_index = store.load_commit_window(repo_id, 10, None);
+        assert!(
+            before_index.is_err(),
+            "expected commit window to require reindex before v2 index is materialized"
+        );
+
+        let commits = vec![
+            ParsedCommit {
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                parents: Vec::new(),
+                tree_sha: "1111111111111111111111111111111111111111".to_string(),
+                author_name: "A".to_string(),
+                author_email: "a@example.com".to_string(),
+                author_time: 10,
+                committer_time: 10,
+                subject: "a".to_string(),
+                metadata_state: CommitMetadataState::Ready,
+            },
+            ParsedCommit {
+                sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                parents: vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()],
+                tree_sha: "2222222222222222222222222222222222222222".to_string(),
+                author_name: "B".to_string(),
+                author_email: "b@example.com".to_string(),
+                author_time: 20,
+                committer_time: 20,
+                subject: "b".to_string(),
+                metadata_state: CommitMetadataState::Ready,
+            },
+            ParsedCommit {
+                sha: "cccccccccccccccccccccccccccccccccccccccc".to_string(),
+                parents: vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()],
+                tree_sha: "3333333333333333333333333333333333333333".to_string(),
+                author_name: "C".to_string(),
+                author_email: "c@example.com".to_string(),
+                author_time: 30,
+                committer_time: 30,
+                subject: "c".to_string(),
+                metadata_state: CommitMetadataState::Ready,
+            },
+        ];
+
+        let persisted = store
+            .persist_commits(repo_id, &commits)
+            .unwrap_or_else(|error| panic!("persist commits for commit-window v2: {error}"));
+        assert_eq!(persisted, commits.len());
+
+        let page1 = store
+            .load_commit_window(repo_id, 2, None)
+            .unwrap_or_else(|error| panic!("load commit window page 1: {error}"));
+        assert_eq!(page1.len(), 2);
+        assert_eq!(
+            page1
+                .iter()
+                .map(|item| item.sha.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "cccccccccccccccccccccccccccccccccccccccc",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ]
+        );
+
+        let cursor = CommitWindowCursor {
+            committer_time: page1[1].committer_time,
+            sha: page1[1].sha.clone(),
+        };
+        let page2 = store
+            .load_commit_window(repo_id, 2, Some(&cursor))
+            .unwrap_or_else(|error| panic!("load commit window page 2: {error}"));
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 }

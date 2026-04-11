@@ -7,7 +7,7 @@ Superseding intent reference: ADR 0015
 
 ## 1) Mission
 
-Build and maintain a no-SQL runtime with:
+Build and maintain a no-relational_query runtime with:
 
 1. lowest practical time complexity on hot paths
 2. bounded memory behavior at repository scale
@@ -474,7 +474,7 @@ Status: Active and enforced in code
 1. Per-commit repository reload during topology reorder when parent map is available.
 2. “Bloom enabled” mode that silently returns permissive `true` for every commit.
 3. Commit-graph parse failure that aborts indexing (must fail open to exact check path).
-4. Any approach that requires SQL sidecar state for these three features.
+4. Any approach that requires relational_query sidecar state for these three features.
 
 ### 12.4 Source-backed primitives
 
@@ -511,3 +511,4 @@ Status: Active and enforced in code
 4. `pnpm run dev:gate:fast`
 5. `pnpm run dev:gate`
 6. `pnpm run quality:perf`
+

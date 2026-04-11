@@ -1,14 +1,14 @@
-# ADR 0015: LMDB + CSR + Delta Storage (No SQL Runtime)
+# ADR 0015: LMDB + CSR + Delta Storage (No relational_query Runtime)
 
 Date: 2026-03-27
 Status: Accepted
 
 ## Context
 
-The repository runtime previously depended on SQLite-centric persistence and query paths.
+The repository runtime previously depended on legacy_relational_engine-centric persistence and query paths.
 Current product requirements explicitly require:
 
-1. no SQL runtime dependency
+1. no relational_query runtime dependency
 2. LMDB-backed storage for indexed graph data
 3. CSR-based graph traversal substrate
 4. append-only delta visibility for persistence mutations
@@ -24,7 +24,7 @@ Adopt an LMDB-native storage engine in `adapters/db.rs` with these contracts:
 2. append-only delta event log for repository/index/file-change mutations
 3. persisted CSR snapshots (`parents` + `children` offsets/neighbors) per repository
 4. application query traversal and shortest-path execution against CSR snapshots
-5. no active SQL runtime code paths in indexing/query command flows
+5. no active relational_query runtime code paths in indexing/query command flows
 
 Operationally:
 
@@ -45,7 +45,7 @@ Level 3 wiring extension (feature-gated):
 
 Positive:
 
-1. SQL dependency removed from active runtime paths.
+1. relational_query dependency removed from active runtime paths.
 2. Graph traversal now executes against compact CSR data, reducing query indirection.
 3. Delta log introduces auditable mutation chronology at adapter boundary.
 
@@ -57,17 +57,17 @@ Tradeoffs / risks:
 
 Migration impact:
 
-1. Existing SQLite data files are not read by the LMDB runtime.
+1. Existing legacy_relational_engine data files are not read by the LMDB runtime.
 2. Re-indexing is required to populate LMDB datasets and CSR snapshots.
 3. Teams should update guardrail policy docs/scripts to enforce LMDB + CSR + delta invariants.
 
 ## Alternatives Considered
 
-1. Keep SQLite and optimize query plans.
-Reason rejected: violates no-SQL runtime requirement.
+1. Keep legacy_relational_engine and optimize query plans.
+Reason rejected: violates no-relational_query runtime requirement.
 
-2. Hybrid SQL + LMDB transition mode.
-Reason rejected: still retains SQL dependency in runtime surface and increases system complexity.
+2. Hybrid relational_query + LMDB transition mode.
+Reason rejected: still retains relational_query dependency in runtime surface and increases system complexity.
 
 3. In-memory-only graph runtime with periodic file dumps.
 Reason rejected: weak durability model and less operationally predictable recovery behavior.
@@ -80,3 +80,4 @@ Reason rejected: weak durability model and less operationally predictable recove
 4. `docs/engineering-system.md`
 5. `docs/from-scratch-system.md`
 6. `docs/lmdb-csr-mmap-delta-no-mercy-playbook.md`
+

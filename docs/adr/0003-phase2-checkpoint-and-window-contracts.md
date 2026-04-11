@@ -46,5 +46,6 @@ Tradeoffs:
 ## References
 
 1. https://doc.rust-lang.org/cargo/reference/workspaces.html
-2. https://www.sqlite.org/lang_upsert.html
+2. https://www.legacy_relational_engine.org/lang_upsert.html
 3. https://git-scm.com/docs/git-log
+

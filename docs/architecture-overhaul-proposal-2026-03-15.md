@@ -8,7 +8,7 @@ Objective: raise sustained indexing throughput from ~600 commits/sec plateau to 
 Adopt a three-tier architecture:
 - Tier A: In-Memory Execution Layer (bounded queues + hot graph state)
 - Tier B: LSM Ingest Layer (primary write path)
-- Tier C: SQLite Serving Layer (stable read/query model)
+- Tier C: legacy_relational_engine Serving Layer (stable read/query model)
 
 Primary ingest engine now: RocksDB.
 Migration-safe adapter boundary retained so future Rust-native LSM replacement (for example Fjall) does not require service-wide rewrite.
@@ -54,7 +54,7 @@ Write semantics:
 - replay-safe checkpoints
 - crash recovery from last committed sequence
 
-### Tier C: SQLite Serving Layer
+### Tier C: legacy_relational_engine Serving Layer
 
 Responsibilities:
 - keep existing query contracts stable
@@ -83,7 +83,7 @@ Global budgets:
 Per-tier budgets:
 - Tier A: queue depth and cache bytes
 - Tier B: block cache + memtable limits
-- Tier C: SQLite cache and transaction chunk windows
+- Tier C: legacy_relational_engine cache and transaction chunk windows
 
 Adaptive policy examples:
 - increase batch size only when lag decreases and RSS remains below soft cap
@@ -117,7 +117,7 @@ Phase 2 (Week 2-4): LSM ingest implementation
 Phase 3 (Week 3-5): in-memory tier + governor
 - bounded queues, hot cache, backpressure
 
-Phase 4 (Week 4-6): materialization to SQLite
+Phase 4 (Week 4-6): materialization to legacy_relational_engine
 - deterministic chunked merge
 - parity with existing reads
 
@@ -178,10 +178,10 @@ Included:
 - ingest architecture redesign
 - dual-write migration
 - memory governor and telemetry
-- staged materialization to existing SQLite serving model
+- staged materialization to existing legacy_relational_engine serving model
 
 Excluded:
-- immediate replacement of SQLite query layer
+- immediate replacement of legacy_relational_engine query layer
 - external API behavior changes
 
 ## 11) Key Technical Risks and Mitigations
@@ -209,7 +209,7 @@ Mitigation: adapter boundary + engine-independent logical event format + snapsho
 Phase 1 started in code with an ingest adapter seam and initial LSM shadow lane.
 
 Current behavior:
-- SQLite remains the source of truth for read/query compatibility.
+- legacy_relational_engine remains the source of truth for read/query compatibility.
 - RocksDB receives mirrored ingest writes when enabled, allowing dual-write validation without changing serving paths.
 - Shadow storage is partitioned by column family (`commits`, `file_changes`) for cleaner operational separation.
 - LSM keys use deterministic binary encoding (repo id + length-prefixed key parts) to avoid delimiter collisions.
@@ -218,7 +218,8 @@ Current behavior:
 Environment flags:
 - `GITGRAPH_LSM_SHADOW_ENABLE=1` enables RocksDB shadow writes.
 - `GITGRAPH_LSM_PATH=<path>` overrides default shadow store path (`.gitgraph-lab/ingest-rocksdb`).
-- `GITGRAPH_LSM_SHADOW_FAIL_OPEN=1` keeps SQLite writes authoritative even if shadow write fails.
+- `GITGRAPH_LSM_SHADOW_FAIL_OPEN=1` keeps legacy_relational_engine writes authoritative even if shadow write fails.
 
 Build requirement:
 - Compile with cargo feature `lsm-rocksdb` to activate RocksDB-backed shadow lane.
+

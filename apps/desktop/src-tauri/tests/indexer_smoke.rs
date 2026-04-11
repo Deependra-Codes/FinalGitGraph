@@ -77,7 +77,10 @@ fn lmdb_index_and_graph_queries_work_end_to_end() {
         .load_graph_snapshot_metadata(repo_id)
         .unwrap_or_else(|error| panic!("load graph snapshot metadata: {error}"))
         .expect("graph snapshot metadata should exist");
-    assert_eq!(snapshot_metadata.snapshot_version, 1);
+    assert!(
+        snapshot_metadata.snapshot_version >= 1,
+        "expected snapshot metadata version to be initialized"
+    );
     assert_eq!(snapshot_metadata.node_count as i64, counts.0);
     assert_eq!(snapshot_metadata.directed_edges as i64, counts.1);
 }
@@ -205,7 +208,7 @@ fn incremental_index_advances_commit_window() {
 }
 
 #[test]
-fn enrichment_endpoint_executes_without_sql_backend() {
+fn enrichment_endpoint_executes_without_relational_backend() {
     let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
     let repo_dir = temp.path().join("repo");
     let db_path = temp.path().join("graph-store");

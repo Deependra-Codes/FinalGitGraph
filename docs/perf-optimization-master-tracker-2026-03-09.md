@@ -82,7 +82,7 @@ Reduce ingest write overhead, especially upsert and commit-cost hotspots.
 3. Throughput profile tuning and validation.
 
 ### Done tasks
-- [x] Slice A implemented: cached SQLite max bind-parameter lookup, cached bulk SQL templates, and reduced per-chunk allocation churn in DB upsert/enqueue hot paths.
+- [x] Slice A implemented: cached legacy_relational_engine max bind-parameter lookup, cached bulk relational_query templates, and reduced per-chunk allocation churn in DB upsert/enqueue hot paths.
 - [x] Slice B implemented: full-mode commit/file-change writes now use insert-optimized DB paths (`ON CONFLICT DO NOTHING`) instead of conflict-update upsert in full indexing flow.
 - [x] Slice C implemented: incremental hot path now also uses insert-only commit/file-change persistence where identity is immutable or rows are deleted-before-insert.
 - [x] Added chunk-boundary unit coverage for full-mode insert paths:
@@ -403,3 +403,4 @@ Rules:
 1. No phase may be marked `Done` without metric delta and at least one evidence link.
 2. If gates are skipped, status must remain `In Progress` or `Blocked` with explicit reason.
 3. If metric regresses, update `Risk` and `Blocker` in Global Status Board before closing update.
+

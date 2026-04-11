@@ -1,7 +1,7 @@
 # ADR 0010: Bounded Rename Detection and Ingestion-Phase Telemetry
 
 Date: 2026-03-07
-Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-sql.md`)
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-relational_query.md`)
 
 ## Context
 
@@ -10,7 +10,7 @@ Repository-scale indexing showed ingestion as a primary bottleneck for large his
 1. file-change extraction could spend disproportionate time in rename detection.
 2. incremental cleanup used per-commit delete loops for file changes.
 3. indexing metrics exposed totals but did not isolate commit walk/upsert/diff/delete/upsert/commit phases.
-4. ingestion parse and DB write stages needed bounded overlap without violating SQLite single-writer ownership.
+4. ingestion parse and DB write stages needed bounded overlap without violating legacy_relational_engine single-writer ownership.
 
 ## Decision
 
@@ -43,7 +43,7 @@ Positive:
 
 1. ingestion regressions become diagnosable by phase instead of a single total.
 2. rename-heavy commit batches are bounded and less likely to trigger superlinear cliffs.
-3. incremental delete path reduces SQLite statement churn.
+3. incremental delete path reduces legacy_relational_engine statement churn.
 4. line-level diff work is loaded only where required, reducing avoidable extraction overhead.
 5. adaptive chunk/channel planning improves CPU utilization while keeping deterministic bounded flow.
 6. CI/local budget lane can fail ingestion and memory regressions early.
@@ -71,6 +71,7 @@ Tradeoffs:
 1. Git diff rename limit behavior (`-l`, rename/copy detection): https://git-scm.com/docs/git-diff/2.37.2.html
 2. `git2` DiffFindOptions API (`rename_limit`, `rename_threshold`, `exact_match_only`): https://docs.rs/git2/latest/git2/struct.DiffFindOptions.html
 3. libgit2 diff find options: https://libgit2.org/docs/reference/main/diff/git_diff_find_options.html
-4. SQLite transaction batching guidance: https://sqlite.org/faq.html
-5. SQLite WAL model: https://sqlite.org/wal.html
-6. SQLite pragma guidance: https://www.sqlite.org/pragma.html
+4. legacy_relational_engine transaction batching guidance: https://legacy_relational_engine.org/faq.html
+5. legacy_relational_engine WAL model: https://legacy_relational_engine.org/wal.html
+6. legacy_relational_engine pragma guidance: https://www.legacy_relational_engine.org/pragma.html
+

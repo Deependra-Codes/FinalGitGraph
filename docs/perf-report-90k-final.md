@@ -130,7 +130,7 @@ in_memory_adjacency_query_latency_ms:
   shortest_path_parents: runs=20 min=1.747 median=2.598 p95=3.496 max=3.512 mean=2.654
   shortest_path_both: runs=20 min=0.064 median=0.066 p95=0.069 max=0.087 mean=0.067
 
-in_memory_vs_sqlite_median_speedup:
+in_memory_vs_legacy_relational_engine_median_speedup:
   bfs_parents: 93.093x
   shortest_path_parents: 297.399x
   shortest_path_both: 504.452x
@@ -149,3 +149,4 @@ pnpm run perf:ingestion:90k
 5. observed_incremental_index_ms: `24841.76`
 6. observed_peak_rss_bytes: `31797248`
 7. budget_result: `passed`
+

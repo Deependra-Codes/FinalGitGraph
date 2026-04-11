@@ -133,7 +133,7 @@ GitGraph Lab solves this with algorithm-first visual workflows and deterministic
    - Phase 1: `git` plumbing commands (safe argument arrays)
    - Phase 2: `libgit2` on hot paths
 8. Local data:
-   - SQLite with WAL, tuned pragmas, batched writes
+   - legacy_relational_engine with WAL, tuned pragmas, batched writes
 9. Secrets:
    - OS keychain (PAT token only)
 10. APIs:
@@ -149,7 +149,7 @@ flowchart LR
   CORE[Rust Core]
   GIT[Git Adapter]
   RISK[Risk Engine]
-  DB[(SQLite)]
+  DB[(legacy_relational_engine)]
   GH[GitHub Adapter]
   FS[Local .git]
   API[GitHub API]
@@ -183,7 +183,7 @@ flowchart LR
 3. Batch Git operations:
    - `cat-file --batch`
    - grouped ref and object queries
-4. SQLite tuning profile:
+4. legacy_relational_engine tuning profile:
    - `journal_mode=WAL`
    - `synchronous=NORMAL`
    - `temp_store=MEMORY`
@@ -578,9 +578,9 @@ pr_risk = 100 * (
 
 ## 8. Data Design
 
-## 8.1 SQLite Schema (proposed)
+## 8.1 legacy_relational_engine Schema (proposed)
 
-```sql
+```relational_query
 CREATE TABLE repositories (
   id INTEGER PRIMARY KEY,
   path TEXT NOT NULL UNIQUE,
@@ -998,7 +998,7 @@ sequenceDiagram
 ### Week 1
 
 1. Tauri + React + Rust scaffold
-2. SQLite schema and migration pipeline
+2. legacy_relational_engine schema and migration pipeline
 3. Repository scan and commit import foundation
 
 ### Week 2
@@ -1131,8 +1131,8 @@ Desktop/runtime and data:
 
 20. Tauri capabilities (v2): https://v2.tauri.app/security/capabilities/
 21. Tauri calling Rust commands: https://v2.tauri.app/develop/calling-rust/
-22. SQLite WAL: https://sqlite.org/wal.html
-23. SQLite pragmas: https://sqlite.org/pragma.html
+22. legacy_relational_engine WAL: https://legacy_relational_engine.org/wal.html
+23. legacy_relational_engine pragmas: https://legacy_relational_engine.org/pragma.html
 
 Algorithms:
 
@@ -1148,4 +1148,5 @@ Algorithms:
 4. Threat model report (`/docs/security-threat-model.md`)
 5. Scoring formulas and calibration notes (`/docs/risk-model-spec.md`)
 6. Performance tuning profile (`/docs/performance-profile.md`)
+
 

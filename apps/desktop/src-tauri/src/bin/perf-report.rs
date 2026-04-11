@@ -120,6 +120,7 @@ struct ReportInput<'a> {
     full_index: Duration,
     incremental_index: Duration,
     query_benchmark: Duration,
+    commit_window_jit_hydrated_rows: usize,
     in_memory_graph_hydration: Duration,
     in_memory_query_benchmark: Duration,
     in_memory_adjacency_query_latency_ms: InMemoryAdjacencyQueryLatencyMs,
@@ -247,14 +248,17 @@ fn run_with_fixture(
     let query_started = Instant::now();
     let total_query_runs = config.query_runs.max(1);
     let query_log_stride = (total_query_runs / 5).max(1);
+    let mut commit_window_jit_hydrated_rows = 0usize;
     for run_index in 0..total_query_runs {
-        let _ = get_commit_window(
+        let commit_window = get_commit_window(
             repo_str.as_str(),
             Some(db_str.as_str()),
             Some(config.window_limit),
             None,
         )
         .map_err(|error| error.to_string())?;
+        commit_window_jit_hydrated_rows =
+            commit_window_jit_hydrated_rows.saturating_add(commit_window.jit_hydrated_rows);
         let _ = get_graph_traversal(
             repo_str.as_str(),
             Some(db_str.as_str()),
@@ -399,6 +403,7 @@ fn run_with_fixture(
         full_index,
         incremental_index,
         query_benchmark,
+        commit_window_jit_hydrated_rows,
         in_memory_graph_hydration,
         in_memory_query_benchmark,
         in_memory_adjacency_query_latency_ms,
@@ -1078,8 +1083,86 @@ fn format_report(input: &ReportInput<'_>) -> String {
         .saturating_add(incremental.commits_indexed);
     let aggregate_end_to_end_ms = full.end_to_end_ms + incremental.end_to_end_ms;
 
+    let aggregate_commit_walk_total_ms =
+        full.commit_walk_total_ms + incremental.commit_walk_total_ms;
+    let aggregate_commit_callback_ms = full.commit_callback_ms + incremental.commit_callback_ms;
+    let aggregate_commit_walk_decode_ms =
+        full.commit_walk_decode_ms + incremental.commit_walk_decode_ms;
+    let aggregate_commit_walk_parent_resolve_ms =
+        full.commit_walk_parent_resolve_ms + incremental.commit_walk_parent_resolve_ms;
+    let aggregate_commit_walk_metadata_parse_ms =
+        full.commit_walk_metadata_parse_ms + incremental.commit_walk_metadata_parse_ms;
+    let aggregate_commit_walk_tip_collection_ms =
+        full.commit_walk_tip_collection_ms + incremental.commit_walk_tip_collection_ms;
+    let aggregate_commit_walk_hide_expansion_ms =
+        full.commit_walk_hide_expansion_ms + incremental.commit_walk_hide_expansion_ms;
+    let aggregate_commit_walk_graph_lookup_ms =
+        full.commit_walk_graph_lookup_ms + incremental.commit_walk_graph_lookup_ms;
+    let aggregate_commit_walk_ordering_ms =
+        full.commit_walk_ordering_ms + incremental.commit_walk_ordering_ms;
+    let aggregate_commit_walk_emit_ms = full.commit_walk_emit_ms + incremental.commit_walk_emit_ms;
+    let aggregate_commit_walk_graph_lookup_hit_count = full
+        .commit_walk_graph_lookup_hit_count
+        .saturating_add(incremental.commit_walk_graph_lookup_hit_count);
+    let aggregate_commit_walk_graph_lookup_miss_count = full
+        .commit_walk_graph_lookup_miss_count
+        .saturating_add(incremental.commit_walk_graph_lookup_miss_count);
+    let aggregate_commit_walk_graph_fallback_count = full
+        .commit_walk_graph_fallback_count
+        .saturating_add(incremental.commit_walk_graph_fallback_count);
+    let aggregate_commit_walk_graph_partial_fallback_count = full
+        .commit_walk_graph_partial_fallback_count
+        .saturating_add(incremental.commit_walk_graph_partial_fallback_count);
+    let aggregate_commit_walk_nodes_seen_count = full
+        .commit_walk_nodes_seen_count
+        .saturating_add(incremental.commit_walk_nodes_seen_count);
+    let aggregate_commit_walk_nodes_pruned_count = full
+        .commit_walk_nodes_pruned_count
+        .saturating_add(incremental.commit_walk_nodes_pruned_count);
+    let aggregate_commit_walk_queue_max_depth = full
+        .commit_walk_queue_max_depth
+        .max(incremental.commit_walk_queue_max_depth);
+    let aggregate_commit_metadata_pending_count = full
+        .commit_metadata_pending_count
+        .saturating_add(incremental.commit_metadata_pending_count);
+    let aggregate_commit_window_jit_hydrated_rows = full
+        .commit_window_jit_hydrated_rows
+        .saturating_add(incremental.commit_window_jit_hydrated_rows);
+    let aggregate_query_commit_window_prewarm_hydrated_rows = full
+        .query_commit_window_prewarm_hydrated_rows
+        .saturating_add(incremental.query_commit_window_prewarm_hydrated_rows);
+    let aggregate_incremental_csr_streaming_mode_effective = if full
+        .incremental_csr_streaming_mode_effective
+        == incremental.incremental_csr_streaming_mode_effective
+    {
+        full.incremental_csr_streaming_mode_effective.as_str()
+    } else {
+        "mixed"
+    };
     let aggregate_commit_walk_ms = full.commit_walk_ms + incremental.commit_walk_ms;
     let aggregate_commit_upsert_ms = full.commit_upsert_ms + incremental.commit_upsert_ms;
+    let aggregate_commit_write_wave_txn_count = full
+        .commit_write_wave_txn_count
+        .saturating_add(incremental.commit_write_wave_txn_count);
+    let aggregate_commit_write_wave_batch_median = if aggregate_commit_write_wave_txn_count == 0 {
+        0.0
+    } else {
+        ((full.commit_write_wave_batch_median * full.commit_write_wave_txn_count as f64)
+            + (incremental.commit_write_wave_batch_median
+                * incremental.commit_write_wave_txn_count as f64))
+            / aggregate_commit_write_wave_txn_count as f64
+    };
+    let aggregate_commit_ingest_queue_max_depth = full
+        .commit_ingest_queue_max_depth
+        .max(incremental.commit_ingest_queue_max_depth);
+    let aggregate_commit_ingest_queue_wait_ms =
+        full.commit_ingest_queue_wait_ms + incremental.commit_ingest_queue_wait_ms;
+    let aggregate_commit_csr_delta_apply_ms =
+        full.commit_csr_delta_apply_ms + incremental.commit_csr_delta_apply_ms;
+    let aggregate_commit_csr_overlay_upsert_ms =
+        full.commit_csr_overlay_upsert_ms + incremental.commit_csr_overlay_upsert_ms;
+    let aggregate_commit_csr_compaction_ms =
+        full.commit_csr_compaction_ms + incremental.commit_csr_compaction_ms;
     let aggregate_file_diff_extract_ms =
         full.file_diff_extract_ms + incremental.file_diff_extract_ms;
     let aggregate_file_change_upsert_ms =
@@ -1215,6 +1298,10 @@ fn format_report(input: &ReportInput<'_>) -> String {
         duration_ms(input.query_benchmark)
     ));
     lines.push(format!(
+        "query_commit_window_jit_hydrated_rows: {}",
+        input.commit_window_jit_hydrated_rows
+    ));
+    lines.push(format!(
         "in_memory_graph_hydration: {:.3}",
         duration_ms(input.in_memory_graph_hydration)
     ));
@@ -1275,12 +1362,125 @@ fn format_report(input: &ReportInput<'_>) -> String {
         incremental.ms_per_commit_seen
     ));
     lines.push(format!(
+        "full_planner_session_id: {}",
+        input.full_stats.planner_session_id
+    ));
+    lines.push(format!(
+        "incremental_planner_session_id: {}",
+        input.incremental_stats.planner_session_id
+    ));
+    lines.push(format!(
+        "full_planner_requested_mode: {}",
+        input.full_stats.planner_requested_mode.as_str()
+    ));
+    lines.push(format!(
+        "incremental_planner_requested_mode: {}",
+        input.incremental_stats.planner_requested_mode.as_str()
+    ));
+    lines.push(format!(
+        "full_planner_effective_mode: {}",
+        input.full_stats.planner_effective_mode.as_str()
+    ));
+    lines.push(format!(
+        "incremental_planner_effective_mode: {}",
+        input.incremental_stats.planner_effective_mode.as_str()
+    ));
+    lines.push(format!(
+        "full_planner_checkpoint_trusted: {}",
+        input.full_stats.planner_checkpoint_trusted
+    ));
+    lines.push(format!(
+        "incremental_planner_checkpoint_trusted: {}",
+        input.incremental_stats.planner_checkpoint_trusted
+    ));
+    lines.push(format!(
+        "full_planner_risk_level: {}",
+        input.full_stats.planner_risk_level.as_str()
+    ));
+    lines.push(format!(
+        "incremental_planner_risk_level: {}",
+        input.incremental_stats.planner_risk_level.as_str()
+    ));
+    lines.push(format!(
+        "full_planner_degraded_policy: {}",
+        input.full_stats.planner_degraded_policy.as_str()
+    ));
+    lines.push(format!(
+        "incremental_planner_degraded_policy: {}",
+        input.incremental_stats.planner_degraded_policy.as_str()
+    ));
+    lines.push(format!(
+        "full_planner_trace_count: {}",
+        input.full_stats.planner_trace_count
+    ));
+    lines.push(format!(
+        "incremental_planner_trace_count: {}",
+        input.incremental_stats.planner_trace_count
+    ));
+    lines.push(format!(
+        "aggregate_planner_trace_count: {}",
+        input
+            .full_stats
+            .planner_trace_count
+            .saturating_add(input.incremental_stats.planner_trace_count)
+    ));
+    lines.push(format!(
+        "full_lmdb_effective_map_size_bytes: {}",
+        input.full_stats.lmdb_effective_map_size_bytes
+    ));
+    lines.push(format!(
+        "incremental_lmdb_effective_map_size_bytes: {}",
+        input.incremental_stats.lmdb_effective_map_size_bytes
+    ));
+    lines.push(format!(
+        "full_lmdb_runtime_flags: no_readahead={} write_map={} map_async={} no_mem_init={}",
+        input.full_stats.lmdb_no_readahead,
+        input.full_stats.lmdb_write_map,
+        input.full_stats.lmdb_map_async,
+        input.full_stats.lmdb_no_mem_init
+    ));
+    lines.push(format!(
+        "incremental_lmdb_runtime_flags: no_readahead={} write_map={} map_async={} no_mem_init={}",
+        input.incremental_stats.lmdb_no_readahead,
+        input.incremental_stats.lmdb_write_map,
+        input.incremental_stats.lmdb_map_async,
+        input.incremental_stats.lmdb_no_mem_init
+    ));
+    lines.push(format!(
         "full_commit_walk_scope: {}",
         full.commit_walk_scope
     ));
     lines.push(format!(
         "incremental_commit_walk_scope: {}",
         incremental.commit_walk_scope
+    ));
+    lines.push(format!(
+        "full_incremental_csr_streaming_mode_effective: {}",
+        full.incremental_csr_streaming_mode_effective
+    ));
+    lines.push(format!(
+        "incremental_incremental_csr_streaming_mode_effective: {}",
+        incremental.incremental_csr_streaming_mode_effective
+    ));
+    lines.push(format!(
+        "aggregate_incremental_csr_streaming_mode_effective: {}",
+        aggregate_incremental_csr_streaming_mode_effective
+    ));
+    lines.push(format!(
+        "full_commit_walk_backend_effective: {}",
+        full.commit_walk_backend_effective
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_backend_effective: {}",
+        incremental.commit_walk_backend_effective
+    ));
+    lines.push(format!(
+        "full_commit_walk_sort_effective: {}",
+        full.commit_walk_sort_effective
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_sort_effective: {}",
+        incremental.commit_walk_sort_effective
     ));
     lines.push(format!(
         "full_commit_walk_tip_count: {}",
@@ -1307,6 +1507,330 @@ fn format_report(input: &ReportInput<'_>) -> String {
         "aggregate_commit_walk_pruned_parent_expansions: {}",
         full.commit_walk_pruned_parent_expansions
             .saturating_add(incremental.commit_walk_pruned_parent_expansions)
+    ));
+    lines.push(format!(
+        "full_commit_walk_total_ms: {:.3}",
+        full.commit_walk_total_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_total_ms: {:.3}",
+        incremental.commit_walk_total_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_total_ms: {:.3}",
+        aggregate_commit_walk_total_ms
+    ));
+    lines.push(format!(
+        "full_commit_callback_ms: {:.3}",
+        full.commit_callback_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_callback_ms: {:.3}",
+        incremental.commit_callback_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_callback_ms: {:.3}",
+        aggregate_commit_callback_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_decode_ms: {:.3}",
+        full.commit_walk_decode_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_decode_ms: {:.3}",
+        incremental.commit_walk_decode_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_decode_ms: {:.3}",
+        aggregate_commit_walk_decode_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_parent_resolve_ms: {:.3}",
+        full.commit_walk_parent_resolve_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_parent_resolve_ms: {:.3}",
+        incremental.commit_walk_parent_resolve_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_parent_resolve_ms: {:.3}",
+        aggregate_commit_walk_parent_resolve_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_metadata_parse_ms: {:.3}",
+        full.commit_walk_metadata_parse_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_metadata_parse_ms: {:.3}",
+        incremental.commit_walk_metadata_parse_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_metadata_parse_ms: {:.3}",
+        aggregate_commit_walk_metadata_parse_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_tip_collection_ms: {:.3}",
+        full.commit_walk_tip_collection_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_tip_collection_ms: {:.3}",
+        incremental.commit_walk_tip_collection_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_tip_collection_ms: {:.3}",
+        aggregate_commit_walk_tip_collection_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_hide_expansion_ms: {:.3}",
+        full.commit_walk_hide_expansion_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_hide_expansion_ms: {:.3}",
+        incremental.commit_walk_hide_expansion_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_hide_expansion_ms: {:.3}",
+        aggregate_commit_walk_hide_expansion_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_graph_lookup_ms: {:.3}",
+        full.commit_walk_graph_lookup_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_graph_lookup_ms: {:.3}",
+        incremental.commit_walk_graph_lookup_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_graph_lookup_ms: {:.3}",
+        aggregate_commit_walk_graph_lookup_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_ordering_ms: {:.3}",
+        full.commit_walk_ordering_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_ordering_ms: {:.3}",
+        incremental.commit_walk_ordering_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_ordering_ms: {:.3}",
+        aggregate_commit_walk_ordering_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_emit_ms: {:.3}",
+        full.commit_walk_emit_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_emit_ms: {:.3}",
+        incremental.commit_walk_emit_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_emit_ms: {:.3}",
+        aggregate_commit_walk_emit_ms
+    ));
+    lines.push(format!(
+        "full_commit_walk_graph_lookup_hit_count: {}",
+        full.commit_walk_graph_lookup_hit_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_graph_lookup_hit_count: {}",
+        incremental.commit_walk_graph_lookup_hit_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_graph_lookup_hit_count: {}",
+        aggregate_commit_walk_graph_lookup_hit_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_graph_lookup_miss_count: {}",
+        full.commit_walk_graph_lookup_miss_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_graph_lookup_miss_count: {}",
+        incremental.commit_walk_graph_lookup_miss_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_graph_lookup_miss_count: {}",
+        aggregate_commit_walk_graph_lookup_miss_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_graph_fallback_count: {}",
+        full.commit_walk_graph_fallback_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_graph_fallback_count: {}",
+        incremental.commit_walk_graph_fallback_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_graph_fallback_count: {}",
+        aggregate_commit_walk_graph_fallback_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_graph_partial_fallback_count: {}",
+        full.commit_walk_graph_partial_fallback_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_graph_partial_fallback_count: {}",
+        incremental.commit_walk_graph_partial_fallback_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_graph_partial_fallback_count: {}",
+        aggregate_commit_walk_graph_partial_fallback_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_nodes_seen_count: {}",
+        full.commit_walk_nodes_seen_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_nodes_seen_count: {}",
+        incremental.commit_walk_nodes_seen_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_nodes_seen_count: {}",
+        aggregate_commit_walk_nodes_seen_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_nodes_pruned_count: {}",
+        full.commit_walk_nodes_pruned_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_nodes_pruned_count: {}",
+        incremental.commit_walk_nodes_pruned_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_nodes_pruned_count: {}",
+        aggregate_commit_walk_nodes_pruned_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_queue_max_depth: {}",
+        full.commit_walk_queue_max_depth
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_queue_max_depth: {}",
+        incremental.commit_walk_queue_max_depth
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_queue_max_depth: {}",
+        aggregate_commit_walk_queue_max_depth
+    ));
+    lines.push(format!(
+        "full_commit_metadata_pending_count: {}",
+        full.commit_metadata_pending_count
+    ));
+    lines.push(format!(
+        "incremental_commit_metadata_pending_count: {}",
+        incremental.commit_metadata_pending_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_metadata_pending_count: {}",
+        aggregate_commit_metadata_pending_count
+    ));
+    lines.push(format!(
+        "full_commit_window_jit_hydrated_rows: {}",
+        full.commit_window_jit_hydrated_rows
+    ));
+    lines.push(format!(
+        "incremental_commit_window_jit_hydrated_rows: {}",
+        incremental.commit_window_jit_hydrated_rows
+    ));
+    lines.push(format!(
+        "aggregate_commit_window_jit_hydrated_rows: {}",
+        aggregate_commit_window_jit_hydrated_rows
+    ));
+    lines.push(format!(
+        "full_query_commit_window_prewarm_hydrated_rows: {}",
+        full.query_commit_window_prewarm_hydrated_rows
+    ));
+    lines.push(format!(
+        "incremental_query_commit_window_prewarm_hydrated_rows: {}",
+        incremental.query_commit_window_prewarm_hydrated_rows
+    ));
+    lines.push(format!(
+        "aggregate_query_commit_window_prewarm_hydrated_rows: {}",
+        aggregate_query_commit_window_prewarm_hydrated_rows
+    ));
+    lines.push(format!(
+        "full_commit_write_wave_txn_count: {}",
+        full.commit_write_wave_txn_count
+    ));
+    lines.push(format!(
+        "incremental_commit_write_wave_txn_count: {}",
+        incremental.commit_write_wave_txn_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_write_wave_txn_count: {}",
+        aggregate_commit_write_wave_txn_count
+    ));
+    lines.push(format!(
+        "full_commit_write_wave_batch_median: {:.3}",
+        full.commit_write_wave_batch_median
+    ));
+    lines.push(format!(
+        "incremental_commit_write_wave_batch_median: {:.3}",
+        incremental.commit_write_wave_batch_median
+    ));
+    lines.push(format!(
+        "aggregate_commit_write_wave_batch_median: {:.3}",
+        aggregate_commit_write_wave_batch_median
+    ));
+    lines.push(format!(
+        "full_commit_ingest_queue_max_depth: {}",
+        full.commit_ingest_queue_max_depth
+    ));
+    lines.push(format!(
+        "incremental_commit_ingest_queue_max_depth: {}",
+        incremental.commit_ingest_queue_max_depth
+    ));
+    lines.push(format!(
+        "aggregate_commit_ingest_queue_max_depth: {}",
+        aggregate_commit_ingest_queue_max_depth
+    ));
+    lines.push(format!(
+        "full_commit_ingest_queue_wait_ms: {:.3}",
+        full.commit_ingest_queue_wait_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_ingest_queue_wait_ms: {:.3}",
+        incremental.commit_ingest_queue_wait_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_ingest_queue_wait_ms: {:.3}",
+        aggregate_commit_ingest_queue_wait_ms
+    ));
+    lines.push(format!(
+        "full_commit_csr_delta_apply_ms: {:.3}",
+        full.commit_csr_delta_apply_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_csr_delta_apply_ms: {:.3}",
+        incremental.commit_csr_delta_apply_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_csr_delta_apply_ms: {:.3}",
+        aggregate_commit_csr_delta_apply_ms
+    ));
+    lines.push(format!(
+        "full_commit_csr_overlay_upsert_ms: {:.3}",
+        full.commit_csr_overlay_upsert_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_csr_overlay_upsert_ms: {:.3}",
+        incremental.commit_csr_overlay_upsert_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_csr_overlay_upsert_ms: {:.3}",
+        aggregate_commit_csr_overlay_upsert_ms
+    ));
+    lines.push(format!(
+        "full_commit_csr_compaction_ms: {:.3}",
+        full.commit_csr_compaction_ms
+    ));
+    lines.push(format!(
+        "incremental_commit_csr_compaction_ms: {:.3}",
+        incremental.commit_csr_compaction_ms
+    ));
+    lines.push(format!(
+        "aggregate_commit_csr_compaction_ms: {:.3}",
+        aggregate_commit_csr_compaction_ms
     ));
     lines.push(format!(
         "full_commit_walk_commits_per_sec: {:.3}",
@@ -1439,6 +1963,280 @@ fn format_report(input: &ReportInput<'_>) -> String {
                 .incremental_stats
                 .ingestion_phase_timing_ms
                 .commit_walk
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_total_ms: {:.3}",
+        input.full_stats.ingestion_phase_timing_ms.commit_walk_total
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_total
+    ));
+    lines.push(format!(
+        "ingest_commit_callback_ms: {:.3}",
+        input.full_stats.ingestion_phase_timing_ms.commit_callback
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_callback
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_decode_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_decode
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_decode
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_parent_resolve_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_parent_resolve
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_parent_resolve
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_metadata_parse_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_metadata_parse
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_metadata_parse
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_tip_collection_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_tip_collection
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_tip_collection
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_hide_expansion_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_hide_expansion
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_hide_expansion
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_graph_lookup_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_graph_lookup
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_graph_lookup
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_ordering_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_ordering
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_ordering
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_emit_ms: {:.3}",
+        input.full_stats.ingestion_phase_timing_ms.commit_walk_emit
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_emit
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_graph_lookup_hit_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_graph_lookup_hit_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_graph_lookup_hit_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_graph_lookup_miss_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_graph_lookup_miss_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_graph_lookup_miss_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_graph_fallback_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_graph_fallback_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_graph_fallback_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_graph_partial_fallback_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_graph_partial_fallback_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_graph_partial_fallback_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_nodes_seen_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_nodes_seen_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_nodes_seen_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_nodes_pruned_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_nodes_pruned_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_nodes_pruned_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_queue_max_depth: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_queue_max_depth
+            .max(
+                input
+                    .incremental_stats
+                    .ingestion_phase_timing_ms
+                    .commit_walk_queue_max_depth,
+            )
+    ));
+    lines.push(format!(
+        "ingest_commit_metadata_pending_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_metadata_pending_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_metadata_pending_count
+    ));
+    lines.push(format!(
+        "ingest_commit_ingest_queue_wait_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_ingest_queue_wait
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_ingest_queue_wait
+    ));
+    lines.push(format!(
+        "ingest_commit_ingest_queue_max_depth: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_ingest_queue_max_depth
+            .max(
+                input
+                    .incremental_stats
+                    .ingestion_phase_timing_ms
+                    .commit_ingest_queue_max_depth,
+            )
+    ));
+    lines.push(format!(
+        "ingest_commit_write_wave_txn_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_write_wave_txn_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_write_wave_txn_count
+    ));
+    lines.push(format!(
+        "ingest_commit_write_wave_batch_median: {:.3}",
+        aggregate_commit_write_wave_batch_median
+    ));
+    lines.push(format!(
+        "ingest_commit_csr_delta_apply_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_csr_delta_apply
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_csr_delta_apply
+    ));
+    lines.push(format!(
+        "ingest_commit_csr_overlay_upsert_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_csr_overlay_upsert
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_csr_overlay_upsert
+    ));
+    lines.push(format!(
+        "ingest_commit_csr_compaction_ms: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_csr_compaction
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_csr_compaction
+    ));
+    lines.push(format!(
+        "ingest_query_commit_window_prewarm_hydrated_rows: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .query_commit_window_prewarm_hydrated_rows
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .query_commit_window_prewarm_hydrated_rows
     ));
     lines.push(format!(
         "ingest_file_diff_extract_ms: {:.3}",

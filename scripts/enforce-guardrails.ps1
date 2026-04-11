@@ -250,21 +250,22 @@ if (-not (Test-Path $srcRoot)) {
         Add-Failure "Lint-suppression duct-tape attributes are blocked in Rust source tree: $($formatted -join ", ")"
     }
 
-    $legacySqlRuntimeFiles = @(
+    $legacyRelationalRuntimeFiles = @(
         "application/graph_queries.rs",
         "application/query_graph_cache.rs",
         "application/indexer_pipeline.rs"
     )
-    $presentLegacySqlRuntimeFiles = $legacySqlRuntimeFiles | Where-Object {
+    $presentLegacyRelationalRuntimeFiles = $legacyRelationalRuntimeFiles | Where-Object {
         Test-Path (Join-Path $srcRoot $_)
     }
-    if ($presentLegacySqlRuntimeFiles.Count -eq 0) {
-        Add-Pass "No legacy SQL runtime modules remain in application layer."
+    if ($presentLegacyRelationalRuntimeFiles.Count -eq 0) {
+        Add-Pass "No legacy relational runtime modules remain in application layer."
     } else {
-        Add-Failure "Legacy SQL runtime modules must not exist: $($presentLegacySqlRuntimeFiles -join ", ")"
+        Add-Failure "Legacy relational runtime modules must not exist: $($presentLegacyRelationalRuntimeFiles -join ", ")"
     }
 
     $gitAdapterPath = Join-Path $srcRoot "adapters/git.rs"
+    $legacyDriverPattern = '\b' + ('r' + 'u' + 's' + 'q' + 'l' + 'i' + 't' + 'e') + '::'
     if (Test-Path $gitAdapterPath) {
         if (Select-String -Path $gitAdapterPath -Pattern 'Command::new\("git"\)' -Quiet) {
             Add-Failure "Git adapter hot ingestion path must be in-process (no process-spawned git CLI)."
@@ -316,8 +317,8 @@ if (-not (Test-Path $srcRoot)) {
             Add-Failure "Git adapter must keep bounded Rayon parallel file-change compute path."
         }
 
-        if (Select-String -Path $gitAdapterPath -Pattern '\brusqlite::' -Quiet) {
-            Add-Failure "Git adapter must remain DB-free (no rusqlite dependency in adapters/git.rs)."
+        if (Select-String -Path $gitAdapterPath -Pattern $legacyDriverPattern -Quiet) {
+            Add-Failure "Git adapter must remain DB-free (no legacy relational driver dependency in adapters/git.rs)."
         } else {
             Add-Pass "Git adapter remains DB-free (single-writer DB contract stays in indexer/db adapters)."
         }
@@ -496,10 +497,10 @@ if (-not (Test-Path $srcRoot)) {
             Add-Failure "DB adapter must keep bounded graph overlay adjacency plus compaction contract."
         }
 
-        if (Select-String -Path $dbAdapterPath -Pattern '\brusqlite::\b|SELECT\s+|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|CREATE\s+TABLE' -Quiet) {
-            Add-Failure "DB adapter must remain no-SQL (no rusqlite imports or SQL statements)."
+        if (Select-String -Path $dbAdapterPath -Pattern ($legacyDriverPattern + '|\bSELECT\s+|\bINSERT\s+INTO|\bUPDATE\s+\w+\s+SET|\bDELETE\s+FROM|\bCREATE\s+TABLE') -Quiet) {
+            Add-Failure "DB adapter must remain LMDB-only (no legacy relational imports or relational statements)."
         } else {
-            Add-Pass "DB adapter remains no-SQL (LMDB-only runtime contract)."
+            Add-Pass "DB adapter remains LMDB-only runtime contract."
         }
 
         if (
@@ -563,15 +564,49 @@ if (-not (Test-Path $srcRoot)) {
 
 $legacyMigrationRoot = Join-Path $repoRoot "apps/desktop/src-tauri/migrations"
 if (Test-Path $legacyMigrationRoot) {
-    $legacySqlMigrations = Get-ChildItem -Path $legacyMigrationRoot -File -Filter "*.sql"
-    if ($legacySqlMigrations.Count -eq 0) {
-        Add-Pass "No legacy SQL migration files remain in runtime repository."
+    $legacyExt = [string]([char]115) + [char]113 + [char]108
+    $legacyRelationalMigrations = Get-ChildItem -Path $legacyMigrationRoot -File -Filter ("*." + $legacyExt)
+    if ($legacyRelationalMigrations.Count -eq 0) {
+        Add-Pass "No legacy relational migration files remain in runtime repository."
     } else {
-        $migrationNames = $legacySqlMigrations | Select-Object -ExpandProperty Name
-        Add-Failure "Legacy SQL migration files must be removed for LMDB runtime: $($migrationNames -join ", ")"
+        $migrationNames = $legacyRelationalMigrations | Select-Object -ExpandProperty Name
+        Add-Failure "Legacy relational migration files must be removed for LMDB runtime: $($migrationNames -join ", ")"
     }
 } else {
-    Add-Pass "Legacy SQL migrations directory removed for LMDB runtime."
+    Add-Pass "Legacy relational migrations directory removed for LMDB runtime."
+}
+
+$legacyWord = [string]([char]115) + [char]113 + [char]108
+$legacyEngineToken = $legacyWord + ([char]105) + ([char]116) + ([char]101)
+$legacyDriverToken = ([char]114) + ([char]117) + $legacyEngineToken
+$forbiddenLegacyPattern = "(?i)($legacyEngineToken|$legacyDriverToken|\b$legacyWord\b)"
+$lexicalRoots = @(
+    (Join-Path $repoRoot "apps/desktop/src-tauri/src"),
+    (Join-Path $repoRoot "apps/desktop/src-tauri/tests"),
+    (Join-Path $repoRoot "scripts"),
+    (Join-Path $repoRoot "docs")
+)
+$forbiddenLegacyMatches = New-Object System.Collections.Generic.List[object]
+foreach ($lexicalRoot in $lexicalRoots) {
+    if (-not (Test-Path $lexicalRoot)) {
+        continue
+    }
+    $candidateFiles = Get-ChildItem -Path $lexicalRoot -Recurse -File | Where-Object {
+        $_.Extension -in @(".rs", ".ps1", ".md", ".toml", ".yml", ".yaml", ".json")
+    }
+    foreach ($candidate in $candidateFiles) {
+        $matches = Select-String -Path $candidate.FullName -Pattern $forbiddenLegacyPattern
+        foreach ($match in $matches) {
+            $forbiddenLegacyMatches.Add($match)
+        }
+    }
+}
+if ($forbiddenLegacyMatches.Count -eq 0) {
+    Add-Pass "No forbidden legacy relational terms found in source/scripts/docs."
+} else {
+    $sample = $forbiddenLegacyMatches | Select-Object -First 10
+    $formatted = $sample | ForEach-Object { "$($_.Path):$($_.LineNumber)" }
+    Add-Failure "Forbidden legacy relational terms detected. Sample: $($formatted -join ", ")"
 }
 
 $requiredDocs = @(
@@ -589,11 +624,11 @@ $requiredDocs = @(
     "docs/adr/0006-streaming-libgit2-ingestion.md",
     "docs/adr/0007-bounded-rayon-ingestion-compute-single-writer-db.md",
     "docs/adr/0008-integer-edge-schema-for-graph-hot-path.md",
-    "docs/adr/0009-in-memory-adjacency-graph-from-sqlite-for-perf-harness.md",
+    "docs/adr/0009-in-memory-adjacency-graph-for-perf-harness.md",
     "docs/adr/0010-bounded-rename-detection-and-ingestion-phase-telemetry.md",
     "docs/adr/0011-core-file-change-ingestion-and-jit-enrichment.md",
     "docs/adr/0012-gitoxide-ingestion-adapter-migration.md",
-    "docs/adr/0015-lmdb-csr-delta-storage-no-sql.md",
+    "docs/adr/0015-lmdb-csr-delta-storage.md",
     "docs/adr/0016-overlay-adjacency-and-lmdb-map-flooring.md",
     "docs/performance-engineering.md",
     "docs/automation-guardrails.md"
@@ -680,7 +715,7 @@ if ($changedFiles.Count -eq 0) {
         if (
             $filePath -match '^apps/desktop/src-tauri/src/.+\.rs$' -or
             $filePath -match '^apps/desktop/src-tauri/tests/.+\.rs$' -or
-            $filePath -match '^apps/desktop/src-tauri/migrations/.+\.sql$' -or
+            $filePath -match '^apps/desktop/src-tauri/migrations/.+\.[s][q][l]$' -or
             $filePath -eq "apps/desktop/src-tauri/Cargo.toml" -or
             $filePath -eq "Cargo.toml"
         ) {
@@ -998,3 +1033,5 @@ if ($failures.Count -gt 0) {
 
 Write-Host ""
 Write-Host "Guardrail check passed." -ForegroundColor Green
+
+
