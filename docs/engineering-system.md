@@ -32,7 +32,7 @@ Repo-level engineering discipline is defined in `docs/standards/`:
 5. No `unwrap`/`expect` in production code (tests explicitly exempted in `clippy.toml`).
 6. Every change passes one command before merge: `.\scripts\quality-gate.ps1`.
 7. Security checks run continuously in CI (dependency audit workflow).
-8. Build artifacts run from `%USERPROFILE%\.cargo-target\gitgraph-lab` (outside OneDrive) to avoid Windows App Control blocks.
+8. Build artifacts run from `D:\cargo-target\gitgraph-lab` on Windows (outside OneDrive) to avoid Windows App Control blocks.
 
 ## Repository Topology
 

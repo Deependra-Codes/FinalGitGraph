@@ -5,7 +5,7 @@
 1. Run `.\scripts\preflight.ps1` once per shell session.
 2. Use `x64` shell by default (`-Arch x64`).
 3. Do not bypass toolchain pinning from `rust-toolchain.toml`.
-4. Keep `CARGO_TARGET_DIR` outside OneDrive (`%USERPROFILE%\.cargo-target\gitgraph-lab` default from scripts).
+4. Keep `CARGO_TARGET_DIR` outside OneDrive (`D:\cargo-target\gitgraph-lab` default on Windows from scripts).
 
 ## Standard Development Loop
 

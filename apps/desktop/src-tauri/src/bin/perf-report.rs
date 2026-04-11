@@ -524,10 +524,36 @@ fn create_fixture_root() -> PerfResult<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("read system time: {error}"))?
         .as_millis();
-    let root = env::temp_dir().join(format!("gitgraph-lab-perf-{millis}"));
+
+    let base_temp_root = env::var_os("GITGRAPH_PERF_TEMP_ROOT")
+        .map(PathBuf::from)
+        .or(preferred_windows_perf_temp_root())
+        .unwrap_or_else(env::temp_dir);
+
+    fs::create_dir_all(&base_temp_root).map_err(|error| {
+        format!(
+            "create perf base temp root {}: {error}",
+            base_temp_root.display()
+        )
+    })?;
+
+    let root = base_temp_root.join(format!("gitgraph-lab-perf-{millis}"));
     fs::create_dir_all(&root)
         .map_err(|error| format!("create fixture root {}: {error}", root.display()))?;
     Ok(root)
+}
+
+#[cfg(target_os = "windows")]
+fn preferred_windows_perf_temp_root() -> Option<PathBuf> {
+    if Path::new(r"D:\").exists() {
+        return Some(PathBuf::from(r"D:\temp\gitgraph-lab"));
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn preferred_windows_perf_temp_root() -> Option<PathBuf> {
+    None
 }
 
 fn remove_database_files(db_path: &Path) -> PerfResult<()> {

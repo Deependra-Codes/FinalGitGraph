@@ -7,10 +7,10 @@ Scope: `topological_parents` hot path (`query_benchmark`) with legacy_relational
 
 Using current local perf artifacts:
 
-1. [tmp/perf-report-25k.txt](C:/Users/deepe/OneDrive/Desktop/finalProject/tmp/perf-report-25k.txt)
-2. [tmp/perf-report-50k.txt](C:/Users/deepe/OneDrive/Desktop/finalProject/tmp/perf-report-50k.txt)
-3. [tmp/perf-report-90k.txt](C:/Users/deepe/OneDrive/Desktop/finalProject/tmp/perf-report-90k.txt)
-4. [tmp/perf-report-250k.txt](C:/Users/deepe/OneDrive/Desktop/finalProject/tmp/perf-report-250k.txt)
+1. [tmp/perf-report-25k.txt](../tmp/perf-report-25k.txt)
+2. [tmp/perf-report-50k.txt](../tmp/perf-report-50k.txt)
+3. [tmp/perf-report-90k.txt](../tmp/perf-report-90k.txt)
+4. [tmp/perf-report-250k.txt](../tmp/perf-report-250k.txt)
 
 Observed `topological_parents` medians:
 
@@ -32,12 +32,12 @@ Conclusion: topological traversal is now a primary query bottleneck at scale.
 
 Topological has two execution lanes:
 
-1. Runtime cache lane (default enabled) in [apps/desktop/src-tauri/src/application/indexer.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/indexer.rs:480)
-2. legacy_relational_engine lane (fallback) in [apps/desktop/src-tauri/src/application/graph_queries.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/graph_queries.rs:462)
+1. Runtime cache lane (default enabled) in [apps/desktop/src-tauri/src/application/indexer.rs](../apps/desktop/src-tauri/src/application/indexer.rs:480)
+2. legacy_relational_engine lane (fallback) in [apps/desktop/src-tauri/src/application/graph_queries.rs](../apps/desktop/src-tauri/src/application/graph_queries.rs:462)
 
-The in-memory lane also uses a Kahn-style topo phase with hash maps + BTreeSet in [apps/desktop/src-tauri/src/application/query_graph_cache.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/query_graph_cache.rs:428).
+The in-memory lane also uses a Kahn-style topo phase with hash maps + BTreeSet in [apps/desktop/src-tauri/src/application/query_graph_cache.rs](../apps/desktop/src-tauri/src/application/query_graph_cache.rs:428).
 
-Important: default behavior is cache-enabled (`GITGRAPH_QUERY_RUNTIME_CACHE` defaults to true) at [apps/desktop/src-tauri/src/application/indexer.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/indexer.rs:535).
+Important: default behavior is cache-enabled (`GITGRAPH_QUERY_RUNTIME_CACHE` defaults to true) at [apps/desktop/src-tauri/src/application/indexer.rs](../apps/desktop/src-tauri/src/application/indexer.rs:535).
 
 ## 3. Research-backed principles
 
@@ -66,8 +66,8 @@ Important: default behavior is cache-enabled (`GITGRAPH_QUERY_RUNTIME_CACHE` def
 
 Target files:
 
-1. [apps/desktop/src-tauri/src/application/query_graph_cache.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/query_graph_cache.rs)
-2. [apps/desktop/src-tauri/src/application/graph_queries.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/graph_queries.rs)
+1. [apps/desktop/src-tauri/src/application/query_graph_cache.rs](../apps/desktop/src-tauri/src/application/query_graph_cache.rs)
+2. [apps/desktop/src-tauri/src/application/graph_queries.rs](../apps/desktop/src-tauri/src/application/graph_queries.rs)
 
 Actions:
 
@@ -85,8 +85,8 @@ Why this is valid:
 
 Target files:
 
-1. [apps/desktop/src-tauri/src/application/graph_queries.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/application/graph_queries.rs)
-2. [apps/desktop/src-tauri/src/adapters/db.rs](C:/Users/deepe/OneDrive/Desktop/finalProject/apps/desktop/src-tauri/src/adapters/db.rs)
+1. [apps/desktop/src-tauri/src/application/graph_queries.rs](../apps/desktop/src-tauri/src/application/graph_queries.rs)
+2. [apps/desktop/src-tauri/src/adapters/db.rs](../apps/desktop/src-tauri/src/adapters/db.rs)
 
 Actions:
 
@@ -120,5 +120,6 @@ For `250k` profile:
 1. No Windows workflow breakage.
 2. No mandatory Linux-only benchmarking requirement for local dev.
 3. No unsafe Rust introduction.
+
 
 

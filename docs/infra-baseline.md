@@ -15,7 +15,7 @@ Keep local setup simple and deterministic from day one for a critical project.
 5. Keep a repeatable preflight command to verify environment readiness.
 6. Enforce code quality in CI from start (`fmt`, `clippy`, `check`, `test`).
 7. Maintain an explicit Phase 0 engineering system (`docs/engineering-system.md`) with ADR workflow.
-8. Set `CARGO_TARGET_DIR` outside OneDrive path to avoid Windows App Control execution blocks (`os error 4551`).
+8. Set `CARGO_TARGET_DIR` to `D:\cargo-target\gitgraph-lab` on Windows (outside OneDrive) to avoid Windows App Control execution blocks (`os error 4551`).
 9. Keep a Docker Linux quality-gate fallback for policy-restricted Windows hosts.
 10. Expose one-command developer gate via `scripts/dev-loop.ps1`.
 

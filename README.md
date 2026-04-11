@@ -45,7 +45,7 @@ Use x86 mode if needed:
 . .\scripts\enter-vs-dev-shell.ps1 -Arch x86
 ```
 
-This script also sets `CARGO_TARGET_DIR` to `%USERPROFILE%\.cargo-target\gitgraph-lab` to avoid App Control/OneDrive execution blocks (`os error 4551`).
+This script also sets `CARGO_TARGET_DIR` to `D:\cargo-target\gitgraph-lab` on Windows (and keeps artifacts off OneDrive) to avoid App Control execution blocks (`os error 4551`).
 
 ## Preflight Check
 
