@@ -2,7 +2,8 @@
 param(
     [ValidateSet("docker", "host")]
     [string]$BackendMode = "docker",
-    [switch]$Fast
+    [switch]$Fast,
+    [string]$WindowsDataRoot = "D:\docker-data\gitgraph-lab"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,9 +13,9 @@ Push-Location $repoRoot
 try {
     if ($BackendMode -eq "docker") {
         if ($Fast) {
-            & "$PSScriptRoot\quality-gate-docker.ps1" -Fast
+            & "$PSScriptRoot\quality-gate-docker.ps1" -Fast -WindowsDataRoot $WindowsDataRoot
         } else {
-            & "$PSScriptRoot\quality-gate-docker.ps1"
+            & "$PSScriptRoot\quality-gate-docker.ps1" -WindowsDataRoot $WindowsDataRoot
         }
         exit $LASTEXITCODE
     }

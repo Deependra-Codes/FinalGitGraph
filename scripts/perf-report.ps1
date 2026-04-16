@@ -14,6 +14,7 @@ param(
     [switch]$KeepFixture,
     [switch]$EnableLsmRocksdb,
     [string]$LibclangPath = "",
+    [string]$WindowsDockerDataRoot = "D:\docker-data\gitgraph-lab",
     [switch]$ProbeOnly
 )
 
@@ -41,6 +42,9 @@ if ($env:OS -eq "Windows_NT") {
     if (-not (Test-Path "D:\")) {
         throw "D: drive is required on Windows for this script."
     }
+    if ($repoRootPath -notmatch '^[dD]:\\') {
+        throw ("Repository root must be on D: drive. Received: {0}" -f $repoRootPath)
+    }
     $preferredTempRoot = "D:\temp\gitgraph-lab"
     if (-not (Test-Path $preferredTempRoot)) {
         New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
@@ -59,6 +63,9 @@ if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null
 }
+if ($env:OS -eq "Windows_NT" -and $CargoTargetRoot -notmatch '^[dD]:\\') {
+    throw ("Cargo target root must be on D: drive. Received: {0}" -f $CargoTargetRoot)
+}
 $env:CARGO_TARGET_DIR = $CargoTargetRoot
 
 function Normalize-AbsolutePath {
@@ -70,6 +77,60 @@ function Normalize-AbsolutePath {
 
     $absolute = [System.IO.Path]::GetFullPath($PathValue)
     return $absolute.TrimEnd('\', '/')
+}
+
+function Assert-WindowsPathOnDDrive {
+    param(
+        [string]$PathValue,
+        [string]$Label
+    )
+
+    $normalized = Normalize-AbsolutePath -PathValue $PathValue
+    if ($normalized -notmatch '^[dD]:\\') {
+        throw ("{0} must be on D: drive. Received: {1}" -f $Label, $normalized)
+    }
+}
+
+function Get-DockerVolumeArgs {
+    param(
+        [string]$RepoRootPath,
+        [string]$WindowsDataRootPath
+    )
+
+    if ($env:OS -eq "Windows_NT") {
+        Assert-WindowsPathOnDDrive -PathValue $RepoRootPath -Label "Repository root"
+        Assert-WindowsPathOnDDrive -PathValue $WindowsDataRootPath -Label "Docker data root"
+
+        $cacheRoot = Normalize-AbsolutePath -PathValue $WindowsDataRootPath
+        $registryRoot = Join-Path $cacheRoot "cargo-registry"
+        $cargoGitRoot = Join-Path $cacheRoot "cargo-git"
+        $rustupRoot = Join-Path $cacheRoot "rustup"
+        $targetRoot = Join-Path $cacheRoot "cargo-target"
+        $tempRoot = Join-Path $cacheRoot "cargo-temp"
+
+        foreach ($dir in @($cacheRoot, $registryRoot, $cargoGitRoot, $rustupRoot, $targetRoot, $tempRoot)) {
+            if (-not (Test-Path $dir)) {
+                New-Item -Path $dir -ItemType Directory -Force | Out-Null
+            }
+        }
+
+        return @(
+            "-v", "${RepoRootPath}:/work",
+            "-v", "${registryRoot}:/usr/local/cargo/registry",
+            "-v", "${cargoGitRoot}:/usr/local/cargo/git",
+            "-v", "${rustupRoot}:/usr/local/rustup",
+            "-v", "${targetRoot}:/cargo-target",
+            "-v", "${tempRoot}:/cargo-temp"
+        )
+    }
+
+    return @(
+        "-v", "${RepoRootPath}:/work",
+        "-v", "gitgraph_cargo_registry:/usr/local/cargo/registry",
+        "-v", "gitgraph_cargo_git:/usr/local/cargo/git",
+        "-v", "gitgraph_rustup:/usr/local/rustup",
+        "-v", "gitgraph_target:/cargo-target"
+    )
 }
 
 function Set-CargoTargetRoot {
@@ -203,23 +264,19 @@ function Get-DockerRunArgs {
         }
     }
 
+    $volumeArgs = Get-DockerVolumeArgs -RepoRootPath $RepoRootPath -WindowsDataRootPath $WindowsDockerDataRoot
     $baseArgs = @(
         "run",
         "--rm",
-        "-v",
-        "${RepoRootPath}:/work",
-        "-v",
-        "gitgraph_cargo_registry:/usr/local/cargo/registry",
-        "-v",
-        "gitgraph_cargo_git:/usr/local/cargo/git",
-        "-v",
-        "gitgraph_rustup:/usr/local/rustup",
-        "-v",
-        "gitgraph_target:/cargo-target",
+        "--security-opt",
+        "no-new-privileges:true"
+    ) + $volumeArgs + @(
         "-e",
         "CARGO_TARGET_DIR=/cargo-target",
         "-e",
         "RUSTUP_HOME=/usr/local/rustup",
+        "-e",
+        "TMPDIR=/cargo-temp",
         "-e",
         "PATH=/usr/local/cargo/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     )

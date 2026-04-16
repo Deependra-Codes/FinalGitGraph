@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$repoRootPath = $repoRoot.Path
 $userHome = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
     $env:USERPROFILE
 } elseif (-not [string]::IsNullOrWhiteSpace($env:HOME)) {
@@ -25,6 +26,9 @@ if ($env:OS -eq "Windows_NT") {
     if (-not (Test-Path "D:\")) {
         throw "D: drive is required on Windows for this script."
     }
+    if ($repoRootPath -notmatch '^[dD]:\\') {
+        throw ("Repository root must be on D: drive. Received: {0}" -f $repoRootPath)
+    }
     $preferredTempRoot = "D:\temp\gitgraph-lab"
     if (-not (Test-Path $preferredTempRoot)) {
         New-Item -Path $preferredTempRoot -ItemType Directory -Force | Out-Null
@@ -41,6 +45,9 @@ if ([string]::IsNullOrWhiteSpace($CargoTargetRoot)) {
 }
 if (-not (Test-Path $CargoTargetRoot)) {
     New-Item -Path $CargoTargetRoot -ItemType Directory -Force | Out-Null
+}
+if ($env:OS -eq "Windows_NT" -and $CargoTargetRoot -notmatch '^[dD]:\\') {
+    throw ("Cargo target root must be on D: drive. Received: {0}" -f $CargoTargetRoot)
 }
 $env:CARGO_TARGET_DIR = $CargoTargetRoot
 
