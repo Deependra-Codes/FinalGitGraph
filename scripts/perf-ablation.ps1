@@ -15,7 +15,13 @@ param(
     [switch]$RequireQueryPositive,
     [double]$MinCpsGainVsControlPercent = 15,
     [switch]$CommitWalkResearch90k,
-    [switch]$Resume
+    [switch]$Resume,
+    [int]$CooldownSeconds = -1,
+    [int]$CooldownBetweenRunsSeconds = -1,
+    [double]$CooldownCpuIdleThreshold = 15.0,
+    [double]$CooldownProcPerfMinPercent = 80.0,
+    [int]$CooldownMaxWaitSeconds = 180,
+    [switch]$NoCooldown
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +32,27 @@ if ($CommitWalkResearch90k) {
     if ($WindowLimit -eq 500) { $WindowLimit = 1000 }
     if ($MaxNodes -eq 25000) { $MaxNodes = 90000 }
 }
+
+if ($NoCooldown) {
+    $effectiveCooldownScenario = 0
+    $effectiveCooldownRun = 0
+} else {
+    $effectiveCooldownScenario = if ($CooldownSeconds -ge 0) {
+        $CooldownSeconds
+    } elseif ($CommitWalkResearch90k) {
+        30
+    } else {
+        10
+    }
+    $effectiveCooldownRun = if ($CooldownBetweenRunsSeconds -ge 0) {
+        $CooldownBetweenRunsSeconds
+    } elseif ($CommitWalkResearch90k) {
+        15
+    } else {
+        5
+    }
+}
+$cooldownThrottleEvents = New-Object System.Collections.Generic.List[string]
 
 function Get-ReportValue {
     param(
@@ -89,6 +116,84 @@ function Mode-String {
     }
     $grouped = $Values | Group-Object | Sort-Object -Property Count, Name -Descending
     return $grouped[0].Name
+}
+
+function Get-CpuUsagePercent {
+    try {
+        $sample = (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop).CounterSamples[0].CookedValue
+        return [Math]::Round($sample, 1)
+    }
+    catch {
+        return -1.0
+    }
+}
+
+function Get-ProcessorPerformancePercent {
+    try {
+        $sample = (Get-Counter '\Processor Information(_Total)\% Processor Performance' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop).CounterSamples[0].CookedValue
+        return [Math]::Round($sample, 1)
+    }
+    catch {
+        return -1.0
+    }
+}
+
+function Wait-ForCpuCooldown {
+    param(
+        [int]$FixedSleepSeconds,
+        [string]$PhaseLabel
+    )
+
+    if ($NoCooldown -or $FixedSleepSeconds -le 0) {
+        return
+    }
+
+    Write-Host ("[{0}] cooldown: sleeping {1}s ({2})" -f (Get-Date -Format "HH:mm:ss"), $FixedSleepSeconds, $PhaseLabel)
+    Start-Sleep -Seconds $FixedSleepSeconds
+
+    $waitedExtra = 0
+    $pollInterval = 3
+    $maxExtra = $CooldownMaxWaitSeconds
+
+    while ($waitedExtra -lt $maxExtra) {
+        $cpuUsage = Get-CpuUsagePercent
+        $procPerf = Get-ProcessorPerformancePercent
+
+        $cpuIdle = ($cpuUsage -ge 0 -and $cpuUsage -lt $CooldownCpuIdleThreshold)
+        $procOk = ($procPerf -lt 0 -or $procPerf -ge $CooldownProcPerfMinPercent)
+
+        if ($cpuIdle -and $procOk) {
+            if ($waitedExtra -gt 0) {
+                Write-Host ("[{0}] cooldown: settled after {1}s extra wait (cpu={2}%, perf={3}%)" -f `
+                    (Get-Date -Format "HH:mm:ss"), $waitedExtra, $cpuUsage, $procPerf)
+            }
+            return
+        }
+
+        $reason = ""
+        if (-not $cpuIdle -and $cpuUsage -ge 0) {
+            $reason += ("cpu={0}%>{1}%" -f $cpuUsage, $CooldownCpuIdleThreshold)
+        }
+        if (-not $procOk -and $procPerf -ge 0) {
+            if ($reason.Length -gt 0) { $reason += ", " }
+            $reason += ("proc_perf={0}%<{1}%" -f $procPerf, $CooldownProcPerfMinPercent)
+        }
+
+        if ($waitedExtra -eq 0 -or ($waitedExtra % 15) -eq 0) {
+            Write-Host ("[{0}] cooldown: waiting for system to settle ({1}) [{2}]" -f `
+                (Get-Date -Format "HH:mm:ss"), $reason, $PhaseLabel)
+        }
+
+        Start-Sleep -Seconds $pollInterval
+        $waitedExtra += $pollInterval
+    }
+
+    $cpuUsage = Get-CpuUsagePercent
+    $procPerf = Get-ProcessorPerformancePercent
+    $throttleMsg = ("[{0}] cooldown: max wait {1}s reached, proceeding (cpu={2}%, perf={3}%) [{4}]" -f `
+        (Get-Date -Format "HH:mm:ss"), $maxExtra, $cpuUsage, $procPerf, $PhaseLabel)
+    Write-Host $throttleMsg
+    $cooldownThrottleEvents.Add($throttleMsg)
 }
 
 function Merge-EnvMaps {
@@ -214,6 +319,9 @@ function Invoke-Scenario {
             }
 
             if ($null -eq $metrics) {
+                if ($run -gt 1) {
+                    Wait-ForCpuCooldown -FixedSleepSeconds $effectiveCooldownRun -PhaseLabel ("between-runs {0} run {1}" -f $ScenarioName, $run)
+                }
                 Write-Host ("[{0}] {1} run {2}/{3}" -f (Get-Date -Format "HH:mm:ss"), $ScenarioName, $run, $Runs)
                 if ($CommitWalkResearch90k) {
                     & powershell -ExecutionPolicy Bypass -File "$PSScriptRoot\perf-report.ps1" `
@@ -482,9 +590,14 @@ if (-not [string]::IsNullOrWhiteSpace($OnlyScenario)) {
     $scenariosToRun = $scenarios
 }
 
+$scenarioIndex = 0
 foreach ($scenario in $scenariosToRun) {
-    Write-Host ("Running ablation scenario: {0}" -f $scenario.Name)
+    if ($scenarioIndex -gt 0) {
+        Wait-ForCpuCooldown -FixedSleepSeconds $effectiveCooldownScenario -PhaseLabel ("before-scenario {0}" -f $scenario.Name)
+    }
+    Write-Host ("Running ablation scenario: {0} [{1}/{2}]" -f $scenario.Name, ($scenarioIndex + 1), $scenariosToRun.Count)
     $results.Add((Invoke-Scenario -ScenarioName $scenario.Name -EnvVars $scenario.Env))
+    $scenarioIndex++
 }
 
 $thresholdError = $null
@@ -527,10 +640,19 @@ $workloadLabel = if ($CommitWalkResearch90k) {
     "25k workload"
 }
 
+$cooldownLabel = if ($NoCooldown) {
+    "disabled"
+} else {
+    ("scenario={0}s, run={1}s, cpu_idle<{2}%, proc_perf>={3}%, max_wait={4}s" -f `
+        $effectiveCooldownScenario, $effectiveCooldownRun, `
+        $CooldownCpuIdleThreshold, $CooldownProcPerfMinPercent, $CooldownMaxWaitSeconds)
+}
+
 $lines = @(
     ("# Perf Ablation ({0})" -f $workloadLabel),
     "",
     ("Runs per scenario: {0}" -f $Runs),
+    ("Thermal cooldown: {0}" -f $cooldownLabel),
     "",
     "| Scenario | Aggregate CPS (median) | Full CPS (median) | Query Benchmark ms (median) | In-Memory Query ms (median) | Core End-to-End ms (median) | Bottleneck Phase | Bottleneck ms (median) | Commit Walk ms (median) | Walk Backend (mode) | Walk Sort (mode) | Walk Scope (mode) | Walk Tip Count (median) | Pruned Parent Expansions (median) |",
     "| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: | ---: |"
@@ -732,6 +854,17 @@ if ($CommitWalkResearch90k) {
                     $entry.FailureReason)
             }
         }
+    }
+}
+
+if ($cooldownThrottleEvents.Count -gt 0) {
+    $lines += ""
+    $lines += "## Thermal Throttle Events"
+    $lines += ""
+    $lines += ("**{0} event(s)** where the system did not settle within the max cooldown wait. Results from scenarios following these events may be thermally impacted." -f $cooldownThrottleEvents.Count)
+    $lines += ""
+    foreach ($evt in $cooldownThrottleEvents) {
+        $lines += ("- {0}" -f $evt)
     }
 }
 
