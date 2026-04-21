@@ -1151,6 +1151,31 @@ fn format_report(input: &ReportInput<'_>) -> String {
     let aggregate_commit_metadata_pending_count = full
         .commit_metadata_pending_count
         .saturating_add(incremental.commit_metadata_pending_count);
+    let aggregate_commit_walk_fallback_boundary_effective = if full
+        .commit_walk_fallback_boundary_effective
+        == incremental.commit_walk_fallback_boundary_effective
+    {
+        full.commit_walk_fallback_boundary_effective.as_str()
+    } else {
+        "mixed"
+    };
+    let aggregate_commit_walk_missing_tip_count = full
+        .commit_walk_missing_tip_count
+        .saturating_add(incremental.commit_walk_missing_tip_count);
+    let aggregate_commit_walk_boundary_stop_count = full
+        .commit_walk_boundary_stop_count
+        .saturating_add(incremental.commit_walk_boundary_stop_count);
+    let aggregate_commit_walk_overlap_skip_count = full
+        .commit_walk_overlap_skip_count
+        .saturating_add(incremental.commit_walk_overlap_skip_count);
+    let aggregate_commit_walk_v2_enabled = match (
+        full.commit_walk_v2_enabled,
+        incremental.commit_walk_v2_enabled,
+    ) {
+        (true, true) => "true",
+        (false, false) => "false",
+        _ => "mixed",
+    };
     let aggregate_commit_window_jit_hydrated_rows = full
         .commit_window_jit_hydrated_rows
         .saturating_add(incremental.commit_window_jit_hydrated_rows);
@@ -1509,6 +1534,18 @@ fn format_report(input: &ReportInput<'_>) -> String {
         incremental.commit_walk_sort_effective
     ));
     lines.push(format!(
+        "full_commit_walk_fallback_boundary_effective: {}",
+        full.commit_walk_fallback_boundary_effective
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_fallback_boundary_effective: {}",
+        incremental.commit_walk_fallback_boundary_effective
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_fallback_boundary_effective: {}",
+        aggregate_commit_walk_fallback_boundary_effective
+    ));
+    lines.push(format!(
         "full_commit_walk_tip_count: {}",
         full.commit_walk_tip_count
     ));
@@ -1749,6 +1786,54 @@ fn format_report(input: &ReportInput<'_>) -> String {
     lines.push(format!(
         "aggregate_commit_metadata_pending_count: {}",
         aggregate_commit_metadata_pending_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_missing_tip_count: {}",
+        full.commit_walk_missing_tip_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_missing_tip_count: {}",
+        incremental.commit_walk_missing_tip_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_missing_tip_count: {}",
+        aggregate_commit_walk_missing_tip_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_boundary_stop_count: {}",
+        full.commit_walk_boundary_stop_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_boundary_stop_count: {}",
+        incremental.commit_walk_boundary_stop_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_boundary_stop_count: {}",
+        aggregate_commit_walk_boundary_stop_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_overlap_skip_count: {}",
+        full.commit_walk_overlap_skip_count
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_overlap_skip_count: {}",
+        incremental.commit_walk_overlap_skip_count
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_overlap_skip_count: {}",
+        aggregate_commit_walk_overlap_skip_count
+    ));
+    lines.push(format!(
+        "full_commit_walk_v2_enabled: {}",
+        full.commit_walk_v2_enabled
+    ));
+    lines.push(format!(
+        "incremental_commit_walk_v2_enabled: {}",
+        incremental.commit_walk_v2_enabled
+    ));
+    lines.push(format!(
+        "aggregate_commit_walk_v2_enabled: {}",
+        aggregate_commit_walk_v2_enabled
     ));
     lines.push(format!(
         "full_commit_window_jit_hydrated_rows: {}",
@@ -2182,6 +2267,39 @@ fn format_report(input: &ReportInput<'_>) -> String {
                 .commit_metadata_pending_count
     ));
     lines.push(format!(
+        "ingest_commit_walk_missing_tip_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_missing_tip_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_missing_tip_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_boundary_stop_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_boundary_stop_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_boundary_stop_count
+    ));
+    lines.push(format!(
+        "ingest_commit_walk_overlap_skip_count: {:.3}",
+        input
+            .full_stats
+            .ingestion_phase_timing_ms
+            .commit_walk_overlap_skip_count
+            + input
+                .incremental_stats
+                .ingestion_phase_timing_ms
+                .commit_walk_overlap_skip_count
+    ));
+    lines.push(format!(
         "ingest_commit_ingest_queue_wait_ms: {:.3}",
         input
             .full_stats
@@ -2448,12 +2566,205 @@ fn current_rss_bytes() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitgraph_lab_core::domain::models::{
+        CommitThroughputTelemetry, FileChangeExtractionQueueMetrics, FileChangeStatsStateCounts,
+        IndexingMode, IndexingStats, IngestionPhaseTimingMs,
+    };
+
+    fn test_indexing_stats(
+        mode: IndexingMode,
+        commit_throughput: CommitThroughputTelemetry,
+        ingestion_phase_timing_ms: IngestionPhaseTimingMs,
+    ) -> IndexingStats {
+        IndexingStats {
+            repo_id: 1,
+            mode,
+            planner_session_id: 11,
+            planner_requested_mode: mode,
+            planner_effective_mode: mode,
+            planner_checkpoint_trusted: true,
+            planner_risk_level: Default::default(),
+            planner_degraded_policy: Default::default(),
+            planner_trace_count: 0,
+            lmdb_effective_map_size_bytes: 0,
+            lmdb_no_readahead: false,
+            lmdb_write_map: false,
+            lmdb_map_async: false,
+            lmdb_no_mem_init: false,
+            commits_indexed: commit_throughput.commits_indexed,
+            edges_indexed: 0,
+            file_changes_indexed: 0,
+            file_change_commits_enqueued: 0,
+            file_change_queue_depth_after_index: 0,
+            file_change_queue_oldest_age_seconds: 0,
+            refs_indexed: 0,
+            indexed_at_epoch: 0,
+            commit_walk_total_ms: commit_throughput.commit_walk_total_ms,
+            commit_callback_ms: commit_throughput.commit_callback_ms,
+            commit_walk_decode_ms: commit_throughput.commit_walk_decode_ms,
+            commit_walk_parent_resolve_ms: commit_throughput.commit_walk_parent_resolve_ms,
+            commit_walk_metadata_parse_ms: commit_throughput.commit_walk_metadata_parse_ms,
+            commit_walk_tip_collection_ms: commit_throughput.commit_walk_tip_collection_ms,
+            commit_walk_hide_expansion_ms: commit_throughput.commit_walk_hide_expansion_ms,
+            commit_walk_graph_lookup_ms: commit_throughput.commit_walk_graph_lookup_ms,
+            commit_walk_ordering_ms: commit_throughput.commit_walk_ordering_ms,
+            commit_walk_emit_ms: commit_throughput.commit_walk_emit_ms,
+            commit_walk_graph_lookup_hit_count: commit_throughput
+                .commit_walk_graph_lookup_hit_count,
+            commit_walk_graph_lookup_miss_count: commit_throughput
+                .commit_walk_graph_lookup_miss_count,
+            commit_walk_graph_fallback_count: commit_throughput.commit_walk_graph_fallback_count,
+            commit_walk_graph_partial_fallback_count: commit_throughput
+                .commit_walk_graph_partial_fallback_count,
+            commit_walk_nodes_seen_count: commit_throughput.commit_walk_nodes_seen_count,
+            commit_walk_nodes_pruned_count: commit_throughput.commit_walk_nodes_pruned_count,
+            commit_walk_queue_max_depth: commit_throughput.commit_walk_queue_max_depth,
+            commit_metadata_pending_count: commit_throughput.commit_metadata_pending_count,
+            commit_walk_fallback_boundary_effective: commit_throughput
+                .commit_walk_fallback_boundary_effective
+                .clone(),
+            commit_walk_missing_tip_count: commit_throughput.commit_walk_missing_tip_count,
+            commit_walk_boundary_stop_count: commit_throughput.commit_walk_boundary_stop_count,
+            commit_walk_overlap_skip_count: commit_throughput.commit_walk_overlap_skip_count,
+            commit_walk_v2_enabled: commit_throughput.commit_walk_v2_enabled,
+            commit_window_jit_hydrated_rows: commit_throughput.commit_window_jit_hydrated_rows,
+            query_commit_window_prewarm_hydrated_rows: commit_throughput
+                .query_commit_window_prewarm_hydrated_rows,
+            incremental_csr_streaming_mode_effective: commit_throughput
+                .incremental_csr_streaming_mode_effective
+                .clone(),
+            commit_write_wave_txn_count: commit_throughput.commit_write_wave_txn_count,
+            commit_write_wave_batch_median: commit_throughput.commit_write_wave_batch_median,
+            commit_ingest_queue_max_depth: commit_throughput.commit_ingest_queue_max_depth,
+            commit_ingest_queue_wait_ms: commit_throughput.commit_ingest_queue_wait_ms,
+            commit_csr_delta_apply_ms: commit_throughput.commit_csr_delta_apply_ms,
+            commit_csr_overlay_upsert_ms: commit_throughput.commit_csr_overlay_upsert_ms,
+            commit_csr_compaction_ms: commit_throughput.commit_csr_compaction_ms,
+            ingestion_phase_timing_ms,
+            commit_throughput,
+        }
+    }
 
     fn count_lines_with_prefix(stream: &str, prefix: &str) -> usize {
         stream
             .lines()
             .filter(|line| line.starts_with(prefix))
             .count()
+    }
+
+    #[test]
+    fn report_includes_boundary_telemetry_keys() {
+        let config = Config::default();
+        let full = test_indexing_stats(
+            IndexingMode::Full,
+            CommitThroughputTelemetry {
+                commits_seen: 4,
+                commits_indexed: 4,
+                end_to_end_ms: 100.0,
+                commits_per_sec_seen: 40.0,
+                commits_per_sec_indexed: 40.0,
+                ms_per_commit_seen: 25.0,
+                ms_per_commit_indexed: 25.0,
+                commit_walk_scope: "frontier".to_string(),
+                commit_walk_backend_effective: "commit_graph_fast_path".to_string(),
+                commit_walk_sort_effective: "commit_time_newest (auto)".to_string(),
+                commit_walk_tip_count: 2,
+                commit_walk_total_ms: 10.0,
+                commit_walk_ms: 8.0,
+                commit_walk_commits_per_sec_seen: 50.0,
+                commit_walk_fallback_boundary_effective: "checkpoint_only".to_string(),
+                commit_walk_missing_tip_count: 1,
+                commit_walk_boundary_stop_count: 2,
+                commit_walk_overlap_skip_count: 0,
+                commit_walk_v2_enabled: true,
+                incremental_csr_streaming_mode_effective: "enabled".to_string(),
+                bottleneck_phase: "commit_walk".to_string(),
+                ..Default::default()
+            },
+            IngestionPhaseTimingMs {
+                commit_walk_missing_tip_count: 1.0,
+                commit_walk_boundary_stop_count: 2.0,
+                commit_walk_overlap_skip_count: 0.0,
+                ..Default::default()
+            },
+        );
+        let incremental = test_indexing_stats(
+            IndexingMode::Incremental,
+            CommitThroughputTelemetry {
+                commits_seen: 1,
+                commits_indexed: 1,
+                end_to_end_ms: 50.0,
+                commits_per_sec_seen: 20.0,
+                commits_per_sec_indexed: 20.0,
+                ms_per_commit_seen: 50.0,
+                ms_per_commit_indexed: 50.0,
+                commit_walk_scope: "frontier".to_string(),
+                commit_walk_backend_effective: "pack_aware".to_string(),
+                commit_walk_sort_effective: "commit_time_newest (auto)".to_string(),
+                commit_walk_tip_count: 1,
+                commit_walk_total_ms: 5.0,
+                commit_walk_ms: 4.0,
+                commit_walk_commits_per_sec_seen: 25.0,
+                commit_walk_fallback_boundary_effective: "checkpoint_only".to_string(),
+                commit_walk_missing_tip_count: 3,
+                commit_walk_boundary_stop_count: 4,
+                commit_walk_overlap_skip_count: 5,
+                commit_walk_v2_enabled: true,
+                incremental_csr_streaming_mode_effective: "enabled".to_string(),
+                bottleneck_phase: "commit_walk".to_string(),
+                ..Default::default()
+            },
+            IngestionPhaseTimingMs {
+                commit_walk_missing_tip_count: 3.0,
+                commit_walk_boundary_stop_count: 4.0,
+                commit_walk_overlap_skip_count: 5.0,
+                ..Default::default()
+            },
+        );
+        let fixture = FixtureSummary {
+            root_sha: "root".to_string(),
+            pre_merge_main_sha: "pre-merge".to_string(),
+            feature_tip_sha: "feature".to_string(),
+            head_sha: "head".to_string(),
+        };
+        let report_input = ReportInput {
+            fixture_root: Path::new("fixture"),
+            fixture_before_incremental: &fixture,
+            fixture_after_incremental: &fixture,
+            config: &config,
+            counts: (0, 0, 0),
+            stats_state_counts: &FileChangeStatsStateCounts::default(),
+            extraction_queue: &FileChangeExtractionQueueMetrics::default(),
+            full_stats: &full,
+            incremental_stats: &incremental,
+            fixture_generation: Duration::ZERO,
+            full_index: Duration::ZERO,
+            incremental_index: Duration::ZERO,
+            query_benchmark: Duration::ZERO,
+            commit_window_jit_hydrated_rows: 0,
+            in_memory_graph_hydration: Duration::ZERO,
+            in_memory_query_benchmark: Duration::ZERO,
+            in_memory_adjacency_query_latency_ms: Default::default(),
+            file_change_extraction_drain: Duration::ZERO,
+            jit_file_change_enrichment: Duration::ZERO,
+            fixture_build_telemetry: FixtureBuildTelemetry::default(),
+            incremental_append_telemetry: FixtureBuildTelemetry::default(),
+            core_end_to_end: Duration::ZERO,
+            fixture_generation_rss: None,
+            final_rss: None,
+            peak_rss: None,
+            commit_throughput_per_sec: 0.0,
+        };
+
+        let report = format_report(&report_input);
+        assert!(report.contains("full_commit_walk_fallback_boundary_effective: checkpoint_only"));
+        assert!(report.contains("aggregate_commit_walk_missing_tip_count: 4"));
+        assert!(report.contains("aggregate_commit_walk_boundary_stop_count: 6"));
+        assert!(report.contains("aggregate_commit_walk_overlap_skip_count: 5"));
+        assert!(report.contains("aggregate_commit_walk_v2_enabled: true"));
+        assert!(report.contains("ingest_commit_walk_missing_tip_count: 4.000"));
+        assert!(report.contains("ingest_commit_walk_boundary_stop_count: 6.000"));
+        assert!(report.contains("ingest_commit_walk_overlap_skip_count: 5.000"));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use gitgraph_lab_core::adapters::db::open_store;
+use gitgraph_lab_core::adapters::git::stream_commits_with_hide;
 use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, enrich_pending_file_change_stats, get_commit_window,
     get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
@@ -14,6 +15,7 @@ use tempfile::TempDir;
 const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
 const COMMIT_WALK_SCOPE_ENV: &str = "GITGRAPH_COMMIT_WALK_SCOPE";
 const COMMIT_WALK_SORT_ENV: &str = "GITGRAPH_COMMIT_WALK_SORT";
+const COMMIT_WALK_BOUNDARY_V2_ENV: &str = "GITGRAPH_COMMIT_WALK_BOUNDARY_V2";
 const INDEX_FAST_MODE_ENV: &str = "GITGRAPH_INDEX_FAST_MODE";
 
 #[test]
@@ -459,6 +461,93 @@ fn commit_walk_scope_frontier_excludes_tag_and_remote_only_refs_until_all_refs_o
     assert_eq!(
         full_all_refs_second.commits_indexed, expected_all_refs_count,
         "expected deterministic non-duplicate commit indexing across repeated all_refs full runs"
+    );
+}
+
+#[test]
+fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _fast_mode_guard = EnvVarGuard::set(INDEX_FAST_MODE_ENV, "1");
+    let _boundary_guard = EnvVarGuard::set(COMMIT_WALK_BOUNDARY_V2_ENV, "1");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _strict_mode_guard = EnvVarGuard::set(FILE_CHANGE_SYNC_STRICT_ENV, "0");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+
+    let checkpoint_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+    run_git(&repo_dir, &["tag", "graph-anchor"]);
+    run_git(&repo_dir, &["repack", "-ad"]);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+    append_commit(&repo_dir, "incremental-partial-fallback");
+    let head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let mut walked_shas = Vec::new();
+    let walk_stats =
+        stream_commits_with_hide(&repo_dir, None, Some(checkpoint_sha.as_str()), |commit| {
+            walked_shas.push(commit.sha);
+            Ok(())
+        })
+        .unwrap_or_else(|error| panic!("direct commit walk: {error}"));
+    assert_eq!(walked_shas, vec![head_sha]);
+    assert_eq!(walk_stats.backend_effective, "commit_graph_fast_path");
+    assert_eq!(walk_stats.fallback_boundary_effective, "checkpoint_only");
+    assert!(
+        walk_stats.missing_tip_count >= 1,
+        "expected the fresh head to miss the stale commit-graph and trigger fallback"
+    );
+    assert!(
+        walk_stats.boundary_stop_count >= 1,
+        "expected checkpoint boundary stops to short-circuit parent expansion"
+    );
+    assert_eq!(walk_stats.overlap_skip_count, 0);
+    assert!(
+        walk_stats.graph_partial_fallback_count >= 1,
+        "expected commit-graph traversal to contribute before missing-tip fallback"
+    );
+}
+
+#[test]
+fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_graph() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _fast_mode_guard = EnvVarGuard::set(INDEX_FAST_MODE_ENV, "1");
+    let _boundary_guard = EnvVarGuard::set(COMMIT_WALK_BOUNDARY_V2_ENV, "1");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _strict_mode_guard = EnvVarGuard::set(FILE_CHANGE_SYNC_STRICT_ENV, "0");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+
+    run_git(&repo_dir, &["tag", "graph-anchor"]);
+    run_git(&repo_dir, &["repack", "-ad"]);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+    append_commit(&repo_dir, "checkpoint-not-in-graph");
+    let checkpoint_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+    append_commit(&repo_dir, "incremental-missing-graph-boundary");
+    let head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+
+    let mut walked_shas = Vec::new();
+    let walk_stats =
+        stream_commits_with_hide(&repo_dir, None, Some(checkpoint_sha.as_str()), |commit| {
+            walked_shas.push(commit.sha);
+            Ok(())
+        })
+        .unwrap_or_else(|error| panic!("direct missing-boundary commit walk: {error}"));
+    assert_eq!(walked_shas, vec![head_sha]);
+    assert_eq!(walk_stats.backend_effective, "pack_aware");
+    assert_eq!(walk_stats.fallback_boundary_effective, "legacy_hide");
+    assert_eq!(walk_stats.missing_tip_count, 0);
+    assert_eq!(walk_stats.boundary_stop_count, 0);
+    assert_eq!(walk_stats.overlap_skip_count, 0);
+    assert!(
+        walk_stats.graph_fallback_count >= 1,
+        "expected safe pack-aware fallback when checkpoint is absent from commit-graph"
+    );
+    assert!(
+        walk_stats.graph_lookup_miss_count >= 1,
+        "expected commit-graph lookup miss to explain the fallback"
     );
 }
 

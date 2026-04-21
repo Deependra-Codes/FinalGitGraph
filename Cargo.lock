@@ -331,6 +331,7 @@ dependencies = [
  "memory-stats",
  "rayon",
  "serde",
+ "smallvec",
  "tempfile",
  "thiserror 1.0.69",
 ]

@@ -84,6 +84,9 @@ struct IngestionPhaseTiming {
     commit_walk_nodes_pruned_count: usize,
     commit_walk_queue_max_depth: usize,
     commit_metadata_pending_count: usize,
+    commit_walk_missing_tip_count: usize,
+    commit_walk_boundary_stop_count: usize,
+    commit_walk_overlap_skip_count: usize,
     commit_upsert: Duration,
     edge_materialize: Duration,
     file_diff_extract: Duration,
@@ -196,6 +199,7 @@ struct CommitWalkTelemetryContext<'a> {
     scope: &'a str,
     backend_effective: &'a str,
     sort_effective: &'a str,
+    fallback_boundary_effective: &'a str,
     tip_count: usize,
     pruned_parent_expansions: usize,
     decode: Duration,
@@ -214,6 +218,10 @@ struct CommitWalkTelemetryContext<'a> {
     nodes_pruned_count: usize,
     queue_max_depth: usize,
     metadata_pending_count: usize,
+    missing_tip_count: usize,
+    boundary_stop_count: usize,
+    overlap_skip_count: usize,
+    v2_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -253,6 +261,9 @@ impl IngestionPhaseTiming {
             commit_walk_nodes_pruned_count: self.commit_walk_nodes_pruned_count as f64,
             commit_walk_queue_max_depth: self.commit_walk_queue_max_depth as f64,
             commit_metadata_pending_count: self.commit_metadata_pending_count as f64,
+            commit_walk_missing_tip_count: self.commit_walk_missing_tip_count as f64,
+            commit_walk_boundary_stop_count: self.commit_walk_boundary_stop_count as f64,
+            commit_walk_overlap_skip_count: self.commit_walk_overlap_skip_count as f64,
             commit_upsert: duration_ms(self.commit_upsert),
             edge_materialize: duration_ms(self.edge_materialize),
             file_diff_extract: duration_ms(self.file_diff_extract),
@@ -556,6 +567,9 @@ impl Indexer {
         ingestion_timing.commit_walk_nodes_pruned_count = commit_walk_stats.nodes_pruned_count;
         ingestion_timing.commit_walk_queue_max_depth = commit_walk_stats.queue_max_depth;
         ingestion_timing.commit_metadata_pending_count = commit_walk_stats.metadata_pending_count;
+        ingestion_timing.commit_walk_missing_tip_count = commit_walk_stats.missing_tip_count;
+        ingestion_timing.commit_walk_boundary_stop_count = commit_walk_stats.boundary_stop_count;
+        ingestion_timing.commit_walk_overlap_skip_count = commit_walk_stats.overlap_skip_count;
         ingestion_timing.commit_upsert = ingestion_timing
             .commit_upsert
             .saturating_add(commit_writer_stats.commit_upsert);
@@ -771,6 +785,11 @@ impl Indexer {
             nodes_pruned_count: commit_walk_stats.nodes_pruned_count,
             queue_max_depth: commit_walk_stats.queue_max_depth,
             metadata_pending_count: commit_walk_stats.metadata_pending_count,
+            fallback_boundary_effective: commit_walk_stats.fallback_boundary_effective.as_str(),
+            missing_tip_count: commit_walk_stats.missing_tip_count,
+            boundary_stop_count: commit_walk_stats.boundary_stop_count,
+            overlap_skip_count: commit_walk_stats.overlap_skip_count,
+            v2_enabled: commit_walk_stats.v2_enabled,
         };
         let commit_throughput = build_commit_throughput_telemetry(
             &planner_telemetry,
@@ -827,6 +846,13 @@ impl Indexer {
             commit_walk_nodes_pruned_count: ingestion_timing.commit_walk_nodes_pruned_count,
             commit_walk_queue_max_depth: ingestion_timing.commit_walk_queue_max_depth,
             commit_metadata_pending_count: ingestion_timing.commit_metadata_pending_count,
+            commit_walk_fallback_boundary_effective: commit_walk_telemetry
+                .fallback_boundary_effective
+                .to_string(),
+            commit_walk_missing_tip_count: ingestion_timing.commit_walk_missing_tip_count,
+            commit_walk_boundary_stop_count: ingestion_timing.commit_walk_boundary_stop_count,
+            commit_walk_overlap_skip_count: ingestion_timing.commit_walk_overlap_skip_count,
+            commit_walk_v2_enabled: commit_walk_telemetry.v2_enabled,
             commit_window_jit_hydrated_rows: 0,
             query_commit_window_prewarm_hydrated_rows,
             incremental_csr_streaming_mode_effective: streaming_mode_telemetry
@@ -1565,6 +1591,13 @@ fn build_commit_throughput_telemetry(
         commit_walk_nodes_pruned_count: commit_walk.nodes_pruned_count,
         commit_walk_queue_max_depth: commit_walk.queue_max_depth,
         commit_metadata_pending_count: commit_walk.metadata_pending_count,
+        commit_walk_fallback_boundary_effective: commit_walk
+            .fallback_boundary_effective
+            .to_string(),
+        commit_walk_missing_tip_count: commit_walk.missing_tip_count,
+        commit_walk_boundary_stop_count: commit_walk.boundary_stop_count,
+        commit_walk_overlap_skip_count: commit_walk.overlap_skip_count,
+        commit_walk_v2_enabled: commit_walk.v2_enabled,
         commit_window_jit_hydrated_rows: 0,
         query_commit_window_prewarm_hydrated_rows: ingestion_timing
             .query_commit_window_prewarm_hydrated_rows,
