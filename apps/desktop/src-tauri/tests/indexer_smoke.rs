@@ -506,6 +506,18 @@ fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
         walk_stats.graph_partial_fallback_count >= 1,
         "expected commit-graph traversal to contribute before missing-tip fallback"
     );
+    assert!(
+        walk_stats.tape_enabled,
+        "expected pack-aware fallback to report tape-backed traversal"
+    );
+    assert!(
+        walk_stats.tape_node_count >= 1,
+        "expected tape build to include at least the missing-tip frontier"
+    );
+    assert!(
+        walk_stats.tape_parent_edges >= 1,
+        "expected tape build to resolve at least one parent edge"
+    );
 }
 
 #[test]
@@ -548,6 +560,18 @@ fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_g
     assert!(
         walk_stats.graph_lookup_miss_count >= 1,
         "expected commit-graph lookup miss to explain the fallback"
+    );
+    assert!(
+        walk_stats.tape_enabled,
+        "expected direct pack-aware traversal to report tape-backed execution"
+    );
+    assert!(
+        walk_stats.tape_node_count >= 1,
+        "expected direct pack-aware traversal to build a non-empty tape"
+    );
+    assert!(
+        walk_stats.tape_parent_edges >= 1,
+        "expected direct pack-aware traversal to translate parent edges once"
     );
 }
 

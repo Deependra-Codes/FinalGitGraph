@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{hash_map::Entry, BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -20,6 +21,7 @@ use gix_pack::data::entry::Header as PackEntryHeader;
 use gix_pack::data::File as PackDataFile;
 use gix_pack::index::File as PackIndexFile;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::domain::models::{
@@ -160,6 +162,10 @@ struct CommitWalkPhaseTiming {
     graph_lookup: Duration,
     ordering: Duration,
     emit: Duration,
+    pack_inflate: Duration,
+    pack_base_resolve: Duration,
+    pack_parse: Duration,
+    tape_build: Duration,
     graph_lookup_hit_count: usize,
     graph_lookup_miss_count: usize,
     graph_fallback_count: usize,
@@ -171,6 +177,8 @@ struct CommitWalkPhaseTiming {
     missing_tip_count: usize,
     boundary_stop_count: usize,
     overlap_skip_count: usize,
+    tape_node_count: usize,
+    tape_parent_edges: usize,
 }
 
 impl CommitWalkPhaseTiming {
@@ -183,6 +191,12 @@ impl CommitWalkPhaseTiming {
         self.graph_lookup = self.graph_lookup.saturating_add(other.graph_lookup);
         self.ordering = self.ordering.saturating_add(other.ordering);
         self.emit = self.emit.saturating_add(other.emit);
+        self.pack_inflate = self.pack_inflate.saturating_add(other.pack_inflate);
+        self.pack_base_resolve = self
+            .pack_base_resolve
+            .saturating_add(other.pack_base_resolve);
+        self.pack_parse = self.pack_parse.saturating_add(other.pack_parse);
+        self.tape_build = self.tape_build.saturating_add(other.tape_build);
         self.graph_lookup_hit_count = self
             .graph_lookup_hit_count
             .saturating_add(other.graph_lookup_hit_count);
@@ -212,6 +226,10 @@ impl CommitWalkPhaseTiming {
         self.overlap_skip_count = self
             .overlap_skip_count
             .saturating_add(other.overlap_skip_count);
+        self.tape_node_count = self.tape_node_count.saturating_add(other.tape_node_count);
+        self.tape_parent_edges = self
+            .tape_parent_edges
+            .saturating_add(other.tape_parent_edges);
     }
 }
 
@@ -221,6 +239,7 @@ struct CommitWalkOutcome {
     boundary_effective: CommitWalkBoundaryMode,
     pruned_parent_expansions: usize,
     phase_timing: CommitWalkPhaseTiming,
+    tape_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +294,10 @@ pub struct CommitWalkExecutionStats {
     pub graph_lookup: Duration,
     pub ordering: Duration,
     pub emit: Duration,
+    pub pack_inflate: Duration,
+    pub pack_base_resolve: Duration,
+    pub pack_parse: Duration,
+    pub tape_build: Duration,
     pub graph_lookup_hit_count: usize,
     pub graph_lookup_miss_count: usize,
     pub graph_fallback_count: usize,
@@ -286,7 +309,10 @@ pub struct CommitWalkExecutionStats {
     pub missing_tip_count: usize,
     pub boundary_stop_count: usize,
     pub overlap_skip_count: usize,
+    pub tape_node_count: usize,
+    pub tape_parent_edges: usize,
     pub v2_enabled: bool,
+    pub tape_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -437,23 +463,47 @@ struct PackTraversalFingerprint {
 }
 
 type PackAwareParentIds = SmallVec<[ObjectId; 2]>;
+type PackAwareTapePosition = u32;
+type PackAwareTapeParentPositions = SmallVec<[PackAwareTapePosition; 2]>;
+type FastObjectIdMap<T> = FxHashMap<ObjectId, T>;
+type FastObjectIdSet = FxHashSet<ObjectId>;
+type FastStringSet = FxHashSet<String>;
 
 #[derive(Debug, Clone)]
 struct PackAwareCommitRecord {
-    oid: ObjectId,
     tree_id: Option<ObjectId>,
     parent_ids: PackAwareParentIds,
     committer_time: i64,
 }
 
-impl PackAwareCommitRecord {
-    fn to_pending_parsed_commit(&self) -> ParsedCommit {
+#[derive(Debug, Clone)]
+struct PackAwareTapeNode {
+    oid: ObjectId,
+    sha: String,
+    tree_id: Option<ObjectId>,
+    committer_time: i64,
+    parent_positions: PackAwareTapeParentPositions,
+}
+
+impl PackAwareTapeNode {
+    fn placeholder(oid: ObjectId) -> Self {
+        Self {
+            sha: oid.to_string(),
+            oid,
+            tree_id: None,
+            committer_time: 0,
+            parent_positions: PackAwareTapeParentPositions::new(),
+        }
+    }
+
+    fn to_pending_parsed_commit(&self, tape: &PackAwareTraversalTape) -> ParsedCommit {
         ParsedCommit {
-            sha: self.oid.to_string(),
+            sha: self.sha.clone(),
             parents: self
-                .parent_ids
+                .parent_positions
                 .iter()
-                .map(|parent| parent.to_string())
+                .filter_map(|position| tape.nodes.get(*position as usize))
+                .map(|parent| parent.sha.clone())
                 .collect(),
             tree_sha: self
                 .tree_id
@@ -469,12 +519,47 @@ impl PackAwareCommitRecord {
     }
 }
 
+#[derive(Debug, Default)]
+struct PackAwareTraversalTape {
+    nodes: Vec<PackAwareTapeNode>,
+    positions_by_oid: FastObjectIdMap<PackAwareTapePosition>,
+    parent_edge_count: usize,
+}
+
+impl PackAwareTraversalTape {
+    fn ensure_position(&mut self, oid: ObjectId) -> PackAwareTapePosition {
+        if let Some(position) = self.positions_by_oid.get(&oid).copied() {
+            return position;
+        }
+        let position = PackAwareTapePosition::try_from(self.nodes.len()).unwrap_or(u32::MAX);
+        self.nodes.push(PackAwareTapeNode::placeholder(oid));
+        self.positions_by_oid.insert(oid, position);
+        position
+    }
+}
+
+struct PackAwareTapeBuildResult {
+    tape: PackAwareTraversalTape,
+    emit_positions: Vec<PackAwareTapePosition>,
+    pruned_parent_expansions: usize,
+}
+
+struct PackAwareTapeBuildContext<'a> {
+    repo: &'a Repository,
+    walk: CommitWalkContext<'a>,
+    hidden: &'a FastObjectIdSet,
+    boundary_oid: Option<ObjectId>,
+    frontier_since_epoch: Option<i64>,
+    pack_state: &'a mut PackAwareTraversalState,
+    phase_timing: &'a mut CommitWalkPhaseTiming,
+}
+
 #[derive(Debug, Clone)]
 struct CachedPackTraversalMetadata {
     fingerprint: PackTraversalFingerprint,
     total_objects: usize,
     pack_paths: Vec<(PathBuf, PathBuf)>,
-    object_locations: HashMap<ObjectId, PackObjectLocation>,
+    object_locations: FastObjectIdMap<PackObjectLocation>,
 }
 
 #[derive(Debug, Default)]
@@ -484,9 +569,9 @@ struct PackTraversalMetadataCache {
 
 struct PackAwareTraversalState {
     packs: Vec<PackBundle>,
-    object_locations: HashMap<ObjectId, PackObjectLocation>,
-    commit_cache: HashMap<ObjectId, PackAwareCommitRecord>,
-    missing_commits: HashSet<ObjectId>,
+    object_locations: FastObjectIdMap<PackObjectLocation>,
+    commit_cache: FastObjectIdMap<PackAwareCommitRecord>,
+    missing_commits: FastObjectIdSet,
     decode_buffer: Vec<u8>,
     decode_inflate: gix::features::zlib::Inflate,
 }
@@ -535,16 +620,68 @@ impl PositionBitmap {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+struct DenseBitmap {
+    words: Vec<u64>,
+}
+
+impl DenseBitmap {
+    fn mark(&mut self, index: usize) -> bool {
+        let word_index = index / u64::BITS as usize;
+        let bit_mask = 1u64 << (index % u64::BITS as usize);
+        if word_index >= self.words.len() {
+            self.words.resize(word_index + 1, 0);
+        }
+        if self.words[word_index] & bit_mask == 0 {
+            self.words[word_index] |= bit_mask;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommitGraphQueueEntry {
     committer_time: i64,
     position: gix::commitgraph::Position,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PackAwareQueueEntry {
-    committer_time: i64,
-    oid: ObjectId,
+enum PackAwareTraversalFrontier {
+    BreadthFirst(VecDeque<PackAwareTapePosition>),
+    DepthFirst(Vec<PackAwareTapePosition>),
+}
+
+impl PackAwareTraversalFrontier {
+    fn new(sort_mode: CommitWalkSortMode, tips: Vec<PackAwareTapePosition>) -> Self {
+        match sort_mode {
+            CommitWalkSortMode::BreadthFirst => Self::BreadthFirst(tips.into_iter().collect()),
+            CommitWalkSortMode::CommitTimeNewest | CommitWalkSortMode::CommitTimeCutoff => {
+                Self::DepthFirst(tips)
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<PackAwareTapePosition> {
+        match self {
+            Self::BreadthFirst(queue) => queue.pop_front(),
+            Self::DepthFirst(stack) => stack.pop(),
+        }
+    }
+
+    fn push_many(&mut self, positions: impl IntoIterator<Item = PackAwareTapePosition>) {
+        match self {
+            Self::BreadthFirst(queue) => queue.extend(positions),
+            Self::DepthFirst(stack) => stack.extend(positions),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::BreadthFirst(queue) => queue.len(),
+            Self::DepthFirst(stack) => stack.len(),
+        }
+    }
 }
 
 impl Ord for CommitGraphQueueEntry {
@@ -669,6 +806,10 @@ fn walk_commits(
             graph_lookup: Duration::ZERO,
             ordering: Duration::ZERO,
             emit: Duration::ZERO,
+            pack_inflate: Duration::ZERO,
+            pack_base_resolve: Duration::ZERO,
+            pack_parse: Duration::ZERO,
+            tape_build: Duration::ZERO,
             graph_lookup_hit_count: 0,
             graph_lookup_miss_count: 0,
             graph_fallback_count: 0,
@@ -680,7 +821,10 @@ fn walk_commits(
             missing_tip_count: 0,
             boundary_stop_count: 0,
             overlap_skip_count: 0,
+            tape_node_count: 0,
+            tape_parent_edges: 0,
             v2_enabled: walk_context.boundary_mode.v2_enabled(),
+            tape_enabled: false,
         });
     }
 
@@ -715,6 +859,10 @@ fn walk_commits(
         graph_lookup: outcome.phase_timing.graph_lookup,
         ordering: outcome.phase_timing.ordering,
         emit: outcome.phase_timing.emit,
+        pack_inflate: outcome.phase_timing.pack_inflate,
+        pack_base_resolve: outcome.phase_timing.pack_base_resolve,
+        pack_parse: outcome.phase_timing.pack_parse,
+        tape_build: outcome.phase_timing.tape_build,
         graph_lookup_hit_count: outcome.phase_timing.graph_lookup_hit_count,
         graph_lookup_miss_count: outcome.phase_timing.graph_lookup_miss_count,
         graph_fallback_count: outcome.phase_timing.graph_fallback_count,
@@ -726,7 +874,10 @@ fn walk_commits(
         missing_tip_count: outcome.phase_timing.missing_tip_count,
         boundary_stop_count: outcome.phase_timing.boundary_stop_count,
         overlap_skip_count: outcome.phase_timing.overlap_skip_count,
+        tape_node_count: outcome.phase_timing.tape_node_count,
+        tape_parent_edges: outcome.phase_timing.tape_parent_edges,
         v2_enabled: outcome.boundary_effective.v2_enabled(),
+        tape_enabled: outcome.tape_enabled,
     })
 }
 
@@ -741,7 +892,7 @@ fn walk_commits_pack_aware_wired(
     let mut full_fallback_context = context;
     if let Some(graph) = load_commit_graph_cached(repo)? {
         graph_attempted = true;
-        let mut emitted_shas = HashSet::new();
+        let mut emitted_shas = FastStringSet::default();
         if let Some(graph_result) = walk_commits_from_commit_graph(
             graph.as_ref(),
             tips.clone(),
@@ -754,7 +905,10 @@ fn walk_commits_pack_aware_wired(
             }
 
             let mut missing_tips = Vec::with_capacity(graph_result.missing_tips.len());
-            let mut seen_missing_tips = HashSet::with_capacity(graph_result.missing_tips.len());
+            let mut seen_missing_tips = FastObjectIdSet::with_capacity_and_hasher(
+                graph_result.missing_tips.len(),
+                Default::default(),
+            );
             for tip in graph_result.missing_tips {
                 if seen_missing_tips.insert(tip) {
                     missing_tips.push(tip);
@@ -812,6 +966,8 @@ fn walk_commits_pack_aware_wired(
                     boundary_effective,
                     pruned_parent_expansions,
                     phase_timing,
+                    tape_enabled: graph_result.outcome.tape_enabled
+                        || fallback_outcome.tape_enabled,
                 });
             }
 
@@ -821,6 +977,7 @@ fn walk_commits_pack_aware_wired(
                 boundary_effective,
                 pruned_parent_expansions,
                 phase_timing,
+                tape_enabled: fallback_outcome.tape_enabled,
             });
         }
 
@@ -862,6 +1019,7 @@ fn walk_commits_pack_aware_wired(
         boundary_effective: full_fallback_context.boundary_mode,
         pruned_parent_expansions,
         phase_timing,
+        tape_enabled: true,
     })
 }
 
@@ -878,6 +1036,7 @@ fn walk_commits_from_missing_tips(
             boundary_effective: context.boundary_mode,
             pruned_parent_expansions: 0,
             phase_timing: CommitWalkPhaseTiming::default(),
+            tape_enabled: false,
         });
     }
 
@@ -890,6 +1049,7 @@ fn walk_commits_from_missing_tips(
                 boundary_effective: context.boundary_mode,
                 pruned_parent_expansions,
                 phase_timing,
+                tape_enabled: true,
             });
         }
     }
@@ -960,6 +1120,7 @@ fn walk_commits_revision(
         boundary_effective: context.boundary_mode,
         pruned_parent_expansions: 0,
         phase_timing,
+        tape_enabled: false,
     })
 }
 
@@ -971,7 +1132,7 @@ fn walk_commits_from_pack_frontier(
     on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
 ) -> AppResult<(usize, CommitWalkPhaseTiming)> {
     let mut phase_timing = CommitWalkPhaseTiming::default();
-    let mut hidden = HashSet::new();
+    let mut hidden = FastObjectIdSet::default();
     let boundary_oid = if context.boundary_mode == CommitWalkBoundaryMode::CheckpointOnly {
         context
             .hide_ancestor_sha
@@ -1000,159 +1161,184 @@ fn walk_commits_from_pack_frontier(
                 .saturating_add(hide_started.elapsed());
         }
     }
+    let frontier_since_epoch = if context.walk_scope == CommitWalkScope::Frontier {
+        context.since_epoch
+    } else {
+        None
+    };
+    let PackAwareTapeBuildResult {
+        tape,
+        mut emit_positions,
+        pruned_parent_expansions,
+    } = build_pack_aware_walk_tape(
+        PackAwareTapeBuildContext {
+            repo,
+            walk: context,
+            hidden: &hidden,
+            boundary_oid,
+            frontier_since_epoch,
+            pack_state,
+            phase_timing: &mut phase_timing,
+        },
+        tips,
+    )?;
 
-    let mut pruned_parent_expansions = 0usize;
-    if context.sort_mode == CommitWalkSortMode::BreadthFirst {
-        let mut queue: VecDeque<ObjectId> = tips.into_iter().collect();
-        let mut emitted = HashSet::new();
-        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
-        while let Some(oid) = queue.pop_front() {
-            if !emitted.insert(oid) || hidden.contains(&oid) {
-                continue;
-            }
-            phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
-            let parent_resolve_started = Instant::now();
-            let Some(commit) =
-                load_pack_aware_commit_cached(repo, pack_state, &oid, &mut phase_timing)?
-            else {
-                phase_timing.parent_resolve = phase_timing
-                    .parent_resolve
-                    .saturating_add(parent_resolve_started.elapsed());
-                continue;
-            };
-            if boundary_oid
-                .as_ref()
-                .is_some_and(|boundary| *boundary == oid)
-            {
-                pruned_parent_expansions =
-                    pruned_parent_expansions.saturating_add(commit.parent_ids.len());
-                phase_timing.boundary_stop_count =
-                    phase_timing.boundary_stop_count.saturating_add(1);
-                phase_timing.parent_resolve = phase_timing
-                    .parent_resolve
-                    .saturating_add(parent_resolve_started.elapsed());
-                continue;
-            }
-            let under_since_cutoff = context
-                .since_epoch
-                .map(|since| commit.committer_time < since)
-                .unwrap_or(false);
-            if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
-                pruned_parent_expansions =
-                    pruned_parent_expansions.saturating_add(commit.parent_ids.len());
-                phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
-                phase_timing.parent_resolve = phase_timing
-                    .parent_resolve
-                    .saturating_add(parent_resolve_started.elapsed());
-                continue;
-            }
-            queue.extend(commit.parent_ids.iter().copied());
-            phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
-            phase_timing.parent_resolve = phase_timing
-                .parent_resolve
-                .saturating_add(parent_resolve_started.elapsed());
-            if context
-                .since_epoch
-                .map(|since| commit.committer_time >= since)
-                .unwrap_or(true)
-            {
-                phase_timing.metadata_pending_count =
-                    phase_timing.metadata_pending_count.saturating_add(1);
-                let emit_started = Instant::now();
-                on_commit(commit.to_pending_parsed_commit())?;
-                phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
-            }
-        }
-        return Ok((pruned_parent_expansions, phase_timing));
+    if context.sort_mode != CommitWalkSortMode::BreadthFirst {
+        let ordering_started = Instant::now();
+        emit_positions.sort_unstable_by(|left, right| {
+            let left_node = &tape.nodes[*left as usize];
+            let right_node = &tape.nodes[*right as usize];
+            right_node
+                .committer_time
+                .cmp(&left_node.committer_time)
+                .then_with(|| right_node.oid.cmp(&left_node.oid))
+        });
+        phase_timing.ordering = phase_timing
+            .ordering
+            .saturating_add(ordering_started.elapsed());
     }
 
-    let mut reachable = Vec::new();
-    let mut seen = HashSet::new();
-    let mut stack = tips.clone();
-    phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(stack.len());
-    while let Some(oid) = stack.pop() {
-        if !seen.insert(oid) || hidden.contains(&oid) {
-            continue;
-        }
-        phase_timing.nodes_seen_count = phase_timing.nodes_seen_count.saturating_add(1);
-        let parent_resolve_started = Instant::now();
-        let Some(commit) =
-            load_pack_aware_commit_cached(repo, pack_state, &oid, &mut phase_timing)?
-        else {
-            phase_timing.parent_resolve = phase_timing
-                .parent_resolve
-                .saturating_add(parent_resolve_started.elapsed());
-            continue;
-        };
-        if boundary_oid
-            .as_ref()
-            .is_some_and(|boundary| *boundary == oid)
-        {
-            pruned_parent_expansions =
-                pruned_parent_expansions.saturating_add(commit.parent_ids.len());
-            phase_timing.boundary_stop_count = phase_timing.boundary_stop_count.saturating_add(1);
-            phase_timing.parent_resolve = phase_timing
-                .parent_resolve
-                .saturating_add(parent_resolve_started.elapsed());
-            continue;
-        }
-        let under_since_cutoff = context
-            .since_epoch
-            .map(|since| commit.committer_time < since)
-            .unwrap_or(false);
-        if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
-            pruned_parent_expansions =
-                pruned_parent_expansions.saturating_add(commit.parent_ids.len());
-            phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
-            phase_timing.parent_resolve = phase_timing
-                .parent_resolve
-                .saturating_add(parent_resolve_started.elapsed());
-            continue;
-        }
-        stack.extend(commit.parent_ids.iter().copied());
-        phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(stack.len());
-        if context
-            .since_epoch
-            .map(|since| commit.committer_time >= since)
-            .unwrap_or(true)
-        {
-            reachable.push(PackAwareQueueEntry {
-                oid,
-                committer_time: commit.committer_time,
-            });
-        }
-        phase_timing.parent_resolve = phase_timing
-            .parent_resolve
-            .saturating_add(parent_resolve_started.elapsed());
-    }
-
-    let ordering_started = Instant::now();
-    reachable.sort_unstable_by(|left, right| {
-        right
-            .committer_time
-            .cmp(&left.committer_time)
-            .then_with(|| right.oid.cmp(&left.oid))
-    });
-    phase_timing.ordering = phase_timing
-        .ordering
-        .saturating_add(ordering_started.elapsed());
-    for entry in reachable {
-        let Some(commit) = pack_state.commit_cache.get(&entry.oid) else {
+    for position in emit_positions {
+        let Some(commit) = tape.nodes.get(position as usize) else {
             continue;
         };
         phase_timing.metadata_pending_count = phase_timing.metadata_pending_count.saturating_add(1);
         let emit_started = Instant::now();
-        on_commit(commit.to_pending_parsed_commit())?;
+        on_commit(commit.to_pending_parsed_commit(&tape))?;
         phase_timing.emit = phase_timing.emit.saturating_add(emit_started.elapsed());
     }
     Ok((pruned_parent_expansions, phase_timing))
+}
+
+fn build_pack_aware_walk_tape(
+    build: PackAwareTapeBuildContext<'_>,
+    tips: Vec<ObjectId>,
+) -> AppResult<PackAwareTapeBuildResult> {
+    let tape_build_started = Instant::now();
+    let mut tape = PackAwareTraversalTape::default();
+    let tip_positions = tips
+        .into_iter()
+        .map(|tip| tape.ensure_position(tip))
+        .collect::<Vec<_>>();
+    let mut frontier = PackAwareTraversalFrontier::new(build.walk.sort_mode, tip_positions);
+    let mut seen = DenseBitmap::default();
+    let mut emit_positions = Vec::new();
+    let mut pruned_parent_expansions = 0usize;
+    build.phase_timing.queue_max_depth = build.phase_timing.queue_max_depth.max(frontier.len());
+
+    while let Some(position) = frontier.pop() {
+        if !seen.mark(position as usize) {
+            continue;
+        }
+
+        let oid = tape.nodes[position as usize].oid;
+        if !build.hidden.is_empty() && build.hidden.contains(&oid) {
+            continue;
+        }
+
+        build.phase_timing.nodes_seen_count = build.phase_timing.nodes_seen_count.saturating_add(1);
+        let parent_resolve_started = Instant::now();
+        let (tree_id, committer_time, parent_positions) = {
+            let Some(commit) = load_pack_aware_commit_cached(
+                build.repo,
+                build.pack_state,
+                &oid,
+                build.phase_timing,
+            )?
+            else {
+                build.phase_timing.parent_resolve = build
+                    .phase_timing
+                    .parent_resolve
+                    .saturating_add(parent_resolve_started.elapsed());
+                continue;
+            };
+            let mut parent_positions =
+                PackAwareTapeParentPositions::with_capacity(commit.parent_ids.len());
+            for &parent_oid in &commit.parent_ids {
+                parent_positions.push(tape.ensure_position(parent_oid));
+            }
+            (commit.tree_id, commit.committer_time, parent_positions)
+        };
+
+        let parent_count = parent_positions.len();
+        let boundary_stop = build.boundary_oid == Some(oid);
+        let under_since_cutoff = build
+            .frontier_since_epoch
+            .is_some_and(|since| committer_time < since);
+        let should_emit = build
+            .walk
+            .since_epoch
+            .is_none_or(|since| committer_time >= since);
+        let should_expand = !boundary_stop && !under_since_cutoff;
+
+        if should_expand {
+            frontier.push_many(parent_positions.iter().copied());
+            build.phase_timing.queue_max_depth =
+                build.phase_timing.queue_max_depth.max(frontier.len());
+        }
+
+        tape.parent_edge_count = tape.parent_edge_count.saturating_add(parent_count);
+        let node = &mut tape.nodes[position as usize];
+        node.tree_id = tree_id;
+        node.committer_time = committer_time;
+        node.parent_positions = parent_positions;
+
+        if boundary_stop {
+            pruned_parent_expansions = pruned_parent_expansions.saturating_add(parent_count);
+            build.phase_timing.boundary_stop_count =
+                build.phase_timing.boundary_stop_count.saturating_add(1);
+            build.phase_timing.parent_resolve = build
+                .phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+            continue;
+        }
+
+        if under_since_cutoff {
+            pruned_parent_expansions = pruned_parent_expansions.saturating_add(parent_count);
+            build.phase_timing.nodes_pruned_count =
+                build.phase_timing.nodes_pruned_count.saturating_add(1);
+            build.phase_timing.parent_resolve = build
+                .phase_timing
+                .parent_resolve
+                .saturating_add(parent_resolve_started.elapsed());
+            continue;
+        }
+
+        build.phase_timing.parent_resolve = build
+            .phase_timing
+            .parent_resolve
+            .saturating_add(parent_resolve_started.elapsed());
+        if should_emit {
+            emit_positions.push(position);
+        }
+    }
+
+    build.phase_timing.tape_build = build
+        .phase_timing
+        .tape_build
+        .saturating_add(tape_build_started.elapsed());
+    build.phase_timing.tape_node_count = build
+        .phase_timing
+        .tape_node_count
+        .saturating_add(tape.nodes.len());
+    build.phase_timing.tape_parent_edges = build
+        .phase_timing
+        .tape_parent_edges
+        .saturating_add(tape.parent_edge_count);
+
+    Ok(PackAwareTapeBuildResult {
+        tape,
+        emit_positions,
+        pruned_parent_expansions,
+    })
 }
 
 fn walk_commits_from_commit_graph(
     graph: &gix::commitgraph::Graph,
     tips: Vec<ObjectId>,
     context: CommitWalkContext<'_>,
-    emitted_shas: &mut HashSet<String>,
+    emitted_shas: &mut FastStringSet,
     on_commit: &mut impl FnMut(ParsedCommit) -> AppResult<()>,
 ) -> AppResult<Option<CommitGraphWalkResult>> {
     if tips.is_empty() {
@@ -1162,6 +1348,7 @@ fn walk_commits_from_commit_graph(
                 boundary_effective: context.boundary_mode,
                 pruned_parent_expansions: 0,
                 phase_timing: CommitWalkPhaseTiming::default(),
+                tape_enabled: false,
             },
             missing_tips: Vec::new(),
         }));
@@ -1188,6 +1375,7 @@ fn walk_commits_from_commit_graph(
                 boundary_effective: context.boundary_mode,
                 pruned_parent_expansions: 0,
                 phase_timing,
+                tape_enabled: false,
             },
             missing_tips,
         }));
@@ -1332,6 +1520,7 @@ fn walk_commits_from_commit_graph(
                 boundary_effective: context.boundary_mode,
                 pruned_parent_expansions,
                 phase_timing,
+                tape_enabled: false,
             },
             missing_tips,
         }));
@@ -1455,6 +1644,7 @@ fn walk_commits_from_commit_graph(
             boundary_effective: context.boundary_mode,
             pruned_parent_expansions,
             phase_timing,
+            tape_enabled: false,
         },
         missing_tips,
     }))
@@ -1542,25 +1732,28 @@ fn commit_graph_committer_time(commit: gix::commitgraph::file::Commit<'_>) -> i6
     i64::try_from(commit.committer_timestamp()).unwrap_or(i64::MAX)
 }
 
-fn load_pack_aware_commit_cached(
+fn load_pack_aware_commit_cached<'a>(
     repo: &Repository,
-    pack_state: &mut PackAwareTraversalState,
+    pack_state: &'a mut PackAwareTraversalState,
     oid: &ObjectId,
     phase_timing: &mut CommitWalkPhaseTiming,
-) -> AppResult<Option<PackAwareCommitRecord>> {
-    if let Some(commit) = pack_state.commit_cache.get(oid) {
-        return Ok(Some(commit.clone()));
+) -> AppResult<Option<&'a PackAwareCommitRecord>> {
+    if pack_state.commit_cache.contains_key(oid) {
+        return Ok(pack_state.commit_cache.get(oid));
     }
     if pack_state.missing_commits.contains(oid) {
         return Ok(None);
     }
 
-    if let Some(location) = pack_state.object_locations.get(oid).copied() {
+    let pack_location = pack_state.object_locations.get(oid).copied();
+    if let Some(location) = pack_location {
         let decode_started = Instant::now();
-        if let Some(commit) = decode_pack_aware_commit(repo, pack_state, oid, location)? {
+        if let Some(commit) =
+            decode_pack_aware_commit(repo, pack_state, oid, location, phase_timing)?
+        {
             phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
             pack_state.commit_cache.insert(*oid, commit);
-            return Ok(pack_state.commit_cache.get(oid).cloned());
+            return Ok(pack_state.commit_cache.get(oid));
         }
         phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
     }
@@ -1577,7 +1770,7 @@ fn load_pack_aware_commit_cached(
     phase_timing.decode = phase_timing.decode.saturating_add(decode_started.elapsed());
     let parsed = build_pack_aware_commit_from_commit(&commit);
     pack_state.commit_cache.insert(*oid, parsed);
-    Ok(pack_state.commit_cache.get(oid).cloned())
+    Ok(pack_state.commit_cache.get(oid))
 }
 
 fn build_pack_aware_traversal_state(
@@ -1647,8 +1840,8 @@ fn build_pack_aware_traversal_state(
                 return Ok(Some(PackAwareTraversalState {
                     packs,
                     object_locations: cached.object_locations.clone(),
-                    commit_cache: HashMap::new(),
-                    missing_commits: HashSet::new(),
+                    commit_cache: FastObjectIdMap::default(),
+                    missing_commits: FastObjectIdSet::default(),
                     decode_buffer: Vec::new(),
                     decode_inflate: gix::features::zlib::Inflate::default(),
                 }));
@@ -1685,14 +1878,14 @@ fn build_pack_aware_traversal_state(
                     fingerprint,
                     total_objects,
                     pack_paths,
-                    object_locations: HashMap::new(),
+                    object_locations: FastObjectIdMap::default(),
                 },
             );
         }
         return Ok(None);
     }
 
-    let mut object_locations = HashMap::new();
+    let mut object_locations = FastObjectIdMap::default();
     for (pack_slot, bundle) in packs.iter().enumerate() {
         for index_entry in bundle.index.iter() {
             object_locations
@@ -1719,8 +1912,8 @@ fn build_pack_aware_traversal_state(
     Ok(Some(PackAwareTraversalState {
         packs,
         object_locations,
-        commit_cache: HashMap::new(),
-        missing_commits: HashSet::new(),
+        commit_cache: FastObjectIdMap::default(),
+        missing_commits: FastObjectIdSet::default(),
         decode_buffer: Vec::new(),
         decode_inflate: gix::features::zlib::Inflate::default(),
     }))
@@ -1763,6 +1956,7 @@ fn decode_pack_aware_commit(
     pack_state: &mut PackAwareTraversalState,
     oid: &ObjectId,
     location: PackObjectLocation,
+    phase_timing: &mut CommitWalkPhaseTiming,
 ) -> AppResult<Option<PackAwareCommitRecord>> {
     let (packs, decode_buffer, decode_inflate) = (
         &pack_state.packs,
@@ -1792,20 +1986,40 @@ fn decode_pack_aware_commit(
     decode_inflate.reset();
     let mut delta_cache = PackDecodeNoCache;
     decode_buffer.clear();
+    let base_resolve_elapsed = Cell::new(Duration::ZERO);
+    let inflate_started = Instant::now();
     let outcome = bundle
         .pack
         .decode_entry(
             pack_entry,
             decode_buffer,
             decode_inflate,
-            &|id, out| resolve_pack_base_object(repo, &bundle.index, &bundle.pack, id, out),
+            &|id, out| {
+                let base_resolve_started = Instant::now();
+                let resolved = resolve_pack_base_object(repo, &bundle.index, &bundle.pack, id, out);
+                base_resolve_elapsed.set(
+                    base_resolve_elapsed
+                        .get()
+                        .saturating_add(base_resolve_started.elapsed()),
+                );
+                resolved
+            },
             &mut delta_cache,
         )
         .map_err(|error| AppError::GitCommand(format!("decode pack entry for {}: {error}", oid)))?;
+    let inflate_elapsed = inflate_started.elapsed();
+    let base_resolve_elapsed = base_resolve_elapsed.get();
+    phase_timing.pack_base_resolve = phase_timing
+        .pack_base_resolve
+        .saturating_add(base_resolve_elapsed);
+    phase_timing.pack_inflate = phase_timing
+        .pack_inflate
+        .saturating_add(inflate_elapsed.saturating_sub(base_resolve_elapsed));
     if outcome.kind != gix::objs::Kind::Commit {
         return Ok(None);
     }
 
+    let parse_started = Instant::now();
     let commit_ref =
         gix::objs::CommitRef::from_bytes(decode_buffer.as_slice()).map_err(|error| {
             AppError::GitCommand(format!(
@@ -1813,7 +2027,10 @@ fn decode_pack_aware_commit(
                 oid
             ))
         })?;
-    Ok(Some(build_pack_aware_commit_from_ref(*oid, &commit_ref)))
+    phase_timing.pack_parse = phase_timing
+        .pack_parse
+        .saturating_add(parse_started.elapsed());
+    Ok(Some(build_pack_aware_commit_from_ref(&commit_ref)))
 }
 
 fn resolve_pack_base_object(
@@ -2013,7 +2230,6 @@ fn build_pack_aware_commit_from_commit(commit: &gix::Commit<'_>) -> PackAwareCom
     let parent_ids: PackAwareParentIds =
         commit.parent_ids().map(|parent| parent.detach()).collect();
     PackAwareCommitRecord {
-        oid: commit.id().detach(),
         tree_id: commit.tree_id().ok().map(|tree_id| tree_id.detach()),
         parent_ids,
         committer_time: commit
@@ -2024,13 +2240,9 @@ fn build_pack_aware_commit_from_commit(commit: &gix::Commit<'_>) -> PackAwareCom
     }
 }
 
-fn build_pack_aware_commit_from_ref(
-    oid: ObjectId,
-    commit: &gix::objs::CommitRef<'_>,
-) -> PackAwareCommitRecord {
+fn build_pack_aware_commit_from_ref(commit: &gix::objs::CommitRef<'_>) -> PackAwareCommitRecord {
     let parent_ids: PackAwareParentIds = commit.parents().map(|parent| parent.to_owned()).collect();
     PackAwareCommitRecord {
-        oid,
         tree_id: Some(commit.tree().to_owned()),
         parent_ids,
         committer_time: commit

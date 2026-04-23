@@ -13,6 +13,9 @@ param(
     [switch]$PreconditionCommitGraph,
     [switch]$KeepFixture,
     [switch]$EnableLsmRocksdb,
+    [ValidateSet("system", "mimalloc")]
+    [string]$Allocator = "system",
+    [switch]$NativeCpu,
     [string]$LibclangPath = "",
     [switch]$ProbeOnly
 )
@@ -280,8 +283,64 @@ function Get-ReportArgs {
 }
 
 function Get-CargoFeatureArgs {
+    $featureNames = @()
     if ($EnableLsmRocksdb) {
-        return @("--features", "lsm-rocksdb")
+        $featureNames += "lsm-rocksdb"
+    }
+    if ($Allocator -eq "mimalloc") {
+        $featureNames += "perf-mimalloc"
+    }
+    if ($featureNames.Count -gt 0) {
+        return @("--features", ($featureNames -join ","))
+    }
+    return @()
+}
+
+function Get-CargoRustflags {
+    $resolved = $env:RUSTFLAGS
+    $nativeCpuFlag = "-C target-cpu=native"
+    if (-not $NativeCpu) {
+        return $resolved
+    }
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        return $nativeCpuFlag
+    }
+    if ($resolved -match [Regex]::Escape($nativeCpuFlag)) {
+        return $resolved
+    }
+    return ($resolved.Trim() + " " + $nativeCpuFlag)
+}
+
+function Get-DockerShellPrefix {
+    $exports = @("export PATH=/usr/local/cargo/bin:`$PATH")
+    $cargoRustflags = Get-CargoRustflags
+    if (-not [string]::IsNullOrWhiteSpace($cargoRustflags)) {
+        $exports += ("export RUSTFLAGS=" + (Convert-ToBashSingleQuoted $cargoRustflags))
+    }
+    return (($exports -join "; ") + "; ")
+}
+
+function Invoke-WithExperimentRustflags {
+    param(
+        [scriptblock]$Action
+    )
+
+    $previousRustflags = $env:RUSTFLAGS
+    $resolvedRustflags = Get-CargoRustflags
+    try {
+        if ([string]::IsNullOrWhiteSpace($resolvedRustflags)) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $resolvedRustflags
+        }
+        return & $Action
+    }
+    finally {
+        if ($null -eq $previousRustflags) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $previousRustflags
+        }
     }
     return @()
 }
@@ -296,9 +355,15 @@ function Invoke-PerfReportDocker {
     Write-Host "Retrying performance report in Docker fallback..."
     $reportArgs = Get-ReportArgs
     $quotedArgs = $reportArgs | ForEach-Object { Convert-ToBashSingleQuoted $_ }
-    $featureArgs = if ($EnableLsmRocksdb) { " --features lsm-rocksdb" } else { "" }
-    $buildCommand = "export PATH=/usr/local/cargo/bin:`$PATH; cargo build --package gitgraph-lab-core --release --locked --bin perf-report$featureArgs"
-    $runCommand = "export PATH=/usr/local/cargo/bin:`$PATH; /cargo-target/release/perf-report " + ($quotedArgs -join " ")
+    $dockerPrefix = Get-DockerShellPrefix
+    $featureArgList = Get-CargoFeatureArgs
+    $featureArgs = if ($featureArgList.Count -gt 0) {
+        " " + (($featureArgList | ForEach-Object { Convert-ToBashSingleQuoted $_ }) -join " ")
+    } else {
+        ""
+    }
+    $buildCommand = $dockerPrefix + "cargo build --package gitgraph-lab-core --release --locked --bin perf-report$featureArgs"
+    $runCommand = $dockerPrefix + "/cargo-target/release/perf-report " + ($quotedArgs -join " ")
 
     $buildResult = Invoke-DockerPhase `
         -RepoRootPath $RepoRootPath `
@@ -345,6 +410,9 @@ try {
         return
     }
 
+    Write-Host ("Allocator: {0}" -f $Allocator)
+    Write-Host ("Native CPU: {0}" -f ($NativeCpu.IsPresent))
+
     if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
         if ($EnableLsmRocksdb) {
             throw "GITGRAPH_PERF_REPORT_DOCKER_ONLY is incompatible with -EnableLsmRocksdb. Use host execution with -LibclangPath."
@@ -365,11 +433,12 @@ try {
     )
     $hostBuildArgs += Get-CargoFeatureArgs
     $repoLocalTargetRoot = Join-Path $repoRootPath "target"
-
-    $buildResult = Invoke-ExternalPhase `
-        -Executable "cargo" `
-        -Arguments $hostBuildArgs `
-        -PhaseLabel "Host build phase (perf-report binary)..."
+    $buildResult = Invoke-WithExperimentRustflags {
+        Invoke-ExternalPhase `
+            -Executable "cargo" `
+            -Arguments $hostBuildArgs `
+            -PhaseLabel "Host build phase (perf-report binary)..."
+    }
 
     $combinedOutputText = $buildResult.OutputText
     if ($buildResult.ExitCode -ne 0 -and -not $cargoTargetRootWasExplicit) {
@@ -381,10 +450,12 @@ try {
                 "'. Retrying with repo-local cargo target '" + $repoLocalTargetRoot + "'..."
             )
             Set-CargoTargetRoot -NextCargoTargetRoot $repoLocalTargetRoot
-            $buildResult = Invoke-ExternalPhase `
-                -Executable "cargo" `
-                -Arguments $hostBuildArgs `
-                -PhaseLabel "Host build phase retry (repo-local target)..."
+            $buildResult = Invoke-WithExperimentRustflags {
+                Invoke-ExternalPhase `
+                    -Executable "cargo" `
+                    -Arguments $hostBuildArgs `
+                    -PhaseLabel "Host build phase retry (repo-local target)..."
+            }
             $combinedOutputText = $buildResult.OutputText
         }
     }

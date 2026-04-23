@@ -76,6 +76,10 @@ struct IngestionPhaseTiming {
     commit_walk_graph_lookup: Duration,
     commit_walk_ordering: Duration,
     commit_walk_emit: Duration,
+    commit_walk_pack_inflate: Duration,
+    commit_walk_pack_base_resolve: Duration,
+    commit_walk_pack_parse: Duration,
+    commit_walk_tape_build: Duration,
     commit_walk_graph_lookup_hit_count: usize,
     commit_walk_graph_lookup_miss_count: usize,
     commit_walk_graph_fallback_count: usize,
@@ -87,6 +91,8 @@ struct IngestionPhaseTiming {
     commit_walk_missing_tip_count: usize,
     commit_walk_boundary_stop_count: usize,
     commit_walk_overlap_skip_count: usize,
+    commit_walk_tape_node_count: usize,
+    commit_walk_tape_parent_edges: usize,
     commit_upsert: Duration,
     edge_materialize: Duration,
     file_diff_extract: Duration,
@@ -210,6 +216,10 @@ struct CommitWalkTelemetryContext<'a> {
     graph_lookup: Duration,
     ordering: Duration,
     emit: Duration,
+    pack_inflate: Duration,
+    pack_base_resolve: Duration,
+    pack_parse: Duration,
+    tape_build: Duration,
     graph_lookup_hit_count: usize,
     graph_lookup_miss_count: usize,
     graph_fallback_count: usize,
@@ -221,7 +231,10 @@ struct CommitWalkTelemetryContext<'a> {
     missing_tip_count: usize,
     boundary_stop_count: usize,
     overlap_skip_count: usize,
+    tape_node_count: usize,
+    tape_parent_edges: usize,
     v2_enabled: bool,
+    tape_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -252,6 +265,10 @@ impl IngestionPhaseTiming {
             commit_walk_graph_lookup: duration_ms(self.commit_walk_graph_lookup),
             commit_walk_ordering: duration_ms(self.commit_walk_ordering),
             commit_walk_emit: duration_ms(self.commit_walk_emit),
+            commit_walk_pack_inflate: duration_ms(self.commit_walk_pack_inflate),
+            commit_walk_pack_base_resolve: duration_ms(self.commit_walk_pack_base_resolve),
+            commit_walk_pack_parse: duration_ms(self.commit_walk_pack_parse),
+            commit_walk_tape_build: duration_ms(self.commit_walk_tape_build),
             commit_walk_graph_lookup_hit_count: self.commit_walk_graph_lookup_hit_count as f64,
             commit_walk_graph_lookup_miss_count: self.commit_walk_graph_lookup_miss_count as f64,
             commit_walk_graph_fallback_count: self.commit_walk_graph_fallback_count as f64,
@@ -264,6 +281,8 @@ impl IngestionPhaseTiming {
             commit_walk_missing_tip_count: self.commit_walk_missing_tip_count as f64,
             commit_walk_boundary_stop_count: self.commit_walk_boundary_stop_count as f64,
             commit_walk_overlap_skip_count: self.commit_walk_overlap_skip_count as f64,
+            commit_walk_tape_node_count: self.commit_walk_tape_node_count as f64,
+            commit_walk_tape_parent_edges: self.commit_walk_tape_parent_edges as f64,
             commit_upsert: duration_ms(self.commit_upsert),
             edge_materialize: duration_ms(self.edge_materialize),
             file_diff_extract: duration_ms(self.file_diff_extract),
@@ -556,6 +575,10 @@ impl Indexer {
         ingestion_timing.commit_walk_graph_lookup = commit_walk_stats.graph_lookup;
         ingestion_timing.commit_walk_ordering = commit_walk_stats.ordering;
         ingestion_timing.commit_walk_emit = commit_walk_stats.emit;
+        ingestion_timing.commit_walk_pack_inflate = commit_walk_stats.pack_inflate;
+        ingestion_timing.commit_walk_pack_base_resolve = commit_walk_stats.pack_base_resolve;
+        ingestion_timing.commit_walk_pack_parse = commit_walk_stats.pack_parse;
+        ingestion_timing.commit_walk_tape_build = commit_walk_stats.tape_build;
         ingestion_timing.commit_walk_graph_lookup_hit_count =
             commit_walk_stats.graph_lookup_hit_count;
         ingestion_timing.commit_walk_graph_lookup_miss_count =
@@ -570,6 +593,8 @@ impl Indexer {
         ingestion_timing.commit_walk_missing_tip_count = commit_walk_stats.missing_tip_count;
         ingestion_timing.commit_walk_boundary_stop_count = commit_walk_stats.boundary_stop_count;
         ingestion_timing.commit_walk_overlap_skip_count = commit_walk_stats.overlap_skip_count;
+        ingestion_timing.commit_walk_tape_node_count = commit_walk_stats.tape_node_count;
+        ingestion_timing.commit_walk_tape_parent_edges = commit_walk_stats.tape_parent_edges;
         ingestion_timing.commit_upsert = ingestion_timing
             .commit_upsert
             .saturating_add(commit_writer_stats.commit_upsert);
@@ -777,6 +802,10 @@ impl Indexer {
             graph_lookup: commit_walk_stats.graph_lookup,
             ordering: commit_walk_stats.ordering,
             emit: commit_walk_stats.emit,
+            pack_inflate: commit_walk_stats.pack_inflate,
+            pack_base_resolve: commit_walk_stats.pack_base_resolve,
+            pack_parse: commit_walk_stats.pack_parse,
+            tape_build: commit_walk_stats.tape_build,
             graph_lookup_hit_count: commit_walk_stats.graph_lookup_hit_count,
             graph_lookup_miss_count: commit_walk_stats.graph_lookup_miss_count,
             graph_fallback_count: commit_walk_stats.graph_fallback_count,
@@ -789,7 +818,10 @@ impl Indexer {
             missing_tip_count: commit_walk_stats.missing_tip_count,
             boundary_stop_count: commit_walk_stats.boundary_stop_count,
             overlap_skip_count: commit_walk_stats.overlap_skip_count,
+            tape_node_count: commit_walk_stats.tape_node_count,
+            tape_parent_edges: commit_walk_stats.tape_parent_edges,
             v2_enabled: commit_walk_stats.v2_enabled,
+            tape_enabled: commit_walk_stats.tape_enabled,
         };
         let commit_throughput = build_commit_throughput_telemetry(
             &planner_telemetry,
@@ -836,6 +868,12 @@ impl Indexer {
             commit_walk_graph_lookup_ms: duration_ms(ingestion_timing.commit_walk_graph_lookup),
             commit_walk_ordering_ms: duration_ms(ingestion_timing.commit_walk_ordering),
             commit_walk_emit_ms: duration_ms(ingestion_timing.commit_walk_emit),
+            commit_walk_pack_inflate_ms: duration_ms(ingestion_timing.commit_walk_pack_inflate),
+            commit_walk_pack_base_resolve_ms: duration_ms(
+                ingestion_timing.commit_walk_pack_base_resolve,
+            ),
+            commit_walk_pack_parse_ms: duration_ms(ingestion_timing.commit_walk_pack_parse),
+            commit_walk_tape_build_ms: duration_ms(ingestion_timing.commit_walk_tape_build),
             commit_walk_graph_lookup_hit_count: ingestion_timing.commit_walk_graph_lookup_hit_count,
             commit_walk_graph_lookup_miss_count: ingestion_timing
                 .commit_walk_graph_lookup_miss_count,
@@ -853,6 +891,9 @@ impl Indexer {
             commit_walk_boundary_stop_count: ingestion_timing.commit_walk_boundary_stop_count,
             commit_walk_overlap_skip_count: ingestion_timing.commit_walk_overlap_skip_count,
             commit_walk_v2_enabled: commit_walk_telemetry.v2_enabled,
+            commit_walk_tape_node_count: ingestion_timing.commit_walk_tape_node_count,
+            commit_walk_tape_parent_edges: ingestion_timing.commit_walk_tape_parent_edges,
+            commit_walk_tape_enabled: commit_walk_telemetry.tape_enabled,
             commit_window_jit_hydrated_rows: 0,
             query_commit_window_prewarm_hydrated_rows,
             incremental_csr_streaming_mode_effective: streaming_mode_telemetry
@@ -1583,6 +1624,10 @@ fn build_commit_throughput_telemetry(
         commit_walk_graph_lookup_ms: duration_ms(commit_walk.graph_lookup),
         commit_walk_ordering_ms: duration_ms(commit_walk.ordering),
         commit_walk_emit_ms: duration_ms(commit_walk.emit),
+        commit_walk_pack_inflate_ms: duration_ms(commit_walk.pack_inflate),
+        commit_walk_pack_base_resolve_ms: duration_ms(commit_walk.pack_base_resolve),
+        commit_walk_pack_parse_ms: duration_ms(commit_walk.pack_parse),
+        commit_walk_tape_build_ms: duration_ms(commit_walk.tape_build),
         commit_walk_graph_lookup_hit_count: commit_walk.graph_lookup_hit_count,
         commit_walk_graph_lookup_miss_count: commit_walk.graph_lookup_miss_count,
         commit_walk_graph_fallback_count: commit_walk.graph_fallback_count,
@@ -1598,6 +1643,9 @@ fn build_commit_throughput_telemetry(
         commit_walk_boundary_stop_count: commit_walk.boundary_stop_count,
         commit_walk_overlap_skip_count: commit_walk.overlap_skip_count,
         commit_walk_v2_enabled: commit_walk.v2_enabled,
+        commit_walk_tape_node_count: commit_walk.tape_node_count,
+        commit_walk_tape_parent_edges: commit_walk.tape_parent_edges,
+        commit_walk_tape_enabled: commit_walk.tape_enabled,
         commit_window_jit_hydrated_rows: 0,
         query_commit_window_prewarm_hydrated_rows: ingestion_timing
             .query_commit_window_prewarm_hydrated_rows,

@@ -19,6 +19,9 @@ param(
     [int]$RenameLimitXLarge = -1,
     [switch]$FastMode,
     [switch]$PreconditionCommitGraph,
+    [ValidateSet("system", "mimalloc")]
+    [string]$Allocator = "system",
+    [switch]$NativeCpu,
     [switch]$ProbeOnly
 )
 
@@ -169,6 +172,8 @@ if (-not $FastMode -and $MaxFileChangeExtractionDrainMs -lt 0) {
 Write-Host ("Ingestion budget profile: {0}" -f $Profile)
 Write-Host ("Ingestion budget lane: {0}" -f $Lane)
 Write-Host ("Ingestion budget fast mode: {0}" -f ($FastMode.IsPresent))
+Write-Host ("Ingestion allocator: {0}" -f $Allocator)
+Write-Host ("Ingestion native CPU: {0}" -f ($NativeCpu.IsPresent))
 Write-Host (
     "Workload: cycles={0} feature_commits={1} incremental_commits={2} query_runs={3} window_limit={4} max_nodes={5}" `
         -f $cycles, $featureCommits, $incrementalCommits, $queryRuns, $windowLimit, $maxNodes
@@ -199,6 +204,8 @@ if ($Lane -eq "warm") {
             -PreconditionCommitGraph:$PreconditionCommitGraph `
             -FixtureRoot $fixtureRoot `
             -KeepFixture `
+            -Allocator $Allocator `
+            -NativeCpu:$NativeCpu `
             -OutputPath ($OutputPath + ".bootstrap.txt")
         if ($LASTEXITCODE -ne 0) {
             throw "Warm lane bootstrap perf-report execution failed."
@@ -253,6 +260,8 @@ try {
         -OutputPath $OutputPath `
         -FixtureRoot $fixtureRoot `
         -WarmFixture:($Lane -eq "warm") `
+        -Allocator $Allocator `
+        -NativeCpu:$NativeCpu `
         -EnableLsmRocksdb:$EnableLsmRocksdb `
         -LibclangPath $LibclangPath
     if ($LASTEXITCODE -ne 0) {
