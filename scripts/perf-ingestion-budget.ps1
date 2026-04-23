@@ -213,7 +213,6 @@ if ($Lane -eq "warm") {
     }
 }
 
-$previousFastMode = $env:GITGRAPH_INDEX_FAST_MODE
 $previousWriteProfile = $env:GITGRAPH_INGEST_WRITE_PROFILE
 $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
 $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
@@ -223,7 +222,6 @@ $previousFileChangeCommitBatchSize = $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE
 $previousRenameLimitLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE
 $previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
 if ($FastMode) {
-    $env:GITGRAPH_INDEX_FAST_MODE = "1"
     $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
     if (-not $EnableLsmRocksdb) {
         $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
@@ -269,11 +267,6 @@ try {
     }
 }
 finally {
-    if ($null -eq $previousFastMode) {
-        Remove-Item Env:GITGRAPH_INDEX_FAST_MODE -ErrorAction SilentlyContinue
-    } else {
-        $env:GITGRAPH_INDEX_FAST_MODE = $previousFastMode
-    }
     if ($null -eq $previousWriteProfile) {
         Remove-Item Env:GITGRAPH_INGEST_WRITE_PROFILE -ErrorAction SilentlyContinue
     } else {

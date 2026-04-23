@@ -324,6 +324,7 @@ name = "gitgraph-lab-core"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "crossbeam-channel",
  "gix",
  "gix-pack",
  "lmdb",

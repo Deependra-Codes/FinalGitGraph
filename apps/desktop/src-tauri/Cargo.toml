@@ -9,6 +9,7 @@ perf-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
  bincode = "1.3.3"
+crossbeam-channel = "0.5"
 gix = "0.80.0"
 gix-pack = "0.67.0"
 lmdb = "0.8.0"

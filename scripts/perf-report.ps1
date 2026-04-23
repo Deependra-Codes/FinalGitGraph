@@ -181,7 +181,6 @@ function Get-DockerRunArgs {
 
     $forwardedEnvArgs = @()
     $forwardedEnvKeys = @(
-        "GITGRAPH_INDEX_FAST_MODE",
         "GITGRAPH_INGEST_WRITE_PROFILE",
         "GITGRAPH_COMMIT_WALK_SORT",
         "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL",
