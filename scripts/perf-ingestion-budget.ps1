@@ -1,7 +1,7 @@
 # platform: any
 param(
     [string]$CargoTargetRoot = "",
-    [ValidateSet("25k", "90k", "100k")]
+    [ValidateSet("25k", "90k", "100k", "200k")]
     [string]$Profile = "25k",
     [ValidateSet("cold", "warm")]
     [string]$Lane = "cold",
@@ -23,10 +23,15 @@ param(
     [string]$Allocator = "system",
     [switch]$NativeCpu,
     [switch]$HardwareMax,
+    [switch]$MaxPerformance,
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($MaxPerformance) {
+    $HardwareMax = [System.Management.Automation.SwitchParameter]::new($true)
+}
 
 if ($HardwareMax) {
     $FastMode = [System.Management.Automation.SwitchParameter]::new($true)
@@ -94,7 +99,19 @@ if ($ProbeOnly) {
     return
 }
 
-if ($Profile -eq "100k") {
+if ($Profile -eq "200k") {
+    $defaultOutputPath = "tmp/perf-report-ingestion-budget-200k.txt"
+    $cycles = 25000
+    $featureCommits = 6
+    $incrementalCommits = 20000
+    $queryRuns = 20
+    $windowLimit = 2000
+    $maxNodes = 200000
+    $defaultMaxFullIndexMs = 180000
+    $defaultMaxIncrementalIndexMs = 120000
+    $defaultMaxPeakRssBytes = [UInt64]::MaxValue
+    $defaultMaxDiffShareRatio = 0.55
+} elseif ($Profile -eq "100k") {
     $defaultOutputPath = "tmp/perf-report-ingestion-budget-100k.txt"
     $cycles = 12500
     $featureCommits = 6
@@ -133,7 +150,9 @@ if ($Profile -eq "100k") {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    if ($HardwareMax) {
+    if ($MaxPerformance) {
+        $OutputPath = $defaultOutputPath.Replace(".txt", "-hardware-max.txt")
+    } elseif ($HardwareMax) {
         $OutputPath = $defaultOutputPath.Replace(".txt", "-hardware.txt")
     } elseif ($FastMode) {
         $OutputPath = $defaultOutputPath.Replace(".txt", "-fast.txt")
@@ -163,6 +182,9 @@ if (-not $PSBoundParameters.ContainsKey("MaxDiffShareRatio")) {
 if ($HardwareMax -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
     $MinFullCommitThroughputPerSec = 100000
 }
+if ($MaxPerformance -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
+    $MinFullCommitThroughputPerSec = 200000
+}
 if ($FastMode -and -not $HardwareMax -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
     $MinFullCommitThroughputPerSec = 12000
 }
@@ -180,6 +202,7 @@ Write-Host ("Ingestion budget profile: {0}" -f $Profile)
 Write-Host ("Ingestion budget lane: {0}" -f $Lane)
 Write-Host ("Ingestion budget fast mode: {0}" -f ($FastMode.IsPresent))
 Write-Host ("Ingestion hardware max: {0}" -f ([bool]$HardwareMax))
+Write-Host ("Ingestion max performance: {0}" -f ([bool]$MaxPerformance))
 Write-Host ("Ingestion allocator: {0}" -f $Allocator)
 Write-Host ("Ingestion native CPU: {0}" -f ([bool]$NativeCpu))
 Write-Host (
@@ -215,6 +238,7 @@ if ($Lane -eq "warm") {
             -Allocator $Allocator `
             -NativeCpu:$NativeCpu `
             -HardwareMax:$HardwareMax `
+            -MaxPerformance:$MaxPerformance `
             -OutputPath ($OutputPath + ".bootstrap.txt")
         if ($LASTEXITCODE -ne 0) {
             throw "Warm lane bootstrap perf-report execution failed."
@@ -230,6 +254,7 @@ $previousDrainChannelCapacity = $env:GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY
 $previousFileChangeCommitBatchSize = $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE
 $previousRenameLimitLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE
 $previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
+$previousRuntimeProfile = $env:GITGRAPH_RUNTIME_PROFILE
 if ($FastMode) {
     $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
     if (-not $HardwareMax) {
@@ -244,6 +269,9 @@ if ($FastMode) {
     if ([string]::IsNullOrWhiteSpace($previousDrainChannelCapacity)) {
         $env:GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY = "32"
     }
+}
+if ($MaxPerformance) {
+    $env:GITGRAPH_RUNTIME_PROFILE = "max_performance"
 }
 if ($FileChangeCommitBatchSize -gt 0) {
     $env:GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE = $FileChangeCommitBatchSize.ToString()
@@ -269,7 +297,8 @@ try {
         -WarmFixture:($Lane -eq "warm") `
         -Allocator $Allocator `
         -NativeCpu:$NativeCpu `
-        -HardwareMax:$HardwareMax
+        -HardwareMax:$HardwareMax `
+        -MaxPerformance:$MaxPerformance
     if ($LASTEXITCODE -ne 0) {
         throw "perf-report execution failed for ingestion budget lane."
     }
@@ -315,6 +344,11 @@ finally {
     } else {
         $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE = $previousRenameLimitXLarge
     }
+    if ($null -eq $previousRuntimeProfile) {
+        Remove-Item Env:GITGRAPH_RUNTIME_PROFILE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_RUNTIME_PROFILE = $previousRuntimeProfile
+    }
 }
 
 $fullIndexRaw = Get-ReportValue -Path $OutputPath -Key "full_index"
@@ -324,6 +358,7 @@ $fullCommitThroughputRaw = Get-ReportValue -Path $OutputPath -Key "commit_throug
 $fileChangeExtractionDrainRaw = Get-ReportValue -Path $OutputPath -Key "file_change_extraction_drain_ms"
 $oldestExtractionQueueAgeRaw = Get-ReportValue -Path $OutputPath -Key "oldest_file_change_extraction_queue_age_seconds"
 $coreEndToEndRaw = Get-ReportValue -Path $OutputPath -Key "core_end_to_end"
+$fixtureGenerationCommitCountRaw = Get-ReportValue -Path $OutputPath -Key "fixture_generation_commit_count"
 $fixtureGenerationRaw = Get-ReportValue -Path $OutputPath -Key "fixture_generation"
 $ingestCommitWalkRaw = Get-ReportValue -Path $OutputPath -Key "ingest_commit_walk_ms"
 $ingestDiffRaw = Get-ReportValue -Path $OutputPath -Key "ingest_file_diff_extract_ms"
@@ -353,6 +388,7 @@ $fullCommitThroughputPerSec = Parse-DoubleOrThrow -Raw $fullCommitThroughputRaw 
 $fileChangeExtractionDrainMs = Parse-DoubleOrThrow -Raw $fileChangeExtractionDrainRaw -Field "file_change_extraction_drain_ms"
 $oldestExtractionQueueAgeSeconds = [int](Parse-DoubleOrThrow -Raw $oldestExtractionQueueAgeRaw -Field "oldest_file_change_extraction_queue_age_seconds")
 $coreEndToEndMs = Parse-DoubleOrThrow -Raw $coreEndToEndRaw -Field "core_end_to_end"
+$fixtureGenerationCommitCount = [int](Parse-DoubleOrThrow -Raw $fixtureGenerationCommitCountRaw -Field "fixture_generation_commit_count")
 $fixtureGenerationMs = Parse-DoubleOrThrow -Raw $fixtureGenerationRaw -Field "fixture_generation"
 [void](Parse-DoubleOrThrow -Raw $ingestCommitWalkRaw -Field "ingest_commit_walk_ms")
 $ingestDiffMs = Parse-DoubleOrThrow -Raw $ingestDiffRaw -Field "ingest_file_diff_extract_ms"
@@ -381,6 +417,7 @@ Write-Host ("Ingestion budget observed full_commit_throughput_per_sec: {0}" -f $
 Write-Host ("Ingestion budget observed file_change_extraction_drain_ms: {0}" -f $fileChangeExtractionDrainMs)
 Write-Host ("Ingestion budget observed oldest_file_change_extraction_queue_age_seconds: {0}" -f $oldestExtractionQueueAgeSeconds)
 Write-Host ("Ingestion budget observed fixture_generation_ms: {0}" -f $fixtureGenerationMs)
+Write-Host ("Ingestion budget observed fixture_generation_commit_count: {0}" -f $fixtureGenerationCommitCount)
 Write-Host ("Ingestion budget observed diff_share_ratio: {0}" -f ([Math]::Round($diffShareRatio, 4)))
 Write-Host ("Ingestion throughput phases (full) cps: walk={0} upsert={1} diff_extract={2} file_change_upsert={3} tx_commit={4}" -f $fullCommitWalkThroughput, $fullCommitUpsertThroughput, $fullDiffExtractThroughput, $fullFileChangeUpsertThroughput, $fullTxCommitThroughput)
 Write-Host ("Ingestion throughput phases (incremental) cps: walk={0} upsert={1} diff_extract={2} file_change_upsert={3} tx_commit={4}" -f $incrementalCommitWalkThroughput, $incrementalCommitUpsertThroughput, $incrementalDiffExtractThroughput, $incrementalFileChangeUpsertThroughput, $incrementalTxCommitThroughput)
@@ -393,7 +430,10 @@ if ($fullIndexMs -gt $MaxFullIndexMs) {
 if ($incrementalIndexMs -gt $MaxIncrementalIndexMs) {
     throw ("Ingestion budget failed: incremental_index_ms {0} > max {1}" -f $incrementalIndexMs, $MaxIncrementalIndexMs)
 }
-if ($peakRssBytes -gt $MaxPeakRssBytes) {
+if ($fixtureGenerationCommitCount -lt $maxNodes) {
+    throw ("Ingestion budget failed: fixture_generation_commit_count {0} < min {1}" -f $fixtureGenerationCommitCount, $maxNodes)
+}
+if (-not $MaxPerformance -and $peakRssBytes -gt $MaxPeakRssBytes) {
     throw ("Ingestion budget failed: peak_observed_rss_bytes {0} > max {1}" -f $peakRssBytes, $MaxPeakRssBytes)
 }
 if ($diffShareRatio -gt $MaxDiffShareRatio) {

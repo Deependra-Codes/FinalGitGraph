@@ -41,14 +41,16 @@ const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
 const COMMIT_INGEST_PIPELINED_ENV: &str = "GITGRAPH_COMMIT_INGEST_PIPELINED";
 const COMMIT_WRITE_WAVE_ADAPTIVE_ENV: &str = "GITGRAPH_COMMIT_WRITE_WAVE_ADAPTIVE";
 const COMMIT_INGEST_QUEUE_CAPACITY_ENV: &str = "GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY";
+const RUNTIME_PROFILE_ENV: &str = "GITGRAPH_RUNTIME_PROFILE";
 const COMMIT_WINDOW_PREWARM_ENV: &str = "GITGRAPH_COMMIT_WINDOW_PREWARM";
 const COMMIT_WINDOW_PREWARM_LIMIT_ENV: &str = "GITGRAPH_COMMIT_WINDOW_PREWARM_LIMIT";
 const COMMIT_WRITE_WAVE_INITIAL_FULL: usize = 16_384;
 const COMMIT_WRITE_WAVE_INITIAL_INCREMENTAL: usize = 8_192;
 const COMMIT_WRITE_WAVE_MIN: usize = 2_048;
-const COMMIT_WRITE_WAVE_MAX: usize = 32_768;
+const COMMIT_WRITE_WAVE_MAX: usize = 131_072;
 const COMMIT_INGEST_QUEUE_CAPACITY_DEFAULT: usize = 32_768;
 const COMMIT_WINDOW_PREWARM_LIMIT_DEFAULT: usize = 1_024;
+const MAX_PERFORMANCE_PROFILE: &str = "max_performance";
 
 static RUNTIME_QUERY_GRAPH_CACHE: OnceLock<Mutex<Option<RuntimeQueryGraphCacheEntry>>> =
     OnceLock::new();
@@ -369,7 +371,7 @@ impl Indexer {
             .map(|value| value.saturating_sub(INCREMENTAL_LOOKBACK_SECONDS));
         let hide_ancestor_sha = decision.hide_ancestor_sha;
         let level3_options = level3_runtime_options();
-        let streaming_csr_enabled = parse_env_bool_with_default(LEVEL3_STREAMING_CSR_ENV, true);
+        let streaming_csr_enabled = parse_env_bool_with_default(LEVEL3_STREAMING_CSR_ENV, false);
         let streaming_csr_mode = parse_streaming_csr_mode();
         let streaming_snapshot_apply_enabled = streaming_snapshot_apply_enabled_for_mode(
             streaming_csr_enabled,
@@ -855,13 +857,18 @@ impl Indexer {
             tape_node_count: commit_walk_stats.tape_node_count,
             tape_parent_edges: commit_walk_stats.tape_parent_edges,
         };
+        let commit_ingestion_duration = if ingestion_timing.commit_walk_total.is_zero() {
+            index_started.elapsed()
+        } else {
+            ingestion_timing.commit_walk_total
+        };
         let commit_throughput = build_commit_throughput_telemetry(
             &planner_telemetry,
             &commit_walk_telemetry,
             &streaming_mode_telemetry,
             streamed_commit_shas.len(),
             commits_inserted,
-            index_started.elapsed(),
+            commit_ingestion_duration,
             &ingestion_timing,
         );
         let lmdb_runtime_contract = store.lmdb_runtime_contract();
@@ -1502,9 +1509,38 @@ fn parse_positive_env_usize(key: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn runtime_profile_is_max_performance() -> bool {
+    std::env::var(RUNTIME_PROFILE_ENV)
+        .ok()
+        .map(|value| value.trim().eq_ignore_ascii_case(MAX_PERFORMANCE_PROFILE))
+        .unwrap_or(false)
+}
+
+fn available_parallelism_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn max_performance_commit_batch_size(mode: IndexingMode) -> usize {
+    let cores = available_parallelism_count();
+    let full_target = cores
+        .saturating_mul(16_384)
+        .clamp(32_768, COMMIT_WRITE_WAVE_MAX);
+    match mode {
+        IndexingMode::Full => full_target,
+        IndexingMode::Incremental => (full_target / 2).clamp(COMMIT_WRITE_WAVE_MIN, full_target),
+    }
+}
+
 fn resolve_initial_commit_batch_size(mode: IndexingMode, override_value: Option<usize>) -> usize {
     if let Some(value) = override_value {
         return value.clamp(COMMIT_WRITE_WAVE_MIN, COMMIT_WRITE_WAVE_MAX);
+    }
+
+    if runtime_profile_is_max_performance() {
+        return max_performance_commit_batch_size(mode);
     }
 
     match mode {
@@ -1514,8 +1550,18 @@ fn resolve_initial_commit_batch_size(mode: IndexingMode, override_value: Option<
 }
 
 fn resolve_commit_ingest_queue_capacity(batch_size: usize) -> usize {
+    let default_capacity = if runtime_profile_is_max_performance() {
+        let cores = available_parallelism_count();
+        cores
+            .saturating_mul(batch_size)
+            .saturating_mul(4)
+            .clamp(COMMIT_INGEST_QUEUE_CAPACITY_DEFAULT, 1_048_576)
+    } else {
+        COMMIT_INGEST_QUEUE_CAPACITY_DEFAULT
+    };
+
     parse_positive_env_usize(COMMIT_INGEST_QUEUE_CAPACITY_ENV)
-        .unwrap_or(COMMIT_INGEST_QUEUE_CAPACITY_DEFAULT)
+        .unwrap_or(default_capacity)
         .max(1)
         .max(batch_size / 2)
 }
@@ -2587,9 +2633,9 @@ fn ensure_slot<T>(slots: &mut Vec<Option<T>>, index: usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        median_usize, resolve_initial_commit_batch_size, CommitWriteWaveController, IndexingMode,
-        COMMIT_WRITE_WAVE_INITIAL_FULL, COMMIT_WRITE_WAVE_INITIAL_INCREMENTAL,
-        COMMIT_WRITE_WAVE_MAX, COMMIT_WRITE_WAVE_MIN,
+        max_performance_commit_batch_size, median_usize, resolve_initial_commit_batch_size,
+        CommitWriteWaveController, IndexingMode, COMMIT_WRITE_WAVE_INITIAL_FULL,
+        COMMIT_WRITE_WAVE_INITIAL_INCREMENTAL, COMMIT_WRITE_WAVE_MAX, COMMIT_WRITE_WAVE_MIN,
     };
     use std::time::Duration;
 
@@ -2603,6 +2649,15 @@ mod tests {
             resolve_initial_commit_batch_size(IndexingMode::Incremental, None),
             COMMIT_WRITE_WAVE_INITIAL_INCREMENTAL
         );
+    }
+
+    #[test]
+    fn max_performance_commit_batch_scales_within_bounds() {
+        let full = max_performance_commit_batch_size(IndexingMode::Full);
+        assert!((32_768..=COMMIT_WRITE_WAVE_MAX).contains(&full));
+
+        let incremental = max_performance_commit_batch_size(IndexingMode::Incremental);
+        assert!((COMMIT_WRITE_WAVE_MIN..=full).contains(&incremental));
     }
 
     #[test]

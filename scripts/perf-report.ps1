@@ -17,11 +17,16 @@ param(
     [string]$Allocator = "system",
     [switch]$NativeCpu,
     [switch]$HardwareMax,
+    [switch]$MaxPerformance,
     [string]$LibclangPath = "",
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($MaxPerformance) {
+    $HardwareMax = [System.Management.Automation.SwitchParameter]::new($true)
+}
 
 if ($HardwareMax) {
     $Allocator = "mimalloc"
@@ -125,6 +130,28 @@ function Test-EnvEnabled {
     return $normalized -in @("1", "true", "yes", "on")
 }
 
+function Get-AvailableMemoryBytes {
+    if ($env:OS -eq "Windows_NT") {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            return ([UInt64]$os.FreePhysicalMemory * 1024).ToString()
+        }
+        catch {
+            return ""
+        }
+    }
+
+    $meminfoPath = "/proc/meminfo"
+    if (Test-Path $meminfoPath) {
+        $line = Select-String -Path $meminfoPath -Pattern "^MemAvailable:\s+(\d+)\s+kB" | Select-Object -First 1
+        if ($null -ne $line) {
+            return ([UInt64]$line.Matches[0].Groups[1].Value * 1024).ToString()
+        }
+    }
+
+    return ""
+}
+
 function Convert-ToBashSingleQuoted {
     param([string]$Value)
     $escaped = $Value -replace "'", "'`"`'`"`'"
@@ -190,6 +217,10 @@ function Get-DockerRunArgs {
     $forwardedEnvKeys = @(
         "GITGRAPH_INGEST_WRITE_PROFILE",
         "GITGRAPH_COMMIT_WALK_SORT",
+        "GITGRAPH_RUNTIME_PROFILE",
+        "GITGRAPH_MAX_PERF_LOGICAL_CORES",
+        "GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES",
+        "GITGRAPH_MAX_PERF_PLATFORM",
         "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL",
         "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_DRAIN",
         "GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE",
@@ -401,8 +432,21 @@ try {
     $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
     $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
     $previousStreamingCsr = $env:GITGRAPH_LEVEL3_STREAMING_CSR
+    $previousRuntimeProfile = $env:GITGRAPH_RUNTIME_PROFILE
+    $previousMaxPerfLogicalCores = $env:GITGRAPH_MAX_PERF_LOGICAL_CORES
+    $previousMaxPerfAvailableMemoryBytes = $env:GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES
+    $previousMaxPerfPlatform = $env:GITGRAPH_MAX_PERF_PLATFORM
     if ($EnableLsmRocksdb) {
         $env:GITGRAPH_INGEST_PRIMARY = "rocksdb"
+    }
+    if ($MaxPerformance) {
+        $env:GITGRAPH_RUNTIME_PROFILE = "max_performance"
+        $env:GITGRAPH_MAX_PERF_LOGICAL_CORES = [Environment]::ProcessorCount.ToString()
+        $availableMemoryBytes = Get-AvailableMemoryBytes
+        if (-not [string]::IsNullOrWhiteSpace($availableMemoryBytes)) {
+            $env:GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES = $availableMemoryBytes
+        }
+        $env:GITGRAPH_MAX_PERF_PLATFORM = if ($env:OS -eq "Windows_NT") { "windows" } else { "unix" }
     }
     if ($HardwareMax) {
         $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
@@ -431,6 +475,12 @@ try {
     Write-Host ("Allocator: {0}" -f $Allocator)
     Write-Host ("Native CPU: {0}" -f ([bool]$NativeCpu))
     Write-Host ("Hardware max: {0}" -f ([bool]$HardwareMax))
+    Write-Host ("Max performance: {0}" -f ([bool]$MaxPerformance))
+    if ($MaxPerformance) {
+        Write-Host ("Max performance logical cores: {0}" -f $env:GITGRAPH_MAX_PERF_LOGICAL_CORES)
+        Write-Host ("Max performance available memory bytes: {0}" -f $env:GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES)
+        Write-Host ("Max performance platform: {0}" -f $env:GITGRAPH_MAX_PERF_PLATFORM)
+    }
 
     if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
         if ($EnableLsmRocksdb) {
@@ -543,6 +593,26 @@ finally {
         Remove-Item Env:GITGRAPH_LEVEL3_STREAMING_CSR -ErrorAction SilentlyContinue
     } else {
         $env:GITGRAPH_LEVEL3_STREAMING_CSR = $previousStreamingCsr
+    }
+    if ($null -eq $previousRuntimeProfile) {
+        Remove-Item Env:GITGRAPH_RUNTIME_PROFILE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_RUNTIME_PROFILE = $previousRuntimeProfile
+    }
+    if ($null -eq $previousMaxPerfLogicalCores) {
+        Remove-Item Env:GITGRAPH_MAX_PERF_LOGICAL_CORES -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_MAX_PERF_LOGICAL_CORES = $previousMaxPerfLogicalCores
+    }
+    if ($null -eq $previousMaxPerfAvailableMemoryBytes) {
+        Remove-Item Env:GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES = $previousMaxPerfAvailableMemoryBytes
+    }
+    if ($null -eq $previousMaxPerfPlatform) {
+        Remove-Item Env:GITGRAPH_MAX_PERF_PLATFORM -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_MAX_PERF_PLATFORM = $previousMaxPerfPlatform
     }
     Pop-Location
 }

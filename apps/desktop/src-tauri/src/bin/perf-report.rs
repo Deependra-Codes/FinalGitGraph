@@ -134,6 +134,14 @@ struct ReportInput<'a> {
     incremental_append_telemetry: FixtureBuildTelemetry,
     core_end_to_end: Duration,
     fixture_generation_rss: Option<u64>,
+    scan_repository_rss: Option<u64>,
+    full_index_rss: Option<u64>,
+    incremental_append_rss: Option<u64>,
+    incremental_index_rss: Option<u64>,
+    file_change_extraction_drain_rss: Option<u64>,
+    query_benchmark_rss: Option<u64>,
+    jit_file_change_enrichment_rss: Option<u64>,
+    in_memory_query_rss: Option<u64>,
     final_rss: Option<u64>,
     peak_rss: Option<u64>,
     commit_throughput_per_sec: f64,
@@ -212,7 +220,7 @@ fn run_with_fixture(
     scan_repository(repo_str.as_str(), Some(db_str.as_str())).map_err(|error| error.to_string())?;
     let _repository_scan = scan_started.elapsed();
     log_phase("scan_repository", _repository_scan);
-    let _ = memory_tracker.sample_rss();
+    let scan_repository_rss = memory_tracker.sample_rss();
 
     let full_started = Instant::now();
     let full_stats =
@@ -220,7 +228,7 @@ fn run_with_fixture(
             .map_err(|error| error.to_string())?;
     let full_index = full_started.elapsed();
     log_phase("full_index", full_index);
-    let _ = memory_tracker.sample_rss();
+    let full_index_rss = memory_tracker.sample_rss();
 
     let incremental_fixture_started = Instant::now();
     let incremental_append_telemetry =
@@ -228,7 +236,7 @@ fn run_with_fixture(
     let fixture_after_incremental = collect_fixture_summary(repo_dir)?;
     let _incremental_fixture_append = incremental_fixture_started.elapsed();
     log_phase("append_incremental_commits", _incremental_fixture_append);
-    let _ = memory_tracker.sample_rss();
+    let incremental_append_rss = memory_tracker.sample_rss();
 
     let incremental_started = Instant::now();
     let incremental_stats = index_commits_with_mode(
@@ -239,7 +247,7 @@ fn run_with_fixture(
     .map_err(|error| error.to_string())?;
     let incremental_index = incremental_started.elapsed();
     log_phase("incremental_index", incremental_index);
-    let _ = memory_tracker.sample_rss();
+    let incremental_index_rss = memory_tracker.sample_rss();
 
     let extraction_drain_started = Instant::now();
     let _extraction_drain =
@@ -247,7 +255,7 @@ fn run_with_fixture(
             .map_err(|error| error.to_string())?;
     let file_change_extraction_drain = extraction_drain_started.elapsed();
     log_phase("file_change_extraction_drain", file_change_extraction_drain);
-    let _ = memory_tracker.sample_rss();
+    let file_change_extraction_drain_rss = memory_tracker.sample_rss();
 
     let query_started = Instant::now();
     let total_query_runs = config.query_runs.max(1);
@@ -317,7 +325,7 @@ fn run_with_fixture(
     }
     let query_benchmark = query_started.elapsed();
     log_phase("query_benchmark", query_benchmark);
-    let _ = memory_tracker.sample_rss();
+    let query_benchmark_rss = memory_tracker.sample_rss();
 
     let enrich_started = Instant::now();
     let _ = ensure_file_change_stats_for_commits(
@@ -329,7 +337,7 @@ fn run_with_fixture(
     .map_err(|error| error.to_string())?;
     let jit_file_change_enrichment = enrich_started.elapsed();
     log_phase("jit_file_change_enrichment", jit_file_change_enrichment);
-    let _ = memory_tracker.sample_rss();
+    let jit_file_change_enrichment_rss = memory_tracker.sample_rss();
 
     let in_memory_indexer = Indexer::new(db_path.to_path_buf());
     let in_memory_benchmark = in_memory_indexer
@@ -347,7 +355,7 @@ fn run_with_fixture(
     let in_memory_adjacency_query_latency_ms = in_memory_benchmark.adjacency_latency_ms;
     log_phase("in_memory_graph_hydration", in_memory_graph_hydration);
     log_phase("in_memory_query_benchmark", in_memory_query_benchmark);
-    let _ = memory_tracker.sample_rss();
+    let in_memory_query_rss = memory_tracker.sample_rss();
 
     let store = open_store(db_path).map_err(|error| error.to_string())?;
     let repo_id = if let Some(existing_repo_id) = store
@@ -417,6 +425,14 @@ fn run_with_fixture(
         incremental_append_telemetry,
         core_end_to_end,
         fixture_generation_rss,
+        scan_repository_rss,
+        full_index_rss,
+        incremental_append_rss,
+        incremental_index_rss,
+        file_change_extraction_drain_rss,
+        query_benchmark_rss,
+        jit_file_change_enrichment_rss,
+        in_memory_query_rss,
         final_rss,
         peak_rss,
         commit_throughput_per_sec,
@@ -1390,6 +1406,33 @@ fn format_report(input: &ReportInput<'_>) -> String {
         "final_rss: {}",
         optional_u64_display(input.final_rss)
     ));
+    let runtime_profile =
+        env::var("GITGRAPH_RUNTIME_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let hardware_logical_cores = env::var("GITGRAPH_MAX_PERF_LOGICAL_CORES").unwrap_or_else(|_| {
+        std::thread::available_parallelism()
+            .map(|cores| cores.get().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    });
+    let hardware_available_memory_bytes = env::var("GITGRAPH_MAX_PERF_AVAILABLE_MEMORY_BYTES")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let hardware_platform =
+        env::var("GITGRAPH_MAX_PERF_PLATFORM").unwrap_or_else(|_| env::consts::OS.to_string());
+    let hardware_allocator = if cfg!(feature = "perf-mimalloc") {
+        "mimalloc"
+    } else {
+        "system"
+    };
+    let hardware_rustflags = env::var("RUSTFLAGS").unwrap_or_else(|_| "unset".to_string());
+    lines.push(format!("runtime_profile: {runtime_profile}"));
+    lines.push(format!(
+        "hardware_profile_logical_cores: {hardware_logical_cores}"
+    ));
+    lines.push(format!(
+        "hardware_profile_available_memory_bytes: {hardware_available_memory_bytes}"
+    ));
+    lines.push(format!("hardware_profile_platform: {hardware_platform}"));
+    lines.push(format!("hardware_profile_allocator: {hardware_allocator}"));
+    lines.push(format!("hardware_profile_rustflags: {hardware_rustflags}"));
     lines.push(format!(
         "commit_throughput_per_sec: {:.3}",
         input.commit_throughput_per_sec
@@ -2623,6 +2666,18 @@ fn format_report(input: &ReportInput<'_>) -> String {
         optional_u64_display(input.fixture_generation_rss)
     ));
     lines.push(format!(
+        "full_index_rss: {}",
+        optional_u64_display(input.full_index_rss)
+    ));
+    lines.push(format!(
+        "incremental_index_rss: {}",
+        optional_u64_display(input.incremental_index_rss)
+    ));
+    lines.push(format!(
+        "file_change_extraction_drain_rss: {}",
+        optional_u64_display(input.file_change_extraction_drain_rss)
+    ));
+    lines.push(format!(
         "jit_file_change_enrichment_ms: {:.3}",
         duration_ms(input.jit_file_change_enrichment)
     ));
@@ -2635,8 +2690,16 @@ fn format_report(input: &ReportInput<'_>) -> String {
         duration_ms(input.core_end_to_end),
     ));
     lines.push(format!(
-        "phase_memory_bytes: fixture_generation_rss={} final_rss={} peak_observed_rss={}",
+        "phase_memory_bytes: fixture_generation_rss={} scan_repository_rss={} full_index_rss={} incremental_append_rss={} incremental_index_rss={} file_change_extraction_drain_rss={} query_benchmark_rss={} jit_file_change_enrichment_rss={} in_memory_query_rss={} final_rss={} peak_observed_rss={}",
         optional_u64_display(input.fixture_generation_rss),
+        optional_u64_display(input.scan_repository_rss),
+        optional_u64_display(input.full_index_rss),
+        optional_u64_display(input.incremental_append_rss),
+        optional_u64_display(input.incremental_index_rss),
+        optional_u64_display(input.file_change_extraction_drain_rss),
+        optional_u64_display(input.query_benchmark_rss),
+        optional_u64_display(input.jit_file_change_enrichment_rss),
+        optional_u64_display(input.in_memory_query_rss),
         optional_u64_display(input.final_rss),
         optional_u64_display(input.peak_rss),
     ));
@@ -2922,6 +2985,14 @@ mod tests {
             incremental_append_telemetry: FixtureBuildTelemetry::default(),
             core_end_to_end: Duration::ZERO,
             fixture_generation_rss: None,
+            scan_repository_rss: None,
+            full_index_rss: None,
+            incremental_append_rss: None,
+            incremental_index_rss: None,
+            file_change_extraction_drain_rss: None,
+            query_benchmark_rss: None,
+            jit_file_change_enrichment_rss: None,
+            in_memory_query_rss: None,
             final_rss: None,
             peak_rss: None,
             commit_throughput_per_sec: 0.0,

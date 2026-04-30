@@ -18,13 +18,13 @@ Use a two-tier hardware ingestion lane:
 
 The Git adapter may use a commit-graph fast path for preconditioned full walks and fall back to tape traversal for missing tips or unsupported boundaries. The indexer sends batches of parsed commits to the single DB writer while queue-depth telemetry continues to count commits, not channel messages.
 
-Hardware mode uses the existing `perf-mimalloc` feature and `-C target-cpu=native`. On Windows, `-HardwareMax` runs through the Docker-backed perf lane used by the repository quality gates so the measurement is not dominated by host filesystem policy. It also disables per-batch streaming CSR application for the hardware ingestion run; the full CSR snapshot is still rebuilt after commit ingestion so query benchmarks continue to exercise a materialized runtime graph. Full reindex stats derive the post-index extraction queue depth from the just-enqueued commit count instead of scanning the freshly cleared 100k queue.
+Hardware mode uses the existing `perf-mimalloc` feature and `-C target-cpu=native`. On Windows, `-HardwareMax` runs through the Docker-backed perf lane used by the repository quality gates so the measurement is not dominated by host filesystem policy. The main ingestion hot path defaults to CSR rebuild mode rather than per-batch streaming CSR application; the full CSR snapshot is still rebuilt after commit ingestion so query benchmarks and runtime queries continue to exercise a materialized graph. `GITGRAPH_LEVEL3_STREAMING_CSR=1` remains available for explicit streaming-CSR ablations. Full reindex stats derive the post-index extraction queue depth from the just-enqueued commit count instead of scanning the freshly cleared 100k queue.
 
 ## Consequences
 
 The hot commit-walk path is faster when commit-graph metadata exists and remains correct when the graph is stale. Partial fallback must dedupe commits already emitted by the commit-graph path. The DB writer remains single-owner and file-change extraction stays asynchronous unless strict mode is requested.
 
-The hardware lane is machine-sensitive by design; normal guardrails and dev gates remain the required correctness gates before interpreting perf numbers. The 100k CPS number represents the commit graph ingestion lane, while CSR rebuild and file-change drain remain separately visible through their existing telemetry.
+The hardware lane is machine-sensitive by design; normal guardrails and dev gates remain the required correctness gates before interpreting perf numbers. The 100k CPS number represents the default commit graph ingestion lane, while CSR rebuild and file-change drain remain separately visible through their existing telemetry.
 
 ## Alternatives Considered
 

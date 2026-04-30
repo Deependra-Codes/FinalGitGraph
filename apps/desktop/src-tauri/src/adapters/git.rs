@@ -1260,6 +1260,7 @@ fn walk_commits_from_commit_graph(
         let mut queue: VecDeque<gix::commitgraph::Position> = tip_positions.into_iter().collect();
         phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
         let mut seen = PositionBitmap::default();
+        let mut parent_positions = Vec::with_capacity(2);
         while let Some(position) = queue.pop_front() {
             if !seen.mark(position) {
                 continue;
@@ -1270,9 +1271,10 @@ fn walk_commits_from_commit_graph(
             else {
                 return Ok(None);
             };
-            let Some(parent_positions) = commit_graph_parent_positions(graph, commit)? else {
+            parent_positions.clear();
+            if !commit_graph_parent_positions(graph, commit, &mut parent_positions)? {
                 return Ok(None);
-            };
+            }
             if boundary_position.is_some_and(|boundary| boundary == position) {
                 pruned_parent_expansions =
                     pruned_parent_expansions.saturating_add(parent_positions.len());
@@ -1340,6 +1342,7 @@ fn walk_commits_from_commit_graph(
     let mut seen = PositionBitmap::default();
     let mut commit_time_cache = vec![None; graph.num_commits() as usize];
     let mut queue = BinaryHeap::new();
+    let mut parent_positions = Vec::with_capacity(2);
     let seed_ordering_started = Instant::now();
     for tip_position in tip_positions {
         let Some(committer_time) = commit_graph_cached_committer_time(
@@ -1371,9 +1374,10 @@ fn walk_commits_from_commit_graph(
         else {
             return Ok(None);
         };
-        let Some(parent_positions) = commit_graph_parent_positions(graph, commit)? else {
+        parent_positions.clear();
+        if !commit_graph_parent_positions(graph, commit, &mut parent_positions)? {
             return Ok(None);
-        };
+        }
         if boundary_position.is_some_and(|boundary| boundary == entry.position) {
             pruned_parent_expansions =
                 pruned_parent_expansions.saturating_add(parent_positions.len());
@@ -1461,19 +1465,19 @@ fn walk_commits_from_commit_graph(
 fn commit_graph_parent_positions(
     graph: &gix::commitgraph::Graph,
     commit: gix::commitgraph::file::Commit<'_>,
-) -> AppResult<Option<Vec<gix::commitgraph::Position>>> {
-    let mut parents = Vec::new();
+    parents: &mut Vec<gix::commitgraph::Position>,
+) -> AppResult<bool> {
     for parent in commit.iter_parents() {
         let parent_position = match parent {
             Ok(position) => position,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(false),
         };
         if parent_position.0 >= graph.num_commits() {
-            return Ok(None);
+            return Ok(false);
         }
         parents.push(gix::commitgraph::Position(parent_position.0));
     }
-    Ok(Some(parents))
+    Ok(true)
 }
 
 fn commit_graph_commit_by_id<'a>(
