@@ -13,12 +13,22 @@ param(
     [switch]$PreconditionCommitGraph,
     [switch]$KeepFixture,
     [switch]$EnableLsmRocksdb,
+    [ValidateSet("system", "mimalloc")]
+    [string]$Allocator = "system",
+    [switch]$NativeCpu,
+    [switch]$HardwareMax,
     [string]$LibclangPath = "",
     [string]$WindowsDockerDataRoot = "D:\docker-data\gitgraph-lab",
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($HardwareMax) {
+    $Allocator = "mimalloc"
+    $NativeCpu = [System.Management.Automation.SwitchParameter]::new($true)
+    $PreconditionCommitGraph = [System.Management.Automation.SwitchParameter]::new($true)
+}
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoRootPath = $repoRoot.Path
@@ -239,7 +249,6 @@ function Get-DockerRunArgs {
 
     $forwardedEnvArgs = @()
     $forwardedEnvKeys = @(
-        "GITGRAPH_INDEX_FAST_MODE",
         "GITGRAPH_INGEST_WRITE_PROFILE",
         "GITGRAPH_COMMIT_WALK_SORT",
         "GITGRAPH_FILE_CHANGE_PIPELINE_COMMIT_BATCH_FULL",
@@ -337,8 +346,64 @@ function Get-ReportArgs {
 }
 
 function Get-CargoFeatureArgs {
+    $featureNames = @()
     if ($EnableLsmRocksdb) {
-        return @("--features", "lsm-rocksdb")
+        $featureNames += "lsm-rocksdb"
+    }
+    if ($Allocator -eq "mimalloc") {
+        $featureNames += "perf-mimalloc"
+    }
+    if ($featureNames.Count -gt 0) {
+        return @("--features", ($featureNames -join ","))
+    }
+    return @()
+}
+
+function Get-CargoRustflags {
+    $resolved = $env:RUSTFLAGS
+    $nativeCpuFlag = "-C target-cpu=native"
+    if (-not $NativeCpu) {
+        return $resolved
+    }
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        return $nativeCpuFlag
+    }
+    if ($resolved -match [Regex]::Escape($nativeCpuFlag)) {
+        return $resolved
+    }
+    return ($resolved.Trim() + " " + $nativeCpuFlag)
+}
+
+function Get-DockerShellPrefix {
+    $exports = @("export PATH=/usr/local/cargo/bin:`$PATH")
+    $cargoRustflags = Get-CargoRustflags
+    if (-not [string]::IsNullOrWhiteSpace($cargoRustflags)) {
+        $exports += ("export RUSTFLAGS=" + (Convert-ToBashSingleQuoted $cargoRustflags))
+    }
+    return (($exports -join "; ") + "; ")
+}
+
+function Invoke-WithExperimentRustflags {
+    param(
+        [scriptblock]$Action
+    )
+
+    $previousRustflags = $env:RUSTFLAGS
+    $resolvedRustflags = Get-CargoRustflags
+    try {
+        if ([string]::IsNullOrWhiteSpace($resolvedRustflags)) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $resolvedRustflags
+        }
+        return & $Action
+    }
+    finally {
+        if ($null -eq $previousRustflags) {
+            Remove-Item Env:RUSTFLAGS -ErrorAction SilentlyContinue
+        } else {
+            $env:RUSTFLAGS = $previousRustflags
+        }
     }
     return @()
 }
@@ -353,9 +418,15 @@ function Invoke-PerfReportDocker {
     Write-Host "Retrying performance report in Docker fallback..."
     $reportArgs = Get-ReportArgs
     $quotedArgs = $reportArgs | ForEach-Object { Convert-ToBashSingleQuoted $_ }
-    $featureArgs = if ($EnableLsmRocksdb) { " --features lsm-rocksdb" } else { "" }
-    $buildCommand = "export PATH=/usr/local/cargo/bin:`$PATH; cargo build --package gitgraph-lab-core --release --locked --bin perf-report$featureArgs"
-    $runCommand = "export PATH=/usr/local/cargo/bin:`$PATH; /cargo-target/release/perf-report " + ($quotedArgs -join " ")
+    $dockerPrefix = Get-DockerShellPrefix
+    $featureArgList = Get-CargoFeatureArgs
+    $featureArgs = if ($featureArgList.Count -gt 0) {
+        " " + (($featureArgList | ForEach-Object { Convert-ToBashSingleQuoted $_ }) -join " ")
+    } else {
+        ""
+    }
+    $buildCommand = $dockerPrefix + "cargo build --package gitgraph-lab-core --release --locked --bin perf-report$featureArgs"
+    $runCommand = $dockerPrefix + "/cargo-target/release/perf-report " + ($quotedArgs -join " ")
 
     $buildResult = Invoke-DockerPhase `
         -RepoRootPath $RepoRootPath `
@@ -383,8 +454,20 @@ function Invoke-PerfReportDocker {
 Push-Location $repoRoot
 try {
     $previousIngestPrimary = $env:GITGRAPH_INGEST_PRIMARY
+    $previousIngestWriteProfile = $env:GITGRAPH_INGEST_WRITE_PROFILE
+    $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
+    $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
+    $previousStreamingCsr = $env:GITGRAPH_LEVEL3_STREAMING_CSR
     if ($EnableLsmRocksdb) {
         $env:GITGRAPH_INGEST_PRIMARY = "rocksdb"
+    }
+    if ($HardwareMax) {
+        $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
+        $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
+        $env:GITGRAPH_LEVEL3_STREAMING_CSR = "0"
+        if ([string]::IsNullOrWhiteSpace($previousWalkSort)) {
+            $env:GITGRAPH_COMMIT_WALK_SORT = "breadth_first"
+        }
     }
 
     if ($EnableLsmRocksdb -and -not [string]::IsNullOrWhiteSpace($LibclangPath)) {
@@ -401,6 +484,10 @@ try {
         Write-Host "Cargo target: $CargoTargetRoot"
         return
     }
+
+    Write-Host ("Allocator: {0}" -f $Allocator)
+    Write-Host ("Native CPU: {0}" -f ([bool]$NativeCpu))
+    Write-Host ("Hardware max: {0}" -f ([bool]$HardwareMax))
 
     if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
         if ($EnableLsmRocksdb) {
@@ -422,11 +509,12 @@ try {
     )
     $hostBuildArgs += Get-CargoFeatureArgs
     $repoLocalTargetRoot = Join-Path $repoRootPath "target"
-
-    $buildResult = Invoke-ExternalPhase `
-        -Executable "cargo" `
-        -Arguments $hostBuildArgs `
-        -PhaseLabel "Host build phase (perf-report binary)..."
+    $buildResult = Invoke-WithExperimentRustflags {
+        Invoke-ExternalPhase `
+            -Executable "cargo" `
+            -Arguments $hostBuildArgs `
+            -PhaseLabel "Host build phase (perf-report binary)..."
+    }
 
     $combinedOutputText = $buildResult.OutputText
     if ($buildResult.ExitCode -ne 0 -and -not $cargoTargetRootWasExplicit) {
@@ -438,10 +526,12 @@ try {
                 "'. Retrying with repo-local cargo target '" + $repoLocalTargetRoot + "'..."
             )
             Set-CargoTargetRoot -NextCargoTargetRoot $repoLocalTargetRoot
-            $buildResult = Invoke-ExternalPhase `
-                -Executable "cargo" `
-                -Arguments $hostBuildArgs `
-                -PhaseLabel "Host build phase retry (repo-local target)..."
+            $buildResult = Invoke-WithExperimentRustflags {
+                Invoke-ExternalPhase `
+                    -Executable "cargo" `
+                    -Arguments $hostBuildArgs `
+                    -PhaseLabel "Host build phase retry (repo-local target)..."
+            }
             $combinedOutputText = $buildResult.OutputText
         }
     }
@@ -490,6 +580,26 @@ finally {
         Remove-Item Env:GITGRAPH_INGEST_PRIMARY -ErrorAction SilentlyContinue
     } else {
         $env:GITGRAPH_INGEST_PRIMARY = $previousIngestPrimary
+    }
+    if ($null -eq $previousIngestWriteProfile) {
+        Remove-Item Env:GITGRAPH_INGEST_WRITE_PROFILE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_INGEST_WRITE_PROFILE = $previousIngestWriteProfile
+    }
+    if ($null -eq $previousWalkSort) {
+        Remove-Item Env:GITGRAPH_COMMIT_WALK_SORT -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_COMMIT_WALK_SORT = $previousWalkSort
+    }
+    if ($null -eq $previousPerfReportDockerOnly) {
+        Remove-Item Env:GITGRAPH_PERF_REPORT_DOCKER_ONLY -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = $previousPerfReportDockerOnly
+    }
+    if ($null -eq $previousStreamingCsr) {
+        Remove-Item Env:GITGRAPH_LEVEL3_STREAMING_CSR -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_LEVEL3_STREAMING_CSR = $previousStreamingCsr
     }
     Pop-Location
 }

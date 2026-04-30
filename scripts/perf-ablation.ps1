@@ -238,7 +238,7 @@ function Parse-ScenarioRunMetrics {
         WalkTipCount = (Parse-Double (Get-ReportValueOrDefault -Path $ReportPath -Key "aggregate_commit_walk_tip_count" -DefaultValue "0"))
         PrunedParentExpansions = (Parse-Double (Get-ReportValueOrDefault -Path $ReportPath -Key "aggregate_commit_walk_pruned_parent_expansions" -DefaultValue "0"))
         CommitWalkMs = (Parse-Double (Get-ReportValueOrDefault -Path $ReportPath -Key "ingest_commit_walk_ms" -DefaultValue "0"))
-        WalkBackend = (Get-ReportValueOrDefault -Path $ReportPath -Key "full_commit_walk_backend_effective" -DefaultValue "n/a")
+        WalkEngine = (Get-ReportValueOrDefault -Path $ReportPath -Key "full_commit_walk_engine" -DefaultValue "n/a")
         WalkSort = (Get-ReportValueOrDefault -Path $ReportPath -Key "full_commit_walk_sort_effective" -DefaultValue "n/a")
     }
 }
@@ -263,15 +263,13 @@ function Invoke-Scenario {
     $walkTipCount = New-Object System.Collections.Generic.List[double]
     $prunedParentExpansions = New-Object System.Collections.Generic.List[double]
     $commitWalkMs = New-Object System.Collections.Generic.List[double]
-    $walkBackend = New-Object System.Collections.Generic.List[string]
+    $walkEngine = New-Object System.Collections.Generic.List[string]
     $walkSort = New-Object System.Collections.Generic.List[string]
 
     $allKeys = @(
         "GITGRAPH_FILE_CHANGE_SYNC_STRICT",
         "GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH",
         "GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO",
-        "GITGRAPH_INDEX_FAST_MODE",
-        "GITGRAPH_LEVEL3_PACK_AWARE_INGEST",
         "GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER",
         "GITGRAPH_LEVEL3_STREAMING_CSR",
         "GITGRAPH_LEVEL3_STREAMING_CSR_MODE",
@@ -372,7 +370,7 @@ function Invoke-Scenario {
             $walkTipCount.Add($metrics.WalkTipCount)
             $prunedParentExpansions.Add($metrics.PrunedParentExpansions)
             $commitWalkMs.Add($metrics.CommitWalkMs)
-            $walkBackend.Add($metrics.WalkBackend)
+            $walkEngine.Add($metrics.WalkEngine)
             $walkSort.Add($metrics.WalkSort)
         }
 
@@ -389,7 +387,7 @@ function Invoke-Scenario {
                 BottleneckPhase = "failed"
                 BottleneckMsMedian = 0.0
                 WalkScopeMode = "failed"
-                WalkBackendMode = "failed"
+                WalkEngineMode = "failed"
                 WalkSortMode = "failed"
                 AggregateWalkTipCountMedian = 0.0
                 AggregatePrunedParentExpansionsMedian = 0.0
@@ -422,7 +420,7 @@ function Invoke-Scenario {
         BottleneckPhase = Mode-String $bottleneckPhase
         BottleneckMsMedian = [Math]::Round((Median-Double $bottleneckMs), 3)
         WalkScopeMode = Mode-String $walkScope
-        WalkBackendMode = Mode-String $walkBackend
+        WalkEngineMode = Mode-String $walkEngine
         WalkSortMode = Mode-String $walkSort
         AggregateWalkTipCountMedian = [Math]::Round((Median-Double $walkTipCount), 3)
         AggregatePrunedParentExpansionsMedian = [Math]::Round((Median-Double $prunedParentExpansions), 3)
@@ -518,8 +516,6 @@ if ($CommitWalkResearch90k) {
                 GITGRAPH_FILE_CHANGE_SYNC_STRICT = "1"
                 GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH = "1"
                 GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO = "0"
-                GITGRAPH_INDEX_FAST_MODE = "0"
-                GITGRAPH_LEVEL3_PACK_AWARE_INGEST = "0"
                 GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER = "0"
                 GITGRAPH_COMMIT_WALK_SORT = "commit_time_newest"
                 GITGRAPH_COMMIT_WALK_SCOPE = "frontier"
@@ -528,12 +524,10 @@ if ($CommitWalkResearch90k) {
                 GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE = "1024"
             }
         },
-        @{ Name = "v2-index-only"; Env = @{
+        @{ Name = "baseline-index-only"; Env = @{
                 GITGRAPH_FILE_CHANGE_SYNC_STRICT = "0"
                 GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH = "1"
                 GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO = "0"
-                GITGRAPH_INDEX_FAST_MODE = "0"
-                GITGRAPH_LEVEL3_PACK_AWARE_INGEST = "0"
                 GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER = "0"
                 GITGRAPH_COMMIT_WALK_SORT = "commit_time_newest"
                 GITGRAPH_COMMIT_WALK_SCOPE = "frontier"
@@ -542,12 +536,10 @@ if ($CommitWalkResearch90k) {
                 GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE = "8192"
             }
         },
-        @{ Name = "v2+adaptive-wave"; Env = @{
+        @{ Name = "adaptive-wave"; Env = @{
                 GITGRAPH_FILE_CHANGE_SYNC_STRICT = "0"
                 GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH = "0"
                 GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO = "0"
-                GITGRAPH_INDEX_FAST_MODE = "0"
-                GITGRAPH_LEVEL3_PACK_AWARE_INGEST = "0"
                 GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER = "0"
                 GITGRAPH_COMMIT_WALK_SORT = "commit_time_newest"
                 GITGRAPH_COMMIT_WALK_SCOPE = "frontier"
@@ -560,8 +552,6 @@ if ($CommitWalkResearch90k) {
                 GITGRAPH_FILE_CHANGE_SYNC_STRICT = "0"
                 GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH = "0"
                 GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO = "1"
-                GITGRAPH_INDEX_FAST_MODE = "1"
-                GITGRAPH_LEVEL3_PACK_AWARE_INGEST = "1"
                 GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER = "1"
                 GITGRAPH_COMMIT_WALK_SCOPE = "frontier"
                 GITGRAPH_COMMIT_INGEST_PIPELINED = "1"
@@ -654,7 +644,7 @@ $lines = @(
     ("Runs per scenario: {0}" -f $Runs),
     ("Thermal cooldown: {0}" -f $cooldownLabel),
     "",
-    "| Scenario | Aggregate CPS (median) | Full CPS (median) | Query Benchmark ms (median) | In-Memory Query ms (median) | Core End-to-End ms (median) | Bottleneck Phase | Bottleneck ms (median) | Commit Walk ms (median) | Walk Backend (mode) | Walk Sort (mode) | Walk Scope (mode) | Walk Tip Count (median) | Pruned Parent Expansions (median) |",
+    "| Scenario | Aggregate CPS (median) | Full CPS (median) | Query Benchmark ms (median) | In-Memory Query ms (median) | Core End-to-End ms (median) | Bottleneck Phase | Bottleneck ms (median) | Commit Walk ms (median) | Walk Engine (mode) | Walk Sort (mode) | Walk Scope (mode) | Walk Tip Count (median) | Pruned Parent Expansions (median) |",
     "| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | ---: | ---: |"
 )
 foreach ($result in $results) {
@@ -673,7 +663,7 @@ foreach ($result in $results) {
             $result.BottleneckPhase, `
             $result.BottleneckMsMedian, `
             $result.CommitWalkMsMedian, `
-            $result.WalkBackendMode, `
+            $result.WalkEngineMode, `
             $result.WalkSortMode, `
             $result.WalkScopeMode, `
             $result.AggregateWalkTipCountMedian, `

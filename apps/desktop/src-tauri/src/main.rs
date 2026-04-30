@@ -6,6 +6,10 @@ use gitgraph_lab_core::application::commands::{
 };
 use gitgraph_lab_core::domain::models::{GraphDirection, GraphTraversalStrategy, IndexingMode};
 
+#[cfg(feature = "perf-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {

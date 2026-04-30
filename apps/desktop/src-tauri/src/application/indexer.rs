@@ -1,18 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc::sync_channel, Arc};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::bounded;
+
 use crate::adapters::db::{
     open_store, should_compact_graph_overlay, CsrSnapshot, GraphOverlayParentRow,
-    GraphSnapshotState, GraphStore,
+    GraphSnapshotMetadata, GraphSnapshotState, GraphStore,
 };
 use crate::adapters::git::{
     hydrate_commit_metadata_for_shas, level3_runtime_options,
     load_file_change_line_stats_for_targets, load_refs, reorder_commits_topologically,
-    reorder_commits_topologically_with_parents, stream_commits, stream_commits_with_hide,
+    reorder_commits_topologically_with_parents, stream_commit_batches_with_hide, stream_commits,
     stream_file_changes_for_commits, stream_file_changes_for_commits_drain, validate_repository,
     FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
@@ -21,9 +23,9 @@ use crate::application::limits::{normalize_graph_max_nodes, normalize_window_lim
 use crate::domain::models::{
     CommitMetadataState, CommitThroughputTelemetry, CommitWindowCursor, CommitWindowResponse,
     FileChangeExtractionDrainBatchStats, FileChangeExtractionDrainPhaseTimingMs,
-    FileChangeExtractionDrainStats, GraphDirection, GraphTraversalResponse, GraphTraversalStrategy,
-    IndexCheckpoint, IndexingMode, IndexingStats, IngestionPhaseTimingMs,
-    PendingFileChangeEnrichment, RepositorySummary, ShortestPathResponse,
+    FileChangeExtractionDrainStats, FileChangeExtractionQueueMetrics, GraphDirection,
+    GraphTraversalResponse, GraphTraversalStrategy, IndexCheckpoint, IndexingMode, IndexingStats,
+    IngestionPhaseTimingMs, PendingFileChangeEnrichment, RepositorySummary, ShortestPathResponse,
 };
 use crate::support::clock::now_epoch_seconds;
 use crate::support::error::{AppError, AppResult};
@@ -47,6 +49,9 @@ const COMMIT_WRITE_WAVE_MIN: usize = 2_048;
 const COMMIT_WRITE_WAVE_MAX: usize = 32_768;
 const COMMIT_INGEST_QUEUE_CAPACITY_DEFAULT: usize = 32_768;
 const COMMIT_WINDOW_PREWARM_LIMIT_DEFAULT: usize = 1_024;
+
+static RUNTIME_QUERY_GRAPH_CACHE: OnceLock<Mutex<Option<RuntimeQueryGraphCacheEntry>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamingCsrMode {
@@ -76,17 +81,23 @@ struct IngestionPhaseTiming {
     commit_walk_graph_lookup: Duration,
     commit_walk_ordering: Duration,
     commit_walk_emit: Duration,
+    commit_walk_pack_inflate: Duration,
+    commit_walk_pack_base_resolve: Duration,
+    commit_walk_pack_parse: Duration,
+    commit_walk_tape_build: Duration,
     commit_walk_graph_lookup_hit_count: usize,
     commit_walk_graph_lookup_miss_count: usize,
-    commit_walk_graph_fallback_count: usize,
-    commit_walk_graph_partial_fallback_count: usize,
+    commit_walk_graph_assist_hit_count: usize,
+    commit_walk_graph_assist_miss_count: usize,
     commit_walk_nodes_seen_count: usize,
     commit_walk_nodes_pruned_count: usize,
     commit_walk_queue_max_depth: usize,
     commit_metadata_pending_count: usize,
-    commit_walk_missing_tip_count: usize,
+    commit_walk_graph_missing_tip_count: usize,
     commit_walk_boundary_stop_count: usize,
     commit_walk_overlap_skip_count: usize,
+    commit_walk_tape_node_count: usize,
+    commit_walk_tape_parent_edges: usize,
     commit_upsert: Duration,
     edge_materialize: Duration,
     file_diff_extract: Duration,
@@ -197,9 +208,9 @@ struct PlannerTelemetryContext {
 #[derive(Debug, Clone, Copy)]
 struct CommitWalkTelemetryContext<'a> {
     scope: &'a str,
-    backend_effective: &'a str,
+    engine: &'a str,
     sort_effective: &'a str,
-    fallback_boundary_effective: &'a str,
+    boundary_mode: &'a str,
     tip_count: usize,
     pruned_parent_expansions: usize,
     decode: Duration,
@@ -210,18 +221,23 @@ struct CommitWalkTelemetryContext<'a> {
     graph_lookup: Duration,
     ordering: Duration,
     emit: Duration,
+    pack_inflate: Duration,
+    pack_base_resolve: Duration,
+    pack_parse: Duration,
+    tape_build: Duration,
     graph_lookup_hit_count: usize,
     graph_lookup_miss_count: usize,
-    graph_fallback_count: usize,
-    graph_partial_fallback_count: usize,
+    graph_assist_hit_count: usize,
+    graph_assist_miss_count: usize,
     nodes_seen_count: usize,
     nodes_pruned_count: usize,
     queue_max_depth: usize,
     metadata_pending_count: usize,
-    missing_tip_count: usize,
+    graph_missing_tip_count: usize,
     boundary_stop_count: usize,
     overlap_skip_count: usize,
-    v2_enabled: bool,
+    tape_node_count: usize,
+    tape_parent_edges: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -252,18 +268,23 @@ impl IngestionPhaseTiming {
             commit_walk_graph_lookup: duration_ms(self.commit_walk_graph_lookup),
             commit_walk_ordering: duration_ms(self.commit_walk_ordering),
             commit_walk_emit: duration_ms(self.commit_walk_emit),
+            commit_walk_pack_inflate: duration_ms(self.commit_walk_pack_inflate),
+            commit_walk_pack_base_resolve: duration_ms(self.commit_walk_pack_base_resolve),
+            commit_walk_pack_parse: duration_ms(self.commit_walk_pack_parse),
+            commit_walk_tape_build: duration_ms(self.commit_walk_tape_build),
             commit_walk_graph_lookup_hit_count: self.commit_walk_graph_lookup_hit_count as f64,
             commit_walk_graph_lookup_miss_count: self.commit_walk_graph_lookup_miss_count as f64,
-            commit_walk_graph_fallback_count: self.commit_walk_graph_fallback_count as f64,
-            commit_walk_graph_partial_fallback_count: self.commit_walk_graph_partial_fallback_count
-                as f64,
+            commit_walk_graph_assist_hit_count: self.commit_walk_graph_assist_hit_count as f64,
+            commit_walk_graph_assist_miss_count: self.commit_walk_graph_assist_miss_count as f64,
             commit_walk_nodes_seen_count: self.commit_walk_nodes_seen_count as f64,
             commit_walk_nodes_pruned_count: self.commit_walk_nodes_pruned_count as f64,
             commit_walk_queue_max_depth: self.commit_walk_queue_max_depth as f64,
             commit_metadata_pending_count: self.commit_metadata_pending_count as f64,
-            commit_walk_missing_tip_count: self.commit_walk_missing_tip_count as f64,
+            commit_walk_graph_missing_tip_count: self.commit_walk_graph_missing_tip_count as f64,
             commit_walk_boundary_stop_count: self.commit_walk_boundary_stop_count as f64,
             commit_walk_overlap_skip_count: self.commit_walk_overlap_skip_count as f64,
+            commit_walk_tape_node_count: self.commit_walk_tape_node_count as f64,
+            commit_walk_tape_parent_edges: self.commit_walk_tape_parent_edges as f64,
             commit_upsert: duration_ms(self.commit_upsert),
             edge_materialize: duration_ms(self.edge_materialize),
             file_diff_extract: duration_ms(self.file_diff_extract),
@@ -403,7 +424,12 @@ impl Indexer {
         let commit_walk_started = Instant::now();
         let commit_walk_stats = if pipelined_commit_ingest {
             let (commit_sender, commit_receiver) =
-                sync_channel::<crate::domain::models::ParsedCommit>(commit_ingest_queue_capacity);
+                bounded::<Vec<crate::domain::models::ParsedCommit>>(
+                    resolve_commit_ingest_batch_queue_capacity(
+                        commit_ingest_queue_capacity,
+                        commit_batch_size,
+                    ),
+                );
             let queue_depth = Arc::new(AtomicUsize::new(0));
             let queue_max_depth = Arc::new(AtomicUsize::new(0));
             let queue_depth_for_writer = Arc::clone(&queue_depth);
@@ -423,27 +449,31 @@ impl Indexer {
                     run_commit_ingest_writer_loop(store_for_writer, commit_receiver, writer_options)
                 });
 
-                let mut on_streamed_commit =
-                    |commit: crate::domain::models::ParsedCommit| -> AppResult<()> {
+                let mut on_streamed_commit_batch =
+                    |commit_batch: Vec<crate::domain::models::ParsedCommit>| -> AppResult<()> {
                         let callback_started = Instant::now();
-                        edges_inserted = edges_inserted.saturating_add(commit.parents.len());
-                        update_checkpoint_candidate(
-                            &mut checkpoint_candidate,
-                            commit.committer_time,
-                            &commit.sha,
-                        );
-                        if capture_streamed_commit_parents {
-                            streamed_commit_parents
-                                .insert(commit.sha.clone(), commit.parents.clone());
+                        let commit_count = commit_batch.len();
+                        for commit in &commit_batch {
+                            edges_inserted = edges_inserted.saturating_add(commit.parents.len());
+                            update_checkpoint_candidate(
+                                &mut checkpoint_candidate,
+                                commit.committer_time,
+                                &commit.sha,
+                            );
+                            if capture_streamed_commit_parents {
+                                streamed_commit_parents
+                                    .insert(commit.sha.clone(), commit.parents.clone());
+                            }
+                            streamed_commit_shas.push(commit.sha.clone());
                         }
-                        streamed_commit_shas.push(commit.sha.clone());
 
-                        let depth_after_enqueue =
-                            queue_depth.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+                        let depth_after_enqueue = queue_depth
+                            .fetch_add(commit_count, Ordering::Relaxed)
+                            .saturating_add(commit_count);
                         update_max_atomic(&queue_max_depth, depth_after_enqueue);
                         let queue_wait_started = Instant::now();
-                        if let Err(error) = commit_sender.send(commit) {
-                            let _ = queue_depth.fetch_sub(1, Ordering::SeqCst);
+                        if let Err(error) = commit_sender.send(commit_batch) {
+                            let _ = queue_depth.fetch_sub(commit_count, Ordering::Relaxed);
                             return Err(AppError::Parse(format!(
                                 "commit ingest queue send failed: {error}"
                             )));
@@ -459,14 +489,20 @@ impl Indexer {
 
                 let walk_result = if effective_mode == IndexingMode::Incremental {
                     let hide_ancestor_sha = hide_ancestor_sha.as_deref();
-                    stream_commits_with_hide(
+                    stream_commit_batches_with_hide(
                         &canonical_repo.root,
                         since_epoch,
                         hide_ancestor_sha,
-                        &mut on_streamed_commit,
+                        commit_batch_size,
+                        &mut on_streamed_commit_batch,
                     )
                 } else {
-                    stream_commits(&canonical_repo.root, since_epoch, &mut on_streamed_commit)
+                    stream_commits(
+                        &canonical_repo.root,
+                        since_epoch,
+                        commit_batch_size,
+                        &mut on_streamed_commit_batch,
+                    )
                 };
 
                 drop(commit_sender);
@@ -488,29 +524,32 @@ impl Indexer {
                 adaptive_commit_waves,
             );
 
-            let mut on_streamed_commit =
-                |commit: crate::domain::models::ParsedCommit| -> AppResult<()> {
+            let mut on_streamed_commit_batch =
+                |streamed_batch: Vec<crate::domain::models::ParsedCommit>| -> AppResult<()> {
                     let callback_started = Instant::now();
-                    edges_inserted = edges_inserted.saturating_add(commit.parents.len());
-                    update_checkpoint_candidate(
-                        &mut checkpoint_candidate,
-                        commit.committer_time,
-                        &commit.sha,
-                    );
-                    if capture_streamed_commit_parents {
-                        streamed_commit_parents.insert(commit.sha.clone(), commit.parents.clone());
-                    }
-                    streamed_commit_shas.push(commit.sha.clone());
-                    commit_batch.push(commit);
-                    if commit_batch.len() >= controller.target_batch_size() {
-                        flush_commit_write_wave(
-                            &store,
-                            repo_id,
-                            &mut commit_batch,
-                            streaming_snapshot_apply_enabled,
-                            &mut controller,
-                            &mut commit_writer_stats,
-                        )?;
+                    for commit in streamed_batch {
+                        edges_inserted = edges_inserted.saturating_add(commit.parents.len());
+                        update_checkpoint_candidate(
+                            &mut checkpoint_candidate,
+                            commit.committer_time,
+                            &commit.sha,
+                        );
+                        if capture_streamed_commit_parents {
+                            streamed_commit_parents
+                                .insert(commit.sha.clone(), commit.parents.clone());
+                        }
+                        streamed_commit_shas.push(commit.sha.clone());
+                        commit_batch.push(commit);
+                        if commit_batch.len() >= controller.target_batch_size() {
+                            flush_commit_write_wave(
+                                &store,
+                                repo_id,
+                                &mut commit_batch,
+                                streaming_snapshot_apply_enabled,
+                                &mut controller,
+                                &mut commit_writer_stats,
+                            )?;
+                        }
                     }
                     commit_callback_duration =
                         commit_callback_duration.saturating_add(callback_started.elapsed());
@@ -519,14 +558,20 @@ impl Indexer {
 
             let commit_walk_stats = if effective_mode == IndexingMode::Incremental {
                 let hide_ancestor_sha = hide_ancestor_sha.as_deref();
-                stream_commits_with_hide(
+                stream_commit_batches_with_hide(
                     &canonical_repo.root,
                     since_epoch,
                     hide_ancestor_sha,
-                    &mut on_streamed_commit,
+                    commit_batch_size,
+                    &mut on_streamed_commit_batch,
                 )?
             } else {
-                stream_commits(&canonical_repo.root, since_epoch, &mut on_streamed_commit)?
+                stream_commits(
+                    &canonical_repo.root,
+                    since_epoch,
+                    commit_batch_size,
+                    &mut on_streamed_commit_batch,
+                )?
             };
 
             if !commit_batch.is_empty() {
@@ -556,20 +601,28 @@ impl Indexer {
         ingestion_timing.commit_walk_graph_lookup = commit_walk_stats.graph_lookup;
         ingestion_timing.commit_walk_ordering = commit_walk_stats.ordering;
         ingestion_timing.commit_walk_emit = commit_walk_stats.emit;
+        ingestion_timing.commit_walk_pack_inflate = commit_walk_stats.pack_inflate;
+        ingestion_timing.commit_walk_pack_base_resolve = commit_walk_stats.pack_base_resolve;
+        ingestion_timing.commit_walk_pack_parse = commit_walk_stats.pack_parse;
+        ingestion_timing.commit_walk_tape_build = commit_walk_stats.tape_build;
         ingestion_timing.commit_walk_graph_lookup_hit_count =
             commit_walk_stats.graph_lookup_hit_count;
         ingestion_timing.commit_walk_graph_lookup_miss_count =
             commit_walk_stats.graph_lookup_miss_count;
-        ingestion_timing.commit_walk_graph_fallback_count = commit_walk_stats.graph_fallback_count;
-        ingestion_timing.commit_walk_graph_partial_fallback_count =
-            commit_walk_stats.graph_partial_fallback_count;
+        ingestion_timing.commit_walk_graph_assist_hit_count =
+            commit_walk_stats.graph_assist_hit_count;
+        ingestion_timing.commit_walk_graph_assist_miss_count =
+            commit_walk_stats.graph_assist_miss_count;
         ingestion_timing.commit_walk_nodes_seen_count = commit_walk_stats.nodes_seen_count;
         ingestion_timing.commit_walk_nodes_pruned_count = commit_walk_stats.nodes_pruned_count;
         ingestion_timing.commit_walk_queue_max_depth = commit_walk_stats.queue_max_depth;
         ingestion_timing.commit_metadata_pending_count = commit_walk_stats.metadata_pending_count;
-        ingestion_timing.commit_walk_missing_tip_count = commit_walk_stats.missing_tip_count;
+        ingestion_timing.commit_walk_graph_missing_tip_count =
+            commit_walk_stats.graph_missing_tip_count;
         ingestion_timing.commit_walk_boundary_stop_count = commit_walk_stats.boundary_stop_count;
         ingestion_timing.commit_walk_overlap_skip_count = commit_walk_stats.overlap_skip_count;
+        ingestion_timing.commit_walk_tape_node_count = commit_walk_stats.tape_node_count;
+        ingestion_timing.commit_walk_tape_parent_edges = commit_walk_stats.tape_parent_edges;
         ingestion_timing.commit_upsert = ingestion_timing
             .commit_upsert
             .saturating_add(commit_writer_stats.commit_upsert);
@@ -664,8 +717,14 @@ impl Indexer {
             }
         } else if !streamed_commit_shas.is_empty() {
             let enqueue_started = Instant::now();
-            file_change_commits_enqueued =
-                store.enqueue_commits_for_file_change_extraction(repo_id, &streamed_commit_shas)?;
+            file_change_commits_enqueued = if effective_mode == IndexingMode::Full {
+                store.enqueue_commits_for_file_change_extraction_after_clear(
+                    repo_id,
+                    &streamed_commit_shas,
+                )?
+            } else {
+                store.enqueue_commits_for_file_change_extraction(repo_id, &streamed_commit_shas)?
+            };
             ingestion_timing.extraction_dispatch_wait = ingestion_timing
                 .extraction_dispatch_wait
                 .saturating_add(enqueue_started.elapsed());
@@ -765,8 +824,9 @@ impl Indexer {
 
         let commit_walk_telemetry = CommitWalkTelemetryContext {
             scope: commit_walk_stats.scope.as_str(),
-            backend_effective: commit_walk_stats.backend_effective.as_str(),
+            engine: commit_walk_stats.engine.as_str(),
             sort_effective: commit_walk_stats.sort_effective.as_str(),
+            boundary_mode: commit_walk_stats.boundary_mode.as_str(),
             tip_count: commit_walk_stats.tip_count,
             pruned_parent_expansions: commit_walk_stats.pruned_parent_expansions,
             decode: commit_walk_stats.decode,
@@ -777,19 +837,23 @@ impl Indexer {
             graph_lookup: commit_walk_stats.graph_lookup,
             ordering: commit_walk_stats.ordering,
             emit: commit_walk_stats.emit,
+            pack_inflate: commit_walk_stats.pack_inflate,
+            pack_base_resolve: commit_walk_stats.pack_base_resolve,
+            pack_parse: commit_walk_stats.pack_parse,
+            tape_build: commit_walk_stats.tape_build,
             graph_lookup_hit_count: commit_walk_stats.graph_lookup_hit_count,
             graph_lookup_miss_count: commit_walk_stats.graph_lookup_miss_count,
-            graph_fallback_count: commit_walk_stats.graph_fallback_count,
-            graph_partial_fallback_count: commit_walk_stats.graph_partial_fallback_count,
+            graph_assist_hit_count: commit_walk_stats.graph_assist_hit_count,
+            graph_assist_miss_count: commit_walk_stats.graph_assist_miss_count,
             nodes_seen_count: commit_walk_stats.nodes_seen_count,
             nodes_pruned_count: commit_walk_stats.nodes_pruned_count,
             queue_max_depth: commit_walk_stats.queue_max_depth,
             metadata_pending_count: commit_walk_stats.metadata_pending_count,
-            fallback_boundary_effective: commit_walk_stats.fallback_boundary_effective.as_str(),
-            missing_tip_count: commit_walk_stats.missing_tip_count,
+            graph_missing_tip_count: commit_walk_stats.graph_missing_tip_count,
             boundary_stop_count: commit_walk_stats.boundary_stop_count,
             overlap_skip_count: commit_walk_stats.overlap_skip_count,
-            v2_enabled: commit_walk_stats.v2_enabled,
+            tape_node_count: commit_walk_stats.tape_node_count,
+            tape_parent_edges: commit_walk_stats.tape_parent_edges,
         };
         let commit_throughput = build_commit_throughput_telemetry(
             &planner_telemetry,
@@ -801,7 +865,14 @@ impl Indexer {
             &ingestion_timing,
         );
         let lmdb_runtime_contract = store.lmdb_runtime_contract();
-        let queue_after_index = store.load_file_change_extraction_queue_metrics(repo_id)?;
+        let queue_after_index = if effective_mode == IndexingMode::Full {
+            FileChangeExtractionQueueMetrics {
+                depth: file_change_commits_enqueued,
+                oldest_queue_age_seconds: 0,
+            }
+        } else {
+            store.load_file_change_extraction_queue_metrics(repo_id)?
+        };
 
         Ok(IndexingStats {
             repo_id,
@@ -836,23 +907,29 @@ impl Indexer {
             commit_walk_graph_lookup_ms: duration_ms(ingestion_timing.commit_walk_graph_lookup),
             commit_walk_ordering_ms: duration_ms(ingestion_timing.commit_walk_ordering),
             commit_walk_emit_ms: duration_ms(ingestion_timing.commit_walk_emit),
+            commit_walk_pack_inflate_ms: duration_ms(ingestion_timing.commit_walk_pack_inflate),
+            commit_walk_pack_base_resolve_ms: duration_ms(
+                ingestion_timing.commit_walk_pack_base_resolve,
+            ),
+            commit_walk_pack_parse_ms: duration_ms(ingestion_timing.commit_walk_pack_parse),
+            commit_walk_tape_build_ms: duration_ms(ingestion_timing.commit_walk_tape_build),
             commit_walk_graph_lookup_hit_count: ingestion_timing.commit_walk_graph_lookup_hit_count,
             commit_walk_graph_lookup_miss_count: ingestion_timing
                 .commit_walk_graph_lookup_miss_count,
-            commit_walk_graph_fallback_count: ingestion_timing.commit_walk_graph_fallback_count,
-            commit_walk_graph_partial_fallback_count: ingestion_timing
-                .commit_walk_graph_partial_fallback_count,
+            commit_walk_graph_assist_hit_count: ingestion_timing.commit_walk_graph_assist_hit_count,
+            commit_walk_graph_assist_miss_count: ingestion_timing
+                .commit_walk_graph_assist_miss_count,
             commit_walk_nodes_seen_count: ingestion_timing.commit_walk_nodes_seen_count,
             commit_walk_nodes_pruned_count: ingestion_timing.commit_walk_nodes_pruned_count,
             commit_walk_queue_max_depth: ingestion_timing.commit_walk_queue_max_depth,
             commit_metadata_pending_count: ingestion_timing.commit_metadata_pending_count,
-            commit_walk_fallback_boundary_effective: commit_walk_telemetry
-                .fallback_boundary_effective
-                .to_string(),
-            commit_walk_missing_tip_count: ingestion_timing.commit_walk_missing_tip_count,
+            commit_walk_boundary_mode: commit_walk_telemetry.boundary_mode.to_string(),
+            commit_walk_graph_missing_tip_count: ingestion_timing
+                .commit_walk_graph_missing_tip_count,
             commit_walk_boundary_stop_count: ingestion_timing.commit_walk_boundary_stop_count,
             commit_walk_overlap_skip_count: ingestion_timing.commit_walk_overlap_skip_count,
-            commit_walk_v2_enabled: commit_walk_telemetry.v2_enabled,
+            commit_walk_tape_node_count: ingestion_timing.commit_walk_tape_node_count,
+            commit_walk_tape_parent_edges: ingestion_timing.commit_walk_tape_parent_edges,
             commit_window_jit_hydrated_rows: 0,
             query_commit_window_prewarm_hydrated_rows,
             incremental_csr_streaming_mode_effective: streaming_mode_telemetry
@@ -1125,11 +1202,8 @@ impl Indexer {
             &canonical_repo.git_dir.display().to_string(),
         )?;
 
-        let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
-            AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
-        })?;
-        QueryGraph::from_graph_state(graph_state)?
-            .traverse(start_sha, strategy, direction, max_nodes)
+        let query_graph = load_runtime_query_graph(&store, repo_id)?;
+        query_graph.traverse(start_sha, strategy, direction, max_nodes)
     }
 
     pub fn shortest_path(
@@ -1148,10 +1222,8 @@ impl Indexer {
             &canonical_repo.git_dir.display().to_string(),
         )?;
 
-        let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
-            AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
-        })?;
-        QueryGraph::from_graph_state(graph_state)?.shortest_path(from_sha, to_sha, direction)
+        let query_graph = load_runtime_query_graph(&store, repo_id)?;
+        query_graph.shortest_path(from_sha, to_sha, direction)
     }
 
     pub fn benchmark_in_memory_queries(
@@ -1228,6 +1300,75 @@ fn resolve_repository_id_for_read(
         return Ok(repo_id);
     }
     store.upsert_repository(repo_path, repo_name, repo_git_dir)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RuntimeQueryGraphCacheKey {
+    store_dir: PathBuf,
+    repo_id: i64,
+    snapshot_version: u64,
+    generated_at_epoch: i64,
+    node_count: usize,
+    directed_edges: usize,
+    pending_overlay_commits: usize,
+    pending_overlay_edges: usize,
+}
+
+struct RuntimeQueryGraphCacheEntry {
+    key: RuntimeQueryGraphCacheKey,
+    graph: Arc<QueryGraph>,
+}
+
+fn runtime_query_graph_cache_key(
+    store: &GraphStore,
+    repo_id: i64,
+    metadata: &GraphSnapshotMetadata,
+) -> RuntimeQueryGraphCacheKey {
+    RuntimeQueryGraphCacheKey {
+        store_dir: store.store_directory().to_path_buf(),
+        repo_id,
+        snapshot_version: metadata.snapshot_version,
+        generated_at_epoch: metadata.generated_at_epoch,
+        node_count: metadata.node_count,
+        directed_edges: metadata.directed_edges,
+        pending_overlay_commits: metadata.pending_overlay_commits,
+        pending_overlay_edges: metadata.pending_overlay_edges,
+    }
+}
+
+fn cached_runtime_query_graph(key: &RuntimeQueryGraphCacheKey) -> Option<Arc<QueryGraph>> {
+    let cache = RUNTIME_QUERY_GRAPH_CACHE.get_or_init(|| Mutex::new(None));
+    let Ok(guard) = cache.lock() else {
+        return None;
+    };
+    guard
+        .as_ref()
+        .filter(|entry| entry.key == *key)
+        .map(|entry| Arc::clone(&entry.graph))
+}
+
+fn store_runtime_query_graph(key: RuntimeQueryGraphCacheKey, graph: Arc<QueryGraph>) {
+    let cache = RUNTIME_QUERY_GRAPH_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(RuntimeQueryGraphCacheEntry { key, graph });
+    }
+}
+
+fn load_runtime_query_graph(store: &GraphStore, repo_id: i64) -> AppResult<Arc<QueryGraph>> {
+    if let Some(metadata) = store.load_graph_snapshot_metadata(repo_id)? {
+        let key = runtime_query_graph_cache_key(store, repo_id, &metadata);
+        if let Some(graph) = cached_runtime_query_graph(&key) {
+            return Ok(graph);
+        }
+    }
+
+    let graph_state = store.load_graph_snapshot_state(repo_id)?.ok_or_else(|| {
+        AppError::InvalidArgument("repository has no indexed CSR snapshot".to_string())
+    })?;
+    let key = runtime_query_graph_cache_key(store, repo_id, &graph_state.metadata);
+    let graph = Arc::new(QueryGraph::from_graph_state(graph_state)?);
+    store_runtime_query_graph(key, Arc::clone(&graph));
+    Ok(graph)
 }
 
 fn enrich_file_change_stats_batch(
@@ -1379,10 +1520,14 @@ fn resolve_commit_ingest_queue_capacity(batch_size: usize) -> usize {
         .max(batch_size / 2)
 }
 
+fn resolve_commit_ingest_batch_queue_capacity(commit_capacity: usize, _batch_size: usize) -> usize {
+    commit_capacity.max(1)
+}
+
 fn update_max_atomic(target: &AtomicUsize, candidate: usize) {
     let mut observed = target.load(Ordering::Relaxed);
     while candidate > observed {
-        match target.compare_exchange(observed, candidate, Ordering::SeqCst, Ordering::Relaxed) {
+        match target.compare_exchange(observed, candidate, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break,
             Err(next) => observed = next,
         }
@@ -1472,7 +1617,7 @@ fn flush_commit_write_wave(
 
 fn run_commit_ingest_writer_loop(
     store: &GraphStore,
-    commit_receiver: std::sync::mpsc::Receiver<crate::domain::models::ParsedCommit>,
+    commit_receiver: crossbeam_channel::Receiver<Vec<crate::domain::models::ParsedCommit>>,
     options: CommitIngestWriterLoopOptions,
 ) -> AppResult<CommitWriteExecutionStats> {
     let mut controller = CommitWriteWaveController::new(
@@ -1485,9 +1630,11 @@ fn run_commit_ingest_writer_loop(
         commit_write_wave_batch_final: controller.target_batch_size(),
         ..CommitWriteExecutionStats::default()
     };
-    while let Ok(commit) = commit_receiver.recv() {
-        options.queue_depth.fetch_sub(1, Ordering::SeqCst);
-        pending_commits.push(commit);
+    while let Ok(mut commits) = commit_receiver.recv() {
+        options
+            .queue_depth
+            .fetch_sub(commits.len(), Ordering::Relaxed);
+        pending_commits.append(&mut commits);
         if pending_commits.len() >= controller.target_batch_size() {
             flush_commit_write_wave(
                 store,
@@ -1509,7 +1656,7 @@ fn run_commit_ingest_writer_loop(
             &mut stats,
         )?;
     }
-    stats.queue_max_depth = options.queue_max_depth.load(Ordering::SeqCst);
+    stats.queue_max_depth = options.queue_max_depth.load(Ordering::Relaxed);
     Ok(stats)
 }
 
@@ -1569,8 +1716,9 @@ fn build_commit_throughput_telemetry(
         ms_per_commit_seen: ms_per_commit(commits_seen, end_to_end),
         ms_per_commit_indexed: ms_per_commit(commits_indexed, end_to_end),
         commit_walk_scope: commit_walk.scope.to_string(),
-        commit_walk_backend_effective: commit_walk.backend_effective.to_string(),
+        commit_walk_engine: commit_walk.engine.to_string(),
         commit_walk_sort_effective: commit_walk.sort_effective.to_string(),
+        commit_walk_boundary_mode: commit_walk.boundary_mode.to_string(),
         commit_walk_tip_count: commit_walk.tip_count,
         commit_walk_pruned_parent_expansions: commit_walk.pruned_parent_expansions,
         commit_walk_total_ms: duration_ms(ingestion_timing.commit_walk_total),
@@ -1583,21 +1731,23 @@ fn build_commit_throughput_telemetry(
         commit_walk_graph_lookup_ms: duration_ms(commit_walk.graph_lookup),
         commit_walk_ordering_ms: duration_ms(commit_walk.ordering),
         commit_walk_emit_ms: duration_ms(commit_walk.emit),
+        commit_walk_pack_inflate_ms: duration_ms(commit_walk.pack_inflate),
+        commit_walk_pack_base_resolve_ms: duration_ms(commit_walk.pack_base_resolve),
+        commit_walk_pack_parse_ms: duration_ms(commit_walk.pack_parse),
+        commit_walk_tape_build_ms: duration_ms(commit_walk.tape_build),
         commit_walk_graph_lookup_hit_count: commit_walk.graph_lookup_hit_count,
         commit_walk_graph_lookup_miss_count: commit_walk.graph_lookup_miss_count,
-        commit_walk_graph_fallback_count: commit_walk.graph_fallback_count,
-        commit_walk_graph_partial_fallback_count: commit_walk.graph_partial_fallback_count,
+        commit_walk_graph_assist_hit_count: commit_walk.graph_assist_hit_count,
+        commit_walk_graph_assist_miss_count: commit_walk.graph_assist_miss_count,
         commit_walk_nodes_seen_count: commit_walk.nodes_seen_count,
         commit_walk_nodes_pruned_count: commit_walk.nodes_pruned_count,
         commit_walk_queue_max_depth: commit_walk.queue_max_depth,
         commit_metadata_pending_count: commit_walk.metadata_pending_count,
-        commit_walk_fallback_boundary_effective: commit_walk
-            .fallback_boundary_effective
-            .to_string(),
-        commit_walk_missing_tip_count: commit_walk.missing_tip_count,
+        commit_walk_graph_missing_tip_count: commit_walk.graph_missing_tip_count,
         commit_walk_boundary_stop_count: commit_walk.boundary_stop_count,
         commit_walk_overlap_skip_count: commit_walk.overlap_skip_count,
-        commit_walk_v2_enabled: commit_walk.v2_enabled,
+        commit_walk_tape_node_count: commit_walk.tape_node_count,
+        commit_walk_tape_parent_edges: commit_walk.tape_parent_edges,
         commit_window_jit_hydrated_rows: 0,
         query_commit_window_prewarm_hydrated_rows: ingestion_timing
             .query_commit_window_prewarm_hydrated_rows,

@@ -379,21 +379,17 @@ Validation executed:
 
 ### 11.2 Implemented wiring in this repo
 
-1. Level 3 runtime flags (Git adapter):
-   - `GITGRAPH_LEVEL3_PACK_AWARE_INGEST`
-   - `GITGRAPH_LEVEL3_BLOOM_DIFF_SKIP`
-   - `GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER`
-   - Implemented in `adapters/git.rs` via `level3_runtime_options()`.
-2. Pack-aware ingestion lane:
-   - `walk_commits()` now selects backend (`RevisionWalk` vs `PackAwareWired`).
-   - `PackAwareWired` is behavior-preserving and currently routes through revision-walk while the dedicated pack traversal backend is integrated.
-3. Bloom diff gate insertion point:
-   - Added `filter_commits_for_line_stat_targets(...)` and `commit_might_touch_target_paths(...)`.
-   - Current behavior remains preserving correctness (no false negatives): commits are retained until Bloom lookup backend is wired.
-4. Topology-aware extraction:
+1. Canonical traversal controls (Git adapter):
+   - `GITGRAPH_COMMIT_WALK_SCOPE`
+   - `GITGRAPH_COMMIT_WALK_SORT`
+   - Tape-first traversal is always on (`commit_walk_engine=tape`); commit-graph is assist-only.
+2. Bloom diff gate wiring:
+   - `filter_commits_for_line_stat_targets(...)` and `commit_might_touch_target_paths(...)` use one cached Bloom index per operation.
+   - Behavior stays fail-open for correctness when Bloom/commit-graph metadata is unavailable.
+3. Topology-aware extraction:
    - Added `reorder_commits_topologically(...)` (Kahn-style parent-before-child ordering with stable tie-break by original chunk order).
    - Indexer uses it when `GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER=1`.
-5. Streaming CSR materialization:
+4. Streaming CSR materialization:
    - Added `GraphStore::initialize_empty_csr_snapshot(repo_id)` for full-index seed.
    - Indexer can apply CSR deltas per persisted commit batch when `GITGRAPH_LEVEL3_STREAMING_CSR=1`.
    - Fallback rebuild remains for safety when no streaming apply occurs.

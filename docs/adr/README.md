@@ -31,6 +31,8 @@ Use `NNNN-short-title.md`, for example:
 15. `0015-level-1-index-session-planner.md`
 16. `0015-lmdb-csr-delta-storage.md`
 17. `0016-overlay-adjacency-and-lmdb-map-flooring.md`
+18. `0017-single-tape-traversal-engine.md`
+19. `0018-commit-graph-fast-path-hardware-ingestion.md`
 
 ## Template
 

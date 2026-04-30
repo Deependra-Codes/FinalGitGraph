@@ -277,13 +277,14 @@ if (-not (Test-Path $srcRoot)) {
             Add-Failure "Git adapter must not reintroduce git2/libgit2 APIs after gix migration."
         } elseif (
             (Select-String -Path $gitAdapterPath -Pattern '^\s*use\s+gix::Repository;' -Quiet) -and
-            (Select-String -Path $gitAdapterPath -Pattern '\brev_walk\(' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\bwalk_commits_tape\(' -Quiet) -and
+            (Select-String -Path $gitAdapterPath -Pattern '\bbuild_pack_aware_walk_tape\(' -Quiet) -and
             (Select-String -Path $gitAdapterPath -Pattern '\bdiff_tree_to_tree\(' -Quiet) -and
             (Select-String -Path $gitAdapterPath -Pattern '\btrack_rewrites\(' -Quiet)
         ) {
-            Add-Pass "Git adapter uses gix revision-walk and tree-diff ingestion APIs."
+            Add-Pass "Git adapter keeps single tape-first traversal with gix tree-diff ingestion APIs."
         } else {
-            Add-Failure "Git adapter must keep gix-backed ingestion path (rev_walk + diff_tree_to_tree + track_rewrites)."
+            Add-Failure "Git adapter must keep tape-first gix ingestion path (walk_commits_tape + build_pack_aware_walk_tape + diff_tree_to_tree + track_rewrites)."
         }
 
         if (Select-String -Path $gitAdapterPath -Pattern 'fn run_git_command' -Quiet) {

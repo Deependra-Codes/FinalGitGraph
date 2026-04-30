@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use gitgraph_lab_core::adapters::db::open_store;
-use gitgraph_lab_core::adapters::git::stream_commits_with_hide;
+use gitgraph_lab_core::adapters::git::{stream_commits, stream_commits_with_hide};
 use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, enrich_pending_file_change_stats, get_commit_window,
     get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
@@ -15,8 +15,6 @@ use tempfile::TempDir;
 const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
 const COMMIT_WALK_SCOPE_ENV: &str = "GITGRAPH_COMMIT_WALK_SCOPE";
 const COMMIT_WALK_SORT_ENV: &str = "GITGRAPH_COMMIT_WALK_SORT";
-const COMMIT_WALK_BOUNDARY_V2_ENV: &str = "GITGRAPH_COMMIT_WALK_BOUNDARY_V2";
-const INDEX_FAST_MODE_ENV: &str = "GITGRAPH_INDEX_FAST_MODE";
 
 #[test]
 fn lmdb_index_and_graph_queries_work_end_to_end() {
@@ -120,6 +118,17 @@ fn incremental_index_advances_commit_window() {
             })
             .expect("graph snapshot metadata should exist after full index")
     };
+    let before_head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+    let before_root_sha = run_git_capture(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]);
+    let warm_shortest = get_shortest_path(
+        repo_path.as_str(),
+        Some(db_path_str.as_str()),
+        before_head_sha.as_str(),
+        before_root_sha.as_str(),
+        GraphDirection::Parents,
+    )
+    .unwrap_or_else(|error| panic!("warm shortest path before incremental index: {error}"));
+    assert!(warm_shortest.found);
 
     append_commit(&repo_dir, "incremental-a");
     let incremental_stats = index_commits_with_mode(
@@ -337,7 +346,6 @@ fn strict_sync_mode_materializes_file_changes_inline() {
 #[test]
 fn commit_walk_scope_frontier_excludes_tag_and_remote_only_refs_until_all_refs_override() {
     let _guard = env_lock().lock().expect("lock env");
-    let _fast_mode_guard = EnvVarGuard::set(INDEX_FAST_MODE_ENV, "1");
     let _walk_sort_guard = EnvVarGuard::set(COMMIT_WALK_SORT_ENV, "breadth_first");
     let _strict_mode_guard = EnvVarGuard::set(FILE_CHANGE_SYNC_STRICT_ENV, "0");
 
@@ -465,10 +473,84 @@ fn commit_walk_scope_frontier_excludes_tag_and_remote_only_refs_until_all_refs_o
 }
 
 #[test]
+fn full_commit_walk_uses_commit_graph_fast_path_when_preconditioned() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _walk_sort_guard = EnvVarGuard::set(COMMIT_WALK_SORT_ENV, "breadth_first");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+
+    let expected_count: usize = run_git_capture(&repo_dir, &["rev-list", "--all", "--count"])
+        .parse()
+        .unwrap_or_else(|error| panic!("parse expected all-ref count: {error}"));
+    let mut batch_sizes = Vec::new();
+    let mut walked_shas = Vec::new();
+    let walk_stats = stream_commits(&repo_dir, None, 2, |batch| {
+        batch_sizes.push(batch.len());
+        walked_shas.extend(batch.into_iter().map(|commit| commit.sha));
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("batched commit-graph full walk: {error}"));
+
+    assert_eq!(walk_stats.engine, "commit_graph_fast_path");
+    assert!(
+        walk_stats.graph_lookup_hit_count >= expected_count,
+        "expected commit-graph lookups to service the full walk"
+    );
+    assert!(
+        batch_sizes.contains(&2),
+        "expected the batched streaming API to emit non-singleton batches"
+    );
+    assert_eq!(walked_shas.len(), expected_count);
+    walked_shas.sort();
+    walked_shas.dedup();
+    assert_eq!(walked_shas.len(), expected_count);
+}
+
+#[test]
+fn commit_graph_partial_fallback_dedupes_missing_tip_history() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _walk_sort_guard = EnvVarGuard::set(COMMIT_WALK_SORT_ENV, "breadth_first");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+    run_git(&repo_dir, &["checkout", "-b", "newer-than-commit-graph"]);
+    append_commit(&repo_dir, "newer-than-commit-graph");
+
+    let expected_count: usize = run_git_capture(&repo_dir, &["rev-list", "--branches", "--count"])
+        .parse()
+        .unwrap_or_else(|error| panic!("parse expected branch count: {error}"));
+    let mut walked_shas = Vec::new();
+    let walk_stats = stream_commits_with_hide(&repo_dir, None, None, |commit| {
+        walked_shas.push(commit.sha);
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("partial commit-graph fallback walk: {error}"));
+
+    assert_eq!(walk_stats.engine, "commit_graph_fast_path");
+    assert!(
+        walk_stats.graph_missing_tip_count >= 1,
+        "expected the fresh branch tip to miss the stale commit graph"
+    );
+    assert!(
+        walk_stats.overlap_skip_count >= 1,
+        "expected fallback traversal to dedupe history already emitted by the commit-graph path"
+    );
+    assert_eq!(walked_shas.len(), expected_count);
+    walked_shas.sort();
+    walked_shas.dedup();
+    assert_eq!(walked_shas.len(), expected_count);
+}
+
+#[test]
 fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
     let _guard = env_lock().lock().expect("lock env");
-    let _fast_mode_guard = EnvVarGuard::set(INDEX_FAST_MODE_ENV, "1");
-    let _boundary_guard = EnvVarGuard::set(COMMIT_WALK_BOUNDARY_V2_ENV, "1");
     let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
     let _strict_mode_guard = EnvVarGuard::set(FILE_CHANGE_SYNC_STRICT_ENV, "0");
 
@@ -477,7 +559,6 @@ fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
     create_test_repo(&repo_dir);
 
     let checkpoint_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
-    run_git(&repo_dir, &["tag", "graph-anchor"]);
     run_git(&repo_dir, &["repack", "-ad"]);
     run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
     append_commit(&repo_dir, "incremental-partial-fallback");
@@ -491,11 +572,11 @@ fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
         })
         .unwrap_or_else(|error| panic!("direct commit walk: {error}"));
     assert_eq!(walked_shas, vec![head_sha]);
-    assert_eq!(walk_stats.backend_effective, "commit_graph_fast_path");
-    assert_eq!(walk_stats.fallback_boundary_effective, "checkpoint_only");
+    assert_eq!(walk_stats.engine, "tape");
+    assert_eq!(walk_stats.boundary_mode, "checkpoint_stop");
     assert!(
-        walk_stats.missing_tip_count >= 1,
-        "expected the fresh head to miss the stale commit-graph and trigger fallback"
+        walk_stats.graph_missing_tip_count >= 1,
+        "expected the fresh head to miss the stale commit-graph in graph-assist mode"
     );
     assert!(
         walk_stats.boundary_stop_count >= 1,
@@ -503,16 +584,22 @@ fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
     );
     assert_eq!(walk_stats.overlap_skip_count, 0);
     assert!(
-        walk_stats.graph_partial_fallback_count >= 1,
-        "expected commit-graph traversal to contribute before missing-tip fallback"
+        walk_stats.graph_assist_miss_count >= 1,
+        "expected graph-assist misses when tips are newer than commit-graph snapshot"
+    );
+    assert!(
+        walk_stats.tape_node_count >= 1,
+        "expected tape build to include at least the missing-tip frontier"
+    );
+    assert!(
+        walk_stats.tape_parent_edges >= 1,
+        "expected tape build to resolve at least one parent edge"
     );
 }
 
 #[test]
 fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_graph() {
     let _guard = env_lock().lock().expect("lock env");
-    let _fast_mode_guard = EnvVarGuard::set(INDEX_FAST_MODE_ENV, "1");
-    let _boundary_guard = EnvVarGuard::set(COMMIT_WALK_BOUNDARY_V2_ENV, "1");
     let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
     let _strict_mode_guard = EnvVarGuard::set(FILE_CHANGE_SYNC_STRICT_ENV, "0");
 
@@ -520,7 +607,6 @@ fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_g
     let repo_dir = temp.path().join("repo");
     create_test_repo(&repo_dir);
 
-    run_git(&repo_dir, &["tag", "graph-anchor"]);
     run_git(&repo_dir, &["repack", "-ad"]);
     run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
     append_commit(&repo_dir, "checkpoint-not-in-graph");
@@ -536,18 +622,26 @@ fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_g
         })
         .unwrap_or_else(|error| panic!("direct missing-boundary commit walk: {error}"));
     assert_eq!(walked_shas, vec![head_sha]);
-    assert_eq!(walk_stats.backend_effective, "pack_aware");
-    assert_eq!(walk_stats.fallback_boundary_effective, "legacy_hide");
-    assert_eq!(walk_stats.missing_tip_count, 0);
-    assert_eq!(walk_stats.boundary_stop_count, 0);
+    assert_eq!(walk_stats.engine, "tape");
+    assert_eq!(walk_stats.boundary_mode, "checkpoint_stop");
+    assert!(walk_stats.graph_missing_tip_count >= 1);
+    assert!(walk_stats.boundary_stop_count >= 1);
     assert_eq!(walk_stats.overlap_skip_count, 0);
     assert!(
-        walk_stats.graph_fallback_count >= 1,
-        "expected safe pack-aware fallback when checkpoint is absent from commit-graph"
+        walk_stats.graph_assist_miss_count >= 1,
+        "expected graph-assist miss accounting when commit-graph is stale"
     );
     assert!(
         walk_stats.graph_lookup_miss_count >= 1,
-        "expected commit-graph lookup miss to explain the fallback"
+        "expected commit-graph lookup misses to be observable in graph-assist telemetry"
+    );
+    assert!(
+        walk_stats.tape_node_count >= 1,
+        "expected direct pack-aware traversal to build a non-empty tape"
+    );
+    assert!(
+        walk_stats.tape_parent_edges >= 1,
+        "expected direct pack-aware traversal to translate parent edges once"
     );
 }
 
