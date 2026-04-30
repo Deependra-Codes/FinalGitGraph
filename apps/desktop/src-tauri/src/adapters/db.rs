@@ -850,12 +850,35 @@ impl GraphStore {
         repo_id: i64,
         commit_shas: &[String],
     ) -> AppResult<usize> {
+        self.enqueue_commits_for_file_change_extraction_inner(repo_id, commit_shas, true)
+    }
+
+    pub fn enqueue_commits_for_file_change_extraction_after_clear(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+    ) -> AppResult<usize> {
+        self.enqueue_commits_for_file_change_extraction_inner(repo_id, commit_shas, false)
+    }
+
+    fn enqueue_commits_for_file_change_extraction_inner(
+        &self,
+        repo_id: i64,
+        commit_shas: &[String],
+        check_existing: bool,
+    ) -> AppResult<usize> {
         if commit_shas.is_empty() {
             return Ok(0);
         }
 
         let mut txn = self.env.begin_rw_txn()?;
         let now_epoch = now_epoch_seconds();
+        let queue = ExtractionQueueCommitEntry {
+            attempts: 0,
+            last_error: None,
+            enqueued_at_epoch: now_epoch,
+        };
+        let raw = serialize(&queue, "serialize extraction queue commit entry")?;
         let mut enqueued = 0usize;
         let mut seen = HashSet::with_capacity(commit_shas.len());
 
@@ -865,16 +888,10 @@ impl GraphStore {
             }
 
             let key = repository_extraction_commit_key(repo_id, commit_sha);
-            if txn.get(self.dbs.extraction_queue, &key).is_ok() {
+            if check_existing && txn.get(self.dbs.extraction_queue, &key).is_ok() {
                 continue;
             }
 
-            let queue = ExtractionQueueCommitEntry {
-                attempts: 0,
-                last_error: None,
-                enqueued_at_epoch: now_epoch,
-            };
-            let raw = serialize(&queue, "serialize extraction queue commit entry")?;
             txn.put(self.dbs.extraction_queue, &key, &raw, WriteFlags::empty())?;
             enqueued = enqueued.saturating_add(1);
         }

@@ -16,11 +16,18 @@ param(
     [ValidateSet("system", "mimalloc")]
     [string]$Allocator = "system",
     [switch]$NativeCpu,
+    [switch]$HardwareMax,
     [string]$LibclangPath = "",
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($HardwareMax) {
+    $Allocator = "mimalloc"
+    $NativeCpu = [System.Management.Automation.SwitchParameter]::new($true)
+    $PreconditionCommitGraph = [System.Management.Automation.SwitchParameter]::new($true)
+}
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoRootPath = $repoRoot.Path
@@ -390,8 +397,20 @@ function Invoke-PerfReportDocker {
 Push-Location $repoRoot
 try {
     $previousIngestPrimary = $env:GITGRAPH_INGEST_PRIMARY
+    $previousIngestWriteProfile = $env:GITGRAPH_INGEST_WRITE_PROFILE
+    $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
+    $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
+    $previousStreamingCsr = $env:GITGRAPH_LEVEL3_STREAMING_CSR
     if ($EnableLsmRocksdb) {
         $env:GITGRAPH_INGEST_PRIMARY = "rocksdb"
+    }
+    if ($HardwareMax) {
+        $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
+        $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
+        $env:GITGRAPH_LEVEL3_STREAMING_CSR = "0"
+        if ([string]::IsNullOrWhiteSpace($previousWalkSort)) {
+            $env:GITGRAPH_COMMIT_WALK_SORT = "breadth_first"
+        }
     }
 
     if ($EnableLsmRocksdb -and -not [string]::IsNullOrWhiteSpace($LibclangPath)) {
@@ -410,7 +429,8 @@ try {
     }
 
     Write-Host ("Allocator: {0}" -f $Allocator)
-    Write-Host ("Native CPU: {0}" -f ($NativeCpu.IsPresent))
+    Write-Host ("Native CPU: {0}" -f ([bool]$NativeCpu))
+    Write-Host ("Hardware max: {0}" -f ([bool]$HardwareMax))
 
     if (Test-EnvEnabled -Name "GITGRAPH_PERF_REPORT_DOCKER_ONLY") {
         if ($EnableLsmRocksdb) {
@@ -503,6 +523,26 @@ finally {
         Remove-Item Env:GITGRAPH_INGEST_PRIMARY -ErrorAction SilentlyContinue
     } else {
         $env:GITGRAPH_INGEST_PRIMARY = $previousIngestPrimary
+    }
+    if ($null -eq $previousIngestWriteProfile) {
+        Remove-Item Env:GITGRAPH_INGEST_WRITE_PROFILE -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_INGEST_WRITE_PROFILE = $previousIngestWriteProfile
+    }
+    if ($null -eq $previousWalkSort) {
+        Remove-Item Env:GITGRAPH_COMMIT_WALK_SORT -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_COMMIT_WALK_SORT = $previousWalkSort
+    }
+    if ($null -eq $previousPerfReportDockerOnly) {
+        Remove-Item Env:GITGRAPH_PERF_REPORT_DOCKER_ONLY -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = $previousPerfReportDockerOnly
+    }
+    if ($null -eq $previousStreamingCsr) {
+        Remove-Item Env:GITGRAPH_LEVEL3_STREAMING_CSR -ErrorAction SilentlyContinue
+    } else {
+        $env:GITGRAPH_LEVEL3_STREAMING_CSR = $previousStreamingCsr
     }
     Pop-Location
 }

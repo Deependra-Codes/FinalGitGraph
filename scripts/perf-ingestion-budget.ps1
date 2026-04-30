@@ -1,7 +1,7 @@
 # platform: any
 param(
     [string]$CargoTargetRoot = "",
-    [ValidateSet("25k", "90k")]
+    [ValidateSet("25k", "90k", "100k")]
     [string]$Profile = "25k",
     [ValidateSet("cold", "warm")]
     [string]$Lane = "cold",
@@ -22,10 +22,18 @@ param(
     [ValidateSet("system", "mimalloc")]
     [string]$Allocator = "system",
     [switch]$NativeCpu,
+    [switch]$HardwareMax,
     [switch]$ProbeOnly
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($HardwareMax) {
+    $FastMode = [System.Management.Automation.SwitchParameter]::new($true)
+    $PreconditionCommitGraph = [System.Management.Automation.SwitchParameter]::new($true)
+    $Allocator = "mimalloc"
+    $NativeCpu = [System.Management.Automation.SwitchParameter]::new($true)
+}
 
 if ($env:OS -eq "Windows_NT") {
     if (-not (Test-Path "D:\")) {
@@ -86,7 +94,19 @@ if ($ProbeOnly) {
     return
 }
 
-if ($Profile -eq "90k") {
+if ($Profile -eq "100k") {
+    $defaultOutputPath = "tmp/perf-report-ingestion-budget-100k.txt"
+    $cycles = 12500
+    $featureCommits = 6
+    $incrementalCommits = 10000
+    $queryRuns = 20
+    $windowLimit = 1200
+    $maxNodes = 100000
+    $defaultMaxFullIndexMs = 120000
+    $defaultMaxIncrementalIndexMs = 90000
+    $defaultMaxPeakRssBytes = [UInt64]300000000
+    $defaultMaxDiffShareRatio = 0.55
+} elseif ($Profile -eq "90k") {
     $defaultOutputPath = "tmp/perf-report-ingestion-budget-90k.txt"
     $cycles = 9000
     $featureCommits = 6
@@ -113,7 +133,9 @@ if ($Profile -eq "90k") {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    if ($FastMode) {
+    if ($HardwareMax) {
+        $OutputPath = $defaultOutputPath.Replace(".txt", "-hardware.txt")
+    } elseif ($FastMode) {
         $OutputPath = $defaultOutputPath.Replace(".txt", "-fast.txt")
     } else {
         $OutputPath = $defaultOutputPath
@@ -128,7 +150,7 @@ if (-not $PSBoundParameters.ContainsKey("MaxIncrementalIndexMs")) {
 if (-not $PSBoundParameters.ContainsKey("MaxPeakRssBytes")) {
     $MaxPeakRssBytes = $defaultMaxPeakRssBytes
 }
-if ($FastMode -and -not $PSBoundParameters.ContainsKey("MaxPeakRssBytes")) {
+if ($FastMode -and -not $HardwareMax -and -not $PSBoundParameters.ContainsKey("MaxPeakRssBytes")) {
     $MaxPeakRssBytes = [UInt64]160000000
 }
 if (-not $PSBoundParameters.ContainsKey("MaxDiffShareRatio")) {
@@ -138,29 +160,14 @@ if (-not $PSBoundParameters.ContainsKey("MaxDiffShareRatio")) {
         $MaxDiffShareRatio = $defaultMaxDiffShareRatio
     }
 }
-if ($FastMode -and -not $EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
-    $MinFullCommitThroughputPerSec = 12000
+if ($HardwareMax -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
+    $MinFullCommitThroughputPerSec = 100000
 }
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
-    $MinFullCommitThroughputPerSec = 500
+if ($FastMode -and -not $HardwareMax -and -not $PSBoundParameters.ContainsKey("MinFullCommitThroughputPerSec")) {
+    $MinFullCommitThroughputPerSec = 12000
 }
 if ($FastMode -and -not $PSBoundParameters.ContainsKey("MaxFileChangeExtractionDrainMs")) {
     $MaxFileChangeExtractionDrainMs = 10000
-}
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinLsmShadowWriteAttempts")) {
-    $MinLsmShadowWriteAttempts = 1
-}
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MinLsmShadowWriteSuccessRatio")) {
-    $MinLsmShadowWriteSuccessRatio = 0.95
-}
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmShadowWriteErrors")) {
-    $MaxLsmShadowWriteErrors = 0
-}
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmShadowDisabledBatches")) {
-    $MaxLsmShadowDisabledBatches = 0
-}
-if ($EnableLsmRocksdb -and -not $PSBoundParameters.ContainsKey("MaxLsmMaterializationErrors")) {
-    $MaxLsmMaterializationErrors = 0
 }
 if (-not $FastMode -and $MinFullCommitThroughputPerSec -lt 0) {
     $MinFullCommitThroughputPerSec = 0
@@ -172,8 +179,9 @@ if (-not $FastMode -and $MaxFileChangeExtractionDrainMs -lt 0) {
 Write-Host ("Ingestion budget profile: {0}" -f $Profile)
 Write-Host ("Ingestion budget lane: {0}" -f $Lane)
 Write-Host ("Ingestion budget fast mode: {0}" -f ($FastMode.IsPresent))
+Write-Host ("Ingestion hardware max: {0}" -f ([bool]$HardwareMax))
 Write-Host ("Ingestion allocator: {0}" -f $Allocator)
-Write-Host ("Ingestion native CPU: {0}" -f ($NativeCpu.IsPresent))
+Write-Host ("Ingestion native CPU: {0}" -f ([bool]$NativeCpu))
 Write-Host (
     "Workload: cycles={0} feature_commits={1} incremental_commits={2} query_runs={3} window_limit={4} max_nodes={5}" `
         -f $cycles, $featureCommits, $incrementalCommits, $queryRuns, $windowLimit, $maxNodes
@@ -206,6 +214,7 @@ if ($Lane -eq "warm") {
             -KeepFixture `
             -Allocator $Allocator `
             -NativeCpu:$NativeCpu `
+            -HardwareMax:$HardwareMax `
             -OutputPath ($OutputPath + ".bootstrap.txt")
         if ($LASTEXITCODE -ne 0) {
             throw "Warm lane bootstrap perf-report execution failed."
@@ -223,7 +232,7 @@ $previousRenameLimitLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_LARGE
 $previousRenameLimitXLarge = $env:GITGRAPH_FILE_CHANGE_RENAME_LIMIT_XLARGE
 if ($FastMode) {
     $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
-    if (-not $EnableLsmRocksdb) {
+    if (-not $HardwareMax) {
         $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
     }
     if ([string]::IsNullOrWhiteSpace($previousWalkSort)) {
@@ -260,8 +269,7 @@ try {
         -WarmFixture:($Lane -eq "warm") `
         -Allocator $Allocator `
         -NativeCpu:$NativeCpu `
-        -EnableLsmRocksdb:$EnableLsmRocksdb `
-        -LibclangPath $LibclangPath
+        -HardwareMax:$HardwareMax
     if ($LASTEXITCODE -ne 0) {
         throw "perf-report execution failed for ingestion budget lane."
     }
@@ -402,21 +410,6 @@ if ($FastMode -and $fileChangeExtractionDrainMs -gt $MaxFileChangeExtractionDrai
 }
 if ($FastMode -and $oldestExtractionQueueAgeSeconds -gt $MaxOldestExtractionQueueAgeSeconds) {
     throw ("Ingestion budget fast-mode failed: oldest_file_change_extraction_queue_age_seconds {0} > max {1}" -f $oldestExtractionQueueAgeSeconds, $MaxOldestExtractionQueueAgeSeconds)
-}
-if ($MinLsmShadowWriteAttempts -ge 0 -and $lsmShadowWriteAttempts -lt $MinLsmShadowWriteAttempts) {
-    throw ("Ingestion budget failed: lsm_shadow_write_attempts {0} < min {1}" -f $lsmShadowWriteAttempts, $MinLsmShadowWriteAttempts)
-}
-if ($MinLsmShadowWriteSuccessRatio -ge 0 -and $lsmShadowWriteSuccessRatio -lt $MinLsmShadowWriteSuccessRatio) {
-    throw ("Ingestion budget failed: lsm_shadow_write_success_ratio {0} < min {1}" -f $lsmShadowWriteSuccessRatio, $MinLsmShadowWriteSuccessRatio)
-}
-if ($MaxLsmShadowWriteErrors -ge 0 -and $lsmShadowWriteErrors -gt $MaxLsmShadowWriteErrors) {
-    throw ("Ingestion budget failed: lsm_shadow_write_errors {0} > max {1}" -f $lsmShadowWriteErrors, $MaxLsmShadowWriteErrors)
-}
-if ($MaxLsmShadowDisabledBatches -ge 0 -and $lsmShadowDisabledBatches -gt $MaxLsmShadowDisabledBatches) {
-    throw ("Ingestion budget failed: lsm_shadow_disabled_batches {0} > max {1}" -f $lsmShadowDisabledBatches, $MaxLsmShadowDisabledBatches)
-}
-if ($MaxLsmMaterializationErrors -ge 0 -and $lsmMaterializationErrors -gt $MaxLsmMaterializationErrors) {
-    throw ("Ingestion budget failed: lsm_materialization_errors {0} > max {1}" -f $lsmMaterializationErrors, $MaxLsmMaterializationErrors)
 }
 
 Write-Host "Ingestion budget passed."

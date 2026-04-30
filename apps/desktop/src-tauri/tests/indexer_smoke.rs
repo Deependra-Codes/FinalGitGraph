@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use gitgraph_lab_core::adapters::db::open_store;
-use gitgraph_lab_core::adapters::git::stream_commits_with_hide;
+use gitgraph_lab_core::adapters::git::{stream_commits, stream_commits_with_hide};
 use gitgraph_lab_core::application::commands::{
     drain_file_change_extraction_queue, enrich_pending_file_change_stats, get_commit_window,
     get_graph_traversal, get_shortest_path, index_commits_with_mode, scan_repository,
@@ -118,6 +118,17 @@ fn incremental_index_advances_commit_window() {
             })
             .expect("graph snapshot metadata should exist after full index")
     };
+    let before_head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
+    let before_root_sha = run_git_capture(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]);
+    let warm_shortest = get_shortest_path(
+        repo_path.as_str(),
+        Some(db_path_str.as_str()),
+        before_head_sha.as_str(),
+        before_root_sha.as_str(),
+        GraphDirection::Parents,
+    )
+    .unwrap_or_else(|error| panic!("warm shortest path before incremental index: {error}"));
+    assert!(warm_shortest.found);
 
     append_commit(&repo_dir, "incremental-a");
     let incremental_stats = index_commits_with_mode(
@@ -459,6 +470,82 @@ fn commit_walk_scope_frontier_excludes_tag_and_remote_only_refs_until_all_refs_o
         full_all_refs_second.commits_indexed, expected_all_refs_count,
         "expected deterministic non-duplicate commit indexing across repeated all_refs full runs"
     );
+}
+
+#[test]
+fn full_commit_walk_uses_commit_graph_fast_path_when_preconditioned() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _walk_sort_guard = EnvVarGuard::set(COMMIT_WALK_SORT_ENV, "breadth_first");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+
+    let expected_count: usize = run_git_capture(&repo_dir, &["rev-list", "--all", "--count"])
+        .parse()
+        .unwrap_or_else(|error| panic!("parse expected all-ref count: {error}"));
+    let mut batch_sizes = Vec::new();
+    let mut walked_shas = Vec::new();
+    let walk_stats = stream_commits(&repo_dir, None, 2, |batch| {
+        batch_sizes.push(batch.len());
+        walked_shas.extend(batch.into_iter().map(|commit| commit.sha));
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("batched commit-graph full walk: {error}"));
+
+    assert_eq!(walk_stats.engine, "commit_graph_fast_path");
+    assert!(
+        walk_stats.graph_lookup_hit_count >= expected_count,
+        "expected commit-graph lookups to service the full walk"
+    );
+    assert!(
+        batch_sizes.contains(&2),
+        "expected the batched streaming API to emit non-singleton batches"
+    );
+    assert_eq!(walked_shas.len(), expected_count);
+    walked_shas.sort();
+    walked_shas.dedup();
+    assert_eq!(walked_shas.len(), expected_count);
+}
+
+#[test]
+fn commit_graph_partial_fallback_dedupes_missing_tip_history() {
+    let _guard = env_lock().lock().expect("lock env");
+    let _scope_guard = EnvVarGuard::set(COMMIT_WALK_SCOPE_ENV, "all_refs");
+    let _walk_sort_guard = EnvVarGuard::set(COMMIT_WALK_SORT_ENV, "breadth_first");
+
+    let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+    let repo_dir = temp.path().join("repo");
+    create_test_repo(&repo_dir);
+    run_git(&repo_dir, &["commit-graph", "write", "--reachable"]);
+    run_git(&repo_dir, &["checkout", "-b", "newer-than-commit-graph"]);
+    append_commit(&repo_dir, "newer-than-commit-graph");
+
+    let expected_count: usize = run_git_capture(&repo_dir, &["rev-list", "--branches", "--count"])
+        .parse()
+        .unwrap_or_else(|error| panic!("parse expected branch count: {error}"));
+    let mut walked_shas = Vec::new();
+    let walk_stats = stream_commits_with_hide(&repo_dir, None, None, |commit| {
+        walked_shas.push(commit.sha);
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("partial commit-graph fallback walk: {error}"));
+
+    assert_eq!(walk_stats.engine, "commit_graph_fast_path");
+    assert!(
+        walk_stats.graph_missing_tip_count >= 1,
+        "expected the fresh branch tip to miss the stale commit graph"
+    );
+    assert!(
+        walk_stats.overlap_skip_count >= 1,
+        "expected fallback traversal to dedupe history already emitted by the commit-graph path"
+    );
+    assert_eq!(walked_shas.len(), expected_count);
+    walked_shas.sort();
+    walked_shas.dedup();
+    assert_eq!(walked_shas.len(), expected_count);
 }
 
 #[test]
