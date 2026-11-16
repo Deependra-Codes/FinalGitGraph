@@ -538,7 +538,18 @@ fn git_ok(dir: &Path, args: &[&str]) -> String {
 fn clone_working_state(repo: &Path, clone: &Path) {
     let source = repo.to_string_lossy().into_owned();
     let target = clone.to_string_lossy().into_owned();
-    git_ok(repo, &["clone", "--quiet", "--local", &source, &target]);
+    // No hardlinks: on Windows CI the checkout (D:) and the temp dir (C:) are different volumes.
+    git_ok(
+        repo,
+        &[
+            "clone",
+            "--quiet",
+            "--local",
+            "--no-hardlinks",
+            &source,
+            &target,
+        ],
+    );
     let listing = git_ok(
         repo,
         &[
