@@ -12,6 +12,11 @@ default-members = [
 edition = "2021"
 rust-version = "1.94"
 
+# `cargo xtask` runs from its own profile directory, so `cargo test` inside the gate can
+# rebuild target/debug/xtask.exe while the gate is still running (Windows locks running exes).
+[profile.xtask]
+inherits = "dev"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 rust_2018_idioms = { level = "deny", priority = -1 }
