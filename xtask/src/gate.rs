@@ -20,7 +20,9 @@ pub fn steps(fast: bool) -> Vec<&'static [&'static str]> {
     steps
 }
 
+/// Guardrails first (what `safe:fast` and `safe:full` added), then the cargo steps.
 pub fn run(fast: bool) -> Result<(), String> {
+    crate::guardrails::run(&crate::paths::repo_root())?;
     run_steps(&steps(fast), |args| run::status(run::cargo().args(args)))?;
     println!("\nQuality gate passed.");
     Ok(())

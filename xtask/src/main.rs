@@ -2,11 +2,13 @@
 
 mod doctor;
 mod gate;
+mod guardrails;
+mod paths;
 mod run;
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: cargo xtask <doctor | gate [--fast]>";
+const USAGE: &str = "usage: cargo xtask <doctor | gate [--fast] | guardrails [--repo <path>]>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,6 +17,8 @@ fn main() -> ExitCode {
         ["doctor"] => doctor::run(),
         ["gate"] => gate::run(false),
         ["gate", "--fast"] => gate::run(true),
+        ["guardrails"] => guardrails::run(&paths::repo_root()),
+        ["guardrails", "--repo", repo] => guardrails::run(std::path::Path::new(repo)),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

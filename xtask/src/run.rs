@@ -34,3 +34,20 @@ pub fn stdout(command: &mut Command) -> Result<String, String> {
         ))
     }
 }
+
+/// Git that cannot see the caller's setup: hooks export `GIT_DIR`, machine config changes defaults.
+pub fn git(repo: &std::path::Path) -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
+        .arg("-C")
+        .arg(repo);
+    command
+}

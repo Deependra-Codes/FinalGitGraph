@@ -708,7 +708,8 @@ if ($changedFiles.Count -eq 0) {
             $filePath -eq ".github/workflows/rust-ci.yml" -or
             $filePath -eq "README.md" -or
             $filePath -eq "CONTRIBUTING.md" -or
-            $filePath -eq "package.json"
+            $filePath -eq "package.json" -or
+            $filePath -match '^xtask/src/guardrails/'
         ) {
             $policyTouched = $true
         }
@@ -718,7 +719,8 @@ if ($changedFiles.Count -eq 0) {
             $filePath -match '^apps/desktop/src-tauri/tests/.+\.rs$' -or
             $filePath -match '^apps/desktop/src-tauri/migrations/.+\.[s][q][l]$' -or
             $filePath -eq "apps/desktop/src-tauri/Cargo.toml" -or
-            $filePath -eq "Cargo.toml"
+            $filePath -eq "Cargo.toml" -or
+            ($filePath -match '^xtask/' -and $filePath -notmatch '^xtask/src/guardrails/')
         ) {
             $implementationTouched = $true
         }

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::paths::repo_root;
 use crate::run;
 
 const RUST_VERSION: &str = "1.94.0";
@@ -32,11 +33,6 @@ pub fn run() -> Result<(), String> {
     } else {
         Err(format!("{failed} doctor check(s) failed"))
     }
-}
-
-fn repo_root() -> PathBuf {
-    let xtask_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    xtask_dir.parent().unwrap_or(xtask_dir).to_path_buf()
 }
 
 fn check_rustc() -> Result<String, String> {
