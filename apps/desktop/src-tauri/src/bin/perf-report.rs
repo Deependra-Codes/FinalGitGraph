@@ -593,17 +593,7 @@ fn generate_branching_fixture(
     fs::create_dir_all(repo_dir)
         .map_err(|error| format!("create fixture repo {}: {error}", repo_dir.display()))?;
 
-    run_git(repo_dir, &["init"])?;
-    run_git(repo_dir, &["config", "user.name", "GitGraph Lab"])?;
-    run_git(
-        repo_dir,
-        &["config", "user.email", "gitgraph-lab@example.com"],
-    )?;
-    run_git(repo_dir, &["config", "commit.gpgsign", "false"])?;
-    run_git(repo_dir, &["config", "tag.gpgsign", "false"])?;
-    run_git(repo_dir, &["config", "core.hooksPath", ".git/hooks"])?;
-    run_git(repo_dir, &["config", "gc.auto", "0"])?;
-    run_git(repo_dir, &["config", "maintenance.auto", "false"])?;
+    init_fixture_repo(repo_dir)?;
 
     let stream_build_started = Instant::now();
     let (fast_import_stream, generated_commits) =
@@ -840,9 +830,7 @@ fn build_incremental_fast_import_stream(count: usize, base_head_revision: &str) 
 }
 
 fn run_git_fast_import(repo_dir: &Path, stream: &str) -> PerfResult<()> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let mut child = pinned_git(repo_dir)
         .args(["fast-import", "--quiet"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -886,17 +874,7 @@ fn generate_branching_fixture_legacy(
     fs::create_dir_all(repo_dir)
         .map_err(|error| format!("create fixture repo {}: {error}", repo_dir.display()))?;
 
-    run_git(repo_dir, &["init"])?;
-    run_git(repo_dir, &["config", "user.name", "GitGraph Lab"])?;
-    run_git(
-        repo_dir,
-        &["config", "user.email", "gitgraph-lab@example.com"],
-    )?;
-    run_git(repo_dir, &["config", "commit.gpgsign", "false"])?;
-    run_git(repo_dir, &["config", "tag.gpgsign", "false"])?;
-    run_git(repo_dir, &["config", "core.hooksPath", ".git/hooks"])?;
-    run_git(repo_dir, &["config", "gc.auto", "0"])?;
-    run_git(repo_dir, &["config", "maintenance.auto", "false"])?;
+    init_fixture_repo(repo_dir)?;
 
     write_repo_file(repo_dir, "README.md", "gitgraph perf fixture\n")?;
     run_git(repo_dir, &["add", "."])?;
@@ -1068,10 +1046,44 @@ fn run_repository_preconditioning(repo_dir: &Path) -> PerfResult<()> {
     )
 }
 
-fn run_git(repo_dir: &Path, args: &[&str]) -> PerfResult<()> {
-    let output = Command::new("git")
+fn init_fixture_repo(repo_dir: &Path) -> PerfResult<()> {
+    // Fixtures write refs/heads/master; pin it so a machine-level init.defaultBranch cannot orphan HEAD.
+    run_git(repo_dir, &["init", "--initial-branch=master"])?;
+    for (key, value) in [
+        ("user.name", "GitGraph Lab"),
+        ("user.email", "gitgraph-lab@example.com"),
+        ("commit.gpgsign", "false"),
+        ("tag.gpgsign", "false"),
+        ("core.hooksPath", ".git/hooks"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+        // init probes the filesystem and sets true on APFS/NTFS; fixtures must have the same trees on every OS.
+        ("core.ignorecase", "false"),
+    ] {
+        run_git(repo_dir, &["config", key, value])?;
+    }
+    Ok(())
+}
+
+fn pinned_git(repo_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    // Fixture git must not see the caller's setup: hooks export GIT_DIR, and machine config changes defaults.
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device)
         .arg("-C")
-        .arg(repo_dir)
+        .arg(repo_dir);
+    command
+}
+
+fn run_git(repo_dir: &Path, args: &[&str]) -> PerfResult<()> {
+    let output = pinned_git(repo_dir)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -1085,9 +1097,7 @@ fn run_git(repo_dir: &Path, args: &[&str]) -> PerfResult<()> {
 }
 
 fn run_git_capture(repo_dir: &Path, args: &[&str]) -> PerfResult<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
+    let output = pinned_git(repo_dir)
         .args(args)
         .output()
         .map_err(|error| format!("execute git {:?}: {error}", args))?;
@@ -2989,5 +2999,90 @@ mod tests {
         assert!(stream.contains("from :2"));
         assert!(stream.contains("from :3"));
         assert!(stream.ends_with("done\n"));
+    }
+
+    #[test]
+    fn branching_fixture_ignores_inherited_git_environment() {
+        const CHILD_ROOT: &str = "GITGRAPH_PERF_FIXTURE_CHILD_ROOT";
+        if let Some(root) = env::var_os(CHILD_ROOT) {
+            let repo_dir = PathBuf::from(root).join("fixture");
+            generate_branching_fixture(&repo_dir, 2, 1).expect("generate fixture");
+            let head = run_git_capture(&repo_dir, &["rev-parse", "--symbolic-full-name", "HEAD"]);
+            assert_eq!(head, Ok("refs/heads/master".to_string()));
+            assert!(
+                !repo_dir.join(".git").join("marker").exists(),
+                "global config leaked into the fixture"
+            );
+            return;
+        }
+
+        // The child gets a hostile env from birth, like a git hook (exports GIT_DIR) on a machine
+        // whose git defaults to another branch (Apple Git ships init.defaultBranch=main) and whose
+        // global config sets a template dir.
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let home = temp.path().join("home");
+        let template = temp.path().join("template");
+        fs::create_dir_all(&home).expect("create home dir");
+        fs::create_dir_all(&template).expect("create template dir");
+        fs::write(template.join("marker"), "leaked\n").expect("write template marker");
+        let global = Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(home.join(".gitconfig"))
+            .arg("init.templateDir")
+            .arg(&template)
+            .status()
+            .expect("write hostile global config");
+        assert!(global.success());
+        let sentinel = temp.path().join("sentinel.git");
+        let init = Command::new("git")
+            .arg("--git-dir")
+            .arg(&sentinel)
+            .args(["init", "--bare", "--quiet"])
+            .status()
+            .expect("init sentinel repo");
+        assert!(init.success());
+
+        let child = Command::new(env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "tests::branching_fixture_ignores_inherited_git_environment",
+            ])
+            .env(CHILD_ROOT, temp.path())
+            .env("HOME", &home)
+            .env("GIT_DIR", &sentinel)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "init.defaultBranch")
+            .env("GIT_CONFIG_VALUE_0", "trunk")
+            .output()
+            .expect("run child test");
+        assert!(
+            child.status.success(),
+            "fixture failed under inherited git env: {}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+
+        let sentinel_refs = Command::new("git")
+            .arg("--git-dir")
+            .arg(&sentinel)
+            .arg("for-each-ref")
+            .output()
+            .expect("list sentinel refs");
+        assert_eq!(String::from_utf8_lossy(&sentinel_refs.stdout), "");
+    }
+
+    #[test]
+    fn fixture_repo_keeps_case_only_paths_distinct() {
+        // git init writes core.ignorecase=true on APFS and NTFS, and fast-import then merges these two paths.
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let repo_dir = temp.path().join("fixture");
+        fs::create_dir_all(&repo_dir).expect("create fixture dir");
+        init_fixture_repo(&repo_dir).expect("init fixture repo");
+
+        let stream = "commit refs/heads/master\nmark :1\ncommitter Lab <lab@example.com> 1700000000 +0000\ndata 4\ncase\nM 100644 inline Makefile\ndata 2\nA\nM 100644 inline makefile\ndata 2\nB\ndone\n";
+        run_git_fast_import(&repo_dir, stream).expect("fast-import case-only paths");
+
+        let tree = run_git_capture(&repo_dir, &["ls-tree", "--name-only", "master"]);
+        assert_eq!(tree, Ok("Makefile\nmakefile".to_string()));
     }
 }
