@@ -67,5 +67,5 @@ Desktop/UI remains a Tauri/React shell around the Rust core.
 
 LMDB/CSR/no-relational_query runtime decision is documented in:
 
-1. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
+1. `docs/adr/0015-lmdb-csr-delta-storage.md`
 

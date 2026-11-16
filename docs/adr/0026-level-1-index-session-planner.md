@@ -1,7 +1,8 @@
-# ADR 0015: Level 1 Index Session Planner
+# ADR 0026: Level 1 Index Session Planner
 
 Date: 2026-03-20
 Status: Accepted
+Renumbered: 2026-11-16, from a duplicate 0015 (ADR 0019 to 0025 are reserved by the cleanup roadmap).
 
 ## Context
 

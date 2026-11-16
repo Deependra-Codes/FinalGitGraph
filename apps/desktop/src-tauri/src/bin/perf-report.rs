@@ -1206,14 +1206,6 @@ fn format_report(input: &ReportInput<'_>) -> String {
     let aggregate_query_commit_window_prewarm_hydrated_rows = full
         .query_commit_window_prewarm_hydrated_rows
         .saturating_add(incremental.query_commit_window_prewarm_hydrated_rows);
-    let aggregate_incremental_csr_streaming_mode_effective = if full
-        .incremental_csr_streaming_mode_effective
-        == incremental.incremental_csr_streaming_mode_effective
-    {
-        full.incremental_csr_streaming_mode_effective.as_str()
-    } else {
-        "mixed"
-    };
     let aggregate_commit_walk_ms = full.commit_walk_ms + incremental.commit_walk_ms;
     let aggregate_commit_upsert_ms = full.commit_upsert_ms + incremental.commit_upsert_ms;
     let aggregate_commit_write_wave_txn_count = full
@@ -1232,8 +1224,6 @@ fn format_report(input: &ReportInput<'_>) -> String {
         .max(incremental.commit_ingest_queue_max_depth);
     let aggregate_commit_ingest_queue_wait_ms =
         full.commit_ingest_queue_wait_ms + incremental.commit_ingest_queue_wait_ms;
-    let aggregate_commit_csr_delta_apply_ms =
-        full.commit_csr_delta_apply_ms + incremental.commit_csr_delta_apply_ms;
     let aggregate_commit_csr_overlay_upsert_ms =
         full.commit_csr_overlay_upsert_ms + incremental.commit_csr_overlay_upsert_ms;
     let aggregate_commit_csr_compaction_ms =
@@ -1528,18 +1518,6 @@ fn format_report(input: &ReportInput<'_>) -> String {
     lines.push(format!(
         "incremental_commit_walk_scope: {}",
         incremental.commit_walk_scope
-    ));
-    lines.push(format!(
-        "full_incremental_csr_streaming_mode_effective: {}",
-        full.incremental_csr_streaming_mode_effective
-    ));
-    lines.push(format!(
-        "incremental_incremental_csr_streaming_mode_effective: {}",
-        incremental.incremental_csr_streaming_mode_effective
-    ));
-    lines.push(format!(
-        "aggregate_incremental_csr_streaming_mode_effective: {}",
-        aggregate_incremental_csr_streaming_mode_effective
     ));
     lines.push(format!(
         "full_commit_walk_engine: {}",
@@ -1994,18 +1972,6 @@ fn format_report(input: &ReportInput<'_>) -> String {
     lines.push(format!(
         "aggregate_commit_ingest_queue_wait_ms: {:.3}",
         aggregate_commit_ingest_queue_wait_ms
-    ));
-    lines.push(format!(
-        "full_commit_csr_delta_apply_ms: {:.3}",
-        full.commit_csr_delta_apply_ms
-    ));
-    lines.push(format!(
-        "incremental_commit_csr_delta_apply_ms: {:.3}",
-        incremental.commit_csr_delta_apply_ms
-    ));
-    lines.push(format!(
-        "aggregate_commit_csr_delta_apply_ms: {:.3}",
-        aggregate_commit_csr_delta_apply_ms
     ));
     lines.push(format!(
         "full_commit_csr_overlay_upsert_ms: {:.3}",
@@ -2493,17 +2459,6 @@ fn format_report(input: &ReportInput<'_>) -> String {
         aggregate_commit_write_wave_batch_median
     ));
     lines.push(format!(
-        "ingest_commit_csr_delta_apply_ms: {:.3}",
-        input
-            .full_stats
-            .ingestion_phase_timing_ms
-            .commit_csr_delta_apply
-            + input
-                .incremental_stats
-                .ingestion_phase_timing_ms
-                .commit_csr_delta_apply
-    ));
-    lines.push(format!(
         "ingest_commit_csr_overlay_upsert_ms: {:.3}",
         input
             .full_stats
@@ -2789,14 +2744,10 @@ mod tests {
             commit_window_jit_hydrated_rows: commit_throughput.commit_window_jit_hydrated_rows,
             query_commit_window_prewarm_hydrated_rows: commit_throughput
                 .query_commit_window_prewarm_hydrated_rows,
-            incremental_csr_streaming_mode_effective: commit_throughput
-                .incremental_csr_streaming_mode_effective
-                .clone(),
             commit_write_wave_txn_count: commit_throughput.commit_write_wave_txn_count,
             commit_write_wave_batch_median: commit_throughput.commit_write_wave_batch_median,
             commit_ingest_queue_max_depth: commit_throughput.commit_ingest_queue_max_depth,
             commit_ingest_queue_wait_ms: commit_throughput.commit_ingest_queue_wait_ms,
-            commit_csr_delta_apply_ms: commit_throughput.commit_csr_delta_apply_ms,
             commit_csr_overlay_upsert_ms: commit_throughput.commit_csr_overlay_upsert_ms,
             commit_csr_compaction_ms: commit_throughput.commit_csr_compaction_ms,
             ingestion_phase_timing_ms,
@@ -2841,7 +2792,6 @@ mod tests {
                 commit_walk_tape_build_ms: 4.5,
                 commit_walk_tape_node_count: 7,
                 commit_walk_tape_parent_edges: 8,
-                incremental_csr_streaming_mode_effective: "enabled".to_string(),
                 bottleneck_phase: "commit_walk".to_string(),
                 ..Default::default()
             },
@@ -2885,7 +2835,6 @@ mod tests {
                 commit_walk_tape_build_ms: 13.0,
                 commit_walk_tape_node_count: 14,
                 commit_walk_tape_parent_edges: 15,
-                incremental_csr_streaming_mode_effective: "enabled".to_string(),
                 bottleneck_phase: "commit_walk".to_string(),
                 ..Default::default()
             },

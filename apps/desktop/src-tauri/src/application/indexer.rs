@@ -16,7 +16,7 @@ use crate::adapters::git::{
     load_file_change_line_stats_for_targets, load_refs, reorder_commits_topologically,
     reorder_commits_topologically_with_parents, stream_commit_batches_with_hide, stream_commits,
     stream_file_changes_for_commits, stream_file_changes_for_commits_drain, validate_repository,
-    FILE_CHANGE_COMMIT_BATCH_SIZE,
+    IncrementalCutoff, FILE_CHANGE_COMMIT_BATCH_SIZE,
 };
 use crate::application::index_planner::{plan_index_session, plan_scan_session};
 use crate::application::limits::{normalize_graph_max_nodes, normalize_window_limit};
@@ -34,8 +34,6 @@ const INCREMENTAL_LOOKBACK_SECONDS: i64 = 300;
 const FILE_CHANGE_DB_BATCH_SIZE: usize = 4_096;
 const FILE_CHANGE_JIT_ENRICH_BATCH_SIZE: usize = 1_024;
 const FILE_CHANGE_COMMIT_BATCH_SIZE_ENV: &str = "GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE";
-const LEVEL3_STREAMING_CSR_ENV: &str = "GITGRAPH_LEVEL3_STREAMING_CSR";
-const LEVEL3_STREAMING_CSR_MODE_ENV: &str = "GITGRAPH_LEVEL3_STREAMING_CSR_MODE";
 const LEVEL3_COSCHEDULE_JIT_ENRICH_ENV: &str = "GITGRAPH_LEVEL3_COSCHEDULE_JIT_ENRICH";
 const FILE_CHANGE_SYNC_STRICT_ENV: &str = "GITGRAPH_FILE_CHANGE_SYNC_STRICT";
 const COMMIT_INGEST_PIPELINED_ENV: &str = "GITGRAPH_COMMIT_INGEST_PIPELINED";
@@ -52,21 +50,6 @@ const COMMIT_WINDOW_PREWARM_LIMIT_DEFAULT: usize = 1_024;
 
 static RUNTIME_QUERY_GRAPH_CACHE: OnceLock<Mutex<Option<RuntimeQueryGraphCacheEntry>>> =
     OnceLock::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamingCsrMode {
-    FullOnly,
-    FullPlusIncremental,
-}
-
-impl StreamingCsrMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::FullOnly => "full_only",
-            Self::FullPlusIncremental => "full_plus_incremental",
-        }
-    }
-}
 
 #[derive(Default)]
 struct IngestionPhaseTiming {
@@ -116,7 +99,6 @@ struct IngestionPhaseTiming {
     commit_ingest_queue_max_depth: usize,
     commit_write_wave_txn_count: usize,
     commit_write_wave_batch_median: f64,
-    commit_csr_delta_apply: Duration,
     commit_csr_overlay_upsert: Duration,
     commit_csr_compaction: Duration,
     query_commit_window_prewarm_hydrated_rows: usize,
@@ -127,14 +109,11 @@ struct IngestionPhaseTiming {
 struct CommitWriteExecutionStats {
     commits_inserted: usize,
     commit_upsert: Duration,
-    edge_materialize: Duration,
     commit_write_wave_txn_count: usize,
     commit_write_wave_batch_sizes: Vec<usize>,
     commit_write_wave_batch_final: usize,
     queue_wait: Duration,
     queue_max_depth: usize,
-    streaming_csr_materialized_any: bool,
-    commit_csr_delta_apply: Duration,
 }
 
 struct CommitIngestWriterLoopOptions {
@@ -142,14 +121,8 @@ struct CommitIngestWriterLoopOptions {
     queue_depth: Arc<AtomicUsize>,
     queue_max_depth: Arc<AtomicUsize>,
     initial_batch_size: usize,
-    streaming_snapshot_apply_enabled: bool,
     fixed_override: bool,
     adaptive: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CsrStreamingModeTelemetry<'a> {
-    effective: &'a str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -303,7 +276,6 @@ impl IngestionPhaseTiming {
             commit_ingest_queue_max_depth: self.commit_ingest_queue_max_depth as f64,
             commit_write_wave_txn_count: self.commit_write_wave_txn_count as f64,
             commit_write_wave_batch_median: self.commit_write_wave_batch_median,
-            commit_csr_delta_apply: duration_ms(self.commit_csr_delta_apply),
             commit_csr_overlay_upsert: duration_ms(self.commit_csr_overlay_upsert),
             commit_csr_compaction: duration_ms(self.commit_csr_compaction),
             query_commit_window_prewarm_hydrated_rows: self
@@ -368,21 +340,12 @@ impl Indexer {
             .resume_from_committer_time
             .map(|value| value.saturating_sub(INCREMENTAL_LOOKBACK_SECONDS));
         let hide_ancestor_sha = decision.hide_ancestor_sha;
+        let is_indexed = |sha: &str| store.commit_exists(repo_id, sha);
+        let incremental_cutoff = since_epoch.map(|since_epoch| IncrementalCutoff {
+            since_epoch,
+            is_indexed: &is_indexed,
+        });
         let level3_options = level3_runtime_options();
-        let streaming_csr_enabled = parse_env_bool_with_default(LEVEL3_STREAMING_CSR_ENV, true);
-        let streaming_csr_mode = parse_streaming_csr_mode();
-        let streaming_snapshot_apply_enabled = streaming_snapshot_apply_enabled_for_mode(
-            streaming_csr_enabled,
-            effective_mode,
-            streaming_csr_mode,
-        );
-        let streaming_mode_telemetry = CsrStreamingModeTelemetry {
-            effective: incremental_csr_streaming_mode_effective(
-                streaming_csr_enabled,
-                effective_mode,
-                streaming_csr_mode,
-            ),
-        };
         let coschedule_jit_enrichment_enabled =
             parse_env_bool_enabled(LEVEL3_COSCHEDULE_JIT_ENRICH_ENV);
         let sync_file_change_extraction = parse_env_bool_enabled(FILE_CHANGE_SYNC_STRICT_ENV);
@@ -402,9 +365,6 @@ impl Indexer {
 
         if effective_mode == IndexingMode::Full {
             store.clear_repository_index_data(repo_id)?;
-            if streaming_snapshot_apply_enabled {
-                store.initialize_empty_csr_snapshot(repo_id)?;
-            }
         }
 
         let refs = load_refs(&canonical_repo.root)?;
@@ -439,7 +399,6 @@ impl Indexer {
                 queue_depth: queue_depth_for_writer,
                 queue_max_depth: queue_max_depth_for_writer,
                 initial_batch_size: commit_batch_size,
-                streaming_snapshot_apply_enabled,
                 fixed_override: commit_batch_override.is_some(),
                 adaptive: adaptive_commit_waves,
             };
@@ -491,7 +450,7 @@ impl Indexer {
                     let hide_ancestor_sha = hide_ancestor_sha.as_deref();
                     stream_commit_batches_with_hide(
                         &canonical_repo.root,
-                        since_epoch,
+                        incremental_cutoff,
                         hide_ancestor_sha,
                         commit_batch_size,
                         &mut on_streamed_commit_batch,
@@ -499,7 +458,6 @@ impl Indexer {
                 } else {
                     stream_commits(
                         &canonical_repo.root,
-                        since_epoch,
                         commit_batch_size,
                         &mut on_streamed_commit_batch,
                     )
@@ -545,7 +503,6 @@ impl Indexer {
                                 &store,
                                 repo_id,
                                 &mut commit_batch,
-                                streaming_snapshot_apply_enabled,
                                 &mut controller,
                                 &mut commit_writer_stats,
                             )?;
@@ -560,7 +517,7 @@ impl Indexer {
                 let hide_ancestor_sha = hide_ancestor_sha.as_deref();
                 stream_commit_batches_with_hide(
                     &canonical_repo.root,
-                    since_epoch,
+                    incremental_cutoff,
                     hide_ancestor_sha,
                     commit_batch_size,
                     &mut on_streamed_commit_batch,
@@ -568,7 +525,6 @@ impl Indexer {
             } else {
                 stream_commits(
                     &canonical_repo.root,
-                    since_epoch,
                     commit_batch_size,
                     &mut on_streamed_commit_batch,
                 )?
@@ -579,7 +535,6 @@ impl Indexer {
                     &store,
                     repo_id,
                     &mut commit_batch,
-                    streaming_snapshot_apply_enabled,
                     &mut controller,
                     &mut commit_writer_stats,
                 )?;
@@ -626,12 +581,6 @@ impl Indexer {
         ingestion_timing.commit_upsert = ingestion_timing
             .commit_upsert
             .saturating_add(commit_writer_stats.commit_upsert);
-        ingestion_timing.edge_materialize = ingestion_timing
-            .edge_materialize
-            .saturating_add(commit_writer_stats.edge_materialize);
-        ingestion_timing.commit_csr_delta_apply = ingestion_timing
-            .commit_csr_delta_apply
-            .saturating_add(commit_writer_stats.commit_csr_delta_apply);
         ingestion_timing.commit_ingest_queue_wait = ingestion_timing
             .commit_ingest_queue_wait
             .saturating_add(commit_writer_stats.queue_wait);
@@ -641,7 +590,6 @@ impl Indexer {
         ingestion_timing.commit_write_wave_batch_median =
             median_usize(&commit_writer_stats.commit_write_wave_batch_sizes);
         let commits_inserted = commit_writer_stats.commits_inserted;
-        let streaming_csr_materialized_any = commit_writer_stats.streaming_csr_materialized_any;
 
         let mut file_changes_indexed = 0usize;
         let mut file_change_commits_enqueued = 0usize;
@@ -739,62 +687,49 @@ impl Indexer {
         if effective_mode == IndexingMode::Incremental {
             if !streamed_commit_shas.is_empty() {
                 let snapshot_started = Instant::now();
-                let should_materialize_overlay =
-                    !streaming_snapshot_apply_enabled || !streaming_csr_materialized_any;
-                if should_materialize_overlay {
-                    let overlay_metadata = if store.load_graph_snapshot_metadata(repo_id)?.is_some()
-                    {
-                        let overlay_started = Instant::now();
-                        let metadata =
-                            store.persist_graph_overlay_commits(repo_id, &streamed_commit_shas)?;
-                        ingestion_timing.commit_csr_overlay_upsert = ingestion_timing
-                            .commit_csr_overlay_upsert
-                            .saturating_add(overlay_started.elapsed());
-                        metadata
-                    } else {
-                        let rebuild_started = Instant::now();
-                        let _ = store.rebuild_csr_snapshot(repo_id)?;
-                        ingestion_timing.commit_csr_compaction = ingestion_timing
-                            .commit_csr_compaction
-                            .saturating_add(rebuild_started.elapsed());
-                        store
-                            .load_graph_snapshot_metadata(repo_id)?
-                            .ok_or_else(|| {
-                                AppError::Parse(
-                                    "graph snapshot metadata missing after incremental fallback rebuild"
-                                        .to_string(),
-                                )
-                            })?
-                    };
+                let overlay_metadata = if store.load_graph_snapshot_metadata(repo_id)?.is_some() {
+                    let overlay_started = Instant::now();
+                    let metadata =
+                        store.persist_graph_overlay_commits(repo_id, &streamed_commit_shas)?;
+                    ingestion_timing.commit_csr_overlay_upsert = ingestion_timing
+                        .commit_csr_overlay_upsert
+                        .saturating_add(overlay_started.elapsed());
+                    metadata
+                } else {
+                    let rebuild_started = Instant::now();
+                    let _ = store.rebuild_csr_snapshot(repo_id)?;
+                    ingestion_timing.commit_csr_compaction = ingestion_timing
+                        .commit_csr_compaction
+                        .saturating_add(rebuild_started.elapsed());
+                    store
+                        .load_graph_snapshot_metadata(repo_id)?
+                        .ok_or_else(|| {
+                            AppError::Parse(
+                                "graph snapshot metadata missing after incremental fallback rebuild"
+                                    .to_string(),
+                            )
+                        })?
+                };
 
-                    if should_compact_graph_overlay(&overlay_metadata) {
-                        let compact_started = Instant::now();
-                        let compacted = store.compact_graph_overlay_into_snapshot(repo_id)?;
-                        if compacted.is_none() {
-                            let _ = store.rebuild_csr_snapshot(repo_id)?;
-                        }
-                        ingestion_timing.commit_csr_compaction = ingestion_timing
-                            .commit_csr_compaction
-                            .saturating_add(compact_started.elapsed());
+                // Compaction applies every overlay commit in one call, so no parent is missing yet.
+                if should_compact_graph_overlay(&overlay_metadata) {
+                    let compact_started = Instant::now();
+                    let compacted = store.compact_graph_overlay_into_snapshot(repo_id)?;
+                    if compacted.is_none() {
+                        let _ = store.rebuild_csr_snapshot(repo_id)?;
                     }
+                    ingestion_timing.commit_csr_compaction = ingestion_timing
+                        .commit_csr_compaction
+                        .saturating_add(compact_started.elapsed());
                 }
 
                 ingestion_timing.edge_materialize = ingestion_timing
                     .edge_materialize
                     .saturating_add(snapshot_started.elapsed());
             }
-        } else if !streaming_csr_enabled {
-            let snapshot_started = Instant::now();
-            {
-                let _ = store.rebuild_csr_snapshot(repo_id)?;
-            }
-            ingestion_timing.commit_csr_compaction = ingestion_timing
-                .commit_csr_compaction
-                .saturating_add(snapshot_started.elapsed());
-            ingestion_timing.edge_materialize = ingestion_timing
-                .edge_materialize
-                .saturating_add(snapshot_started.elapsed());
-        } else if !streamed_commit_shas.is_empty() && !streaming_csr_materialized_any {
+        } else {
+            // One rebuild after the whole walk: per-wave snapshot deltas dropped edges whose
+            // parent arrived in a later wave (ADR-0019).
             let snapshot_started = Instant::now();
             let _ = store.rebuild_csr_snapshot(repo_id)?;
             ingestion_timing.commit_csr_compaction = ingestion_timing
@@ -858,7 +793,6 @@ impl Indexer {
         let commit_throughput = build_commit_throughput_telemetry(
             &planner_telemetry,
             &commit_walk_telemetry,
-            &streaming_mode_telemetry,
             streamed_commit_shas.len(),
             commits_inserted,
             index_started.elapsed(),
@@ -932,14 +866,10 @@ impl Indexer {
             commit_walk_tape_parent_edges: ingestion_timing.commit_walk_tape_parent_edges,
             commit_window_jit_hydrated_rows: 0,
             query_commit_window_prewarm_hydrated_rows,
-            incremental_csr_streaming_mode_effective: streaming_mode_telemetry
-                .effective
-                .to_string(),
             commit_write_wave_txn_count: ingestion_timing.commit_write_wave_txn_count,
             commit_write_wave_batch_median: ingestion_timing.commit_write_wave_batch_median,
             commit_ingest_queue_max_depth: ingestion_timing.commit_ingest_queue_max_depth,
             commit_ingest_queue_wait_ms: duration_ms(ingestion_timing.commit_ingest_queue_wait),
-            commit_csr_delta_apply_ms: duration_ms(ingestion_timing.commit_csr_delta_apply),
             commit_csr_overlay_upsert_ms: duration_ms(ingestion_timing.commit_csr_overlay_upsert),
             commit_csr_compaction_ms: duration_ms(ingestion_timing.commit_csr_compaction),
             ingestion_phase_timing_ms: ingestion_timing.into_ms(),
@@ -1450,51 +1380,6 @@ fn parse_env_bool_with_default(key: &str, default_value: bool) -> bool {
         .unwrap_or(default_value)
 }
 
-fn parse_streaming_csr_mode() -> StreamingCsrMode {
-    std::env::var(LEVEL3_STREAMING_CSR_MODE_ENV)
-        .ok()
-        .map(|raw| raw.trim().to_ascii_lowercase())
-        .map(|raw| match raw.as_str() {
-            "full_plus_incremental" => StreamingCsrMode::FullPlusIncremental,
-            _ => StreamingCsrMode::FullOnly,
-        })
-        .unwrap_or(StreamingCsrMode::FullPlusIncremental)
-}
-
-fn streaming_snapshot_apply_enabled_for_mode(
-    streaming_csr_enabled: bool,
-    effective_mode: IndexingMode,
-    streaming_csr_mode: StreamingCsrMode,
-) -> bool {
-    if !streaming_csr_enabled {
-        return false;
-    }
-    match effective_mode {
-        IndexingMode::Full => true,
-        IndexingMode::Incremental => streaming_csr_mode == StreamingCsrMode::FullPlusIncremental,
-    }
-}
-
-fn incremental_csr_streaming_mode_effective(
-    streaming_csr_enabled: bool,
-    effective_mode: IndexingMode,
-    streaming_csr_mode: StreamingCsrMode,
-) -> &'static str {
-    if !streaming_csr_enabled {
-        return "disabled";
-    }
-    match effective_mode {
-        IndexingMode::Full => streaming_csr_mode.as_str(),
-        IndexingMode::Incremental => {
-            if streaming_csr_mode == StreamingCsrMode::FullPlusIncremental {
-                "full_plus_incremental"
-            } else {
-                "full_only"
-            }
-        }
-    }
-}
-
 fn parse_positive_env_usize(key: &str) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -1574,7 +1459,6 @@ fn flush_commit_write_wave(
     store: &GraphStore,
     repo_id: i64,
     pending_commits: &mut Vec<crate::domain::models::ParsedCommit>,
-    streaming_snapshot_apply_enabled: bool,
     controller: &mut CommitWriteWaveController,
     stats: &mut CommitWriteExecutionStats,
 ) -> AppResult<()> {
@@ -1582,28 +1466,11 @@ fn flush_commit_write_wave(
         return Ok(());
     }
 
-    let batch_shas: Vec<String> = pending_commits
-        .iter()
-        .map(|item| item.sha.clone())
-        .collect();
     let upsert_started = Instant::now();
     let persisted = store.persist_commits(repo_id, pending_commits)?;
     let upsert_elapsed = upsert_started.elapsed();
     stats.commits_inserted = stats.commits_inserted.saturating_add(persisted);
     stats.commit_upsert = stats.commit_upsert.saturating_add(upsert_elapsed);
-
-    if streaming_snapshot_apply_enabled {
-        let materialize_started = Instant::now();
-        let applied = store.apply_csr_delta_from_commit_shas(repo_id, &batch_shas)?;
-        let materialize_elapsed = materialize_started.elapsed();
-        stats.edge_materialize = stats.edge_materialize.saturating_add(materialize_elapsed);
-        stats.commit_csr_delta_apply = stats
-            .commit_csr_delta_apply
-            .saturating_add(materialize_elapsed);
-        if applied.is_some() {
-            stats.streaming_csr_materialized_any = true;
-        }
-    }
 
     stats.commit_write_wave_txn_count = stats.commit_write_wave_txn_count.saturating_add(1);
     stats
@@ -1640,7 +1507,6 @@ fn run_commit_ingest_writer_loop(
                 store,
                 options.repo_id,
                 &mut pending_commits,
-                options.streaming_snapshot_apply_enabled,
                 &mut controller,
                 &mut stats,
             )?;
@@ -1651,7 +1517,6 @@ fn run_commit_ingest_writer_loop(
             store,
             options.repo_id,
             &mut pending_commits,
-            options.streaming_snapshot_apply_enabled,
             &mut controller,
             &mut stats,
         )?;
@@ -1663,7 +1528,6 @@ fn run_commit_ingest_writer_loop(
 fn build_commit_throughput_telemetry(
     planner: &PlannerTelemetryContext,
     commit_walk: &CommitWalkTelemetryContext<'_>,
-    csr_streaming_mode: &CsrStreamingModeTelemetry<'_>,
     commits_seen: usize,
     commits_indexed: usize,
     end_to_end: Duration,
@@ -1751,7 +1615,6 @@ fn build_commit_throughput_telemetry(
         commit_window_jit_hydrated_rows: 0,
         query_commit_window_prewarm_hydrated_rows: ingestion_timing
             .query_commit_window_prewarm_hydrated_rows,
-        incremental_csr_streaming_mode_effective: csr_streaming_mode.effective.to_string(),
         commit_walk_ms: duration_ms(ingestion_timing.commit_walk),
         commit_walk_commits_per_sec_seen: throughput_per_sec(
             commits_seen,
@@ -1766,7 +1629,6 @@ fn build_commit_throughput_telemetry(
         commit_write_wave_batch_median: ingestion_timing.commit_write_wave_batch_median,
         commit_ingest_queue_max_depth: ingestion_timing.commit_ingest_queue_max_depth,
         commit_ingest_queue_wait_ms: duration_ms(ingestion_timing.commit_ingest_queue_wait),
-        commit_csr_delta_apply_ms: duration_ms(ingestion_timing.commit_csr_delta_apply),
         commit_csr_overlay_upsert_ms: duration_ms(ingestion_timing.commit_csr_overlay_upsert),
         commit_csr_compaction_ms: duration_ms(ingestion_timing.commit_csr_compaction),
         file_diff_extract_ms: duration_ms(ingestion_timing.file_diff_extract),

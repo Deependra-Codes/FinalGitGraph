@@ -71,7 +71,7 @@ Fixed on 2026-11-16, before S1, at the owner's request:
 - The same test also plants a hostile global config (`HOME/.gitconfig` with an `init.templateDir` marker). A mutation check confirmed it fails when the `GIT_CONFIG_GLOBAL` pin is removed. CI therefore checks the pin on each OS it runs.
 - `init_fixture_repo` sets `core.ignorecase=false`. `git init` probes the filesystem and writes `true` on APFS and NTFS, which env pinning cannot prevent. The test `fixture_repo_keeps_case_only_paths_distinct` was written first: a fast-import of `Makefile` and `makefile` collapsed to one path on this Mac, and now keeps both.
 - After the fix, every S0 step passes on this Mac with no environment workaround: 55 tests, guardrails, perf smoke and perf budget.
-- Not yet run on Windows: the `NUL` global-config pin and the NTFS ignorecase case. Both are covered by the tests above, which the CI `windows-latest` job runs on the next push.
+- Verified on Windows by CI run 43920277148 (commit `6df0b5c`). Both new tests passed on `windows-latest`, covering the `NUL` global-config pin and the NTFS ignorecase case. Ubuntu and the 25k ingestion budget lane also passed.
 
 Another finding along the way: the red-team's recommended catalog engine collides with the relational-term guardrail. See the LMDB row of the decision register.
 
@@ -96,6 +96,14 @@ This sub-project follows the corrected Phase 0 from RT ("Migration plan" and "Ch
 - Fix the duplicate ADR number 0015 (`0015-level-1-index-session-planner.md` and `0015-lmdb-csr-delta-storage.md`).
 
 Both bugs are so far confirmed only by reading the code. The S1 tests are the first executable proof.
+
+S1 result, 2026-11-16 (details in `docs/adr/0019-remove-streaming-csr-and-age-only-pruning.md`):
+
+- **Bugs reproduced.** Four tests written first failed for the predicted reasons. A 20,000-commit full index lost exactly 2 edges. A 9,000-commit incremental run broke reachability from HEAD. An old-dated merged branch lost 5 commits. A pre-fix checkpoint was still trusted.
+- **Owner's choice on pruning.** The owner chose the hotfix. All three walkers now prune a commit older than the cutoff only when the index already holds it, through one shared `cutoff_action` and an `IncrementalCutoff { since_epoch, is_indexed }` input.
+- **Repair.** Repair uses a versioned checkpoint key. Each existing index re-indexes in full once.
+- **Duplicate ADR number.** The duplicate 0015 was fixed by renumbering the planner ADR to 0026, which keeps 0019 to 0025 free for this program. Nine dead links to a nonexistent 0015 file name were corrected.
+- **Gates and perf.** All gates pass. On the host 25k cold lane (median of 3), full index time went from 120.2 to 99.3 ms. Incremental time stayed within noise, and peak RSS went from 89.2 to 83.0 MB.
 
 ### S2. Portable automation (ADR-0020)
 

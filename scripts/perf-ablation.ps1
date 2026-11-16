@@ -271,8 +271,6 @@ function Invoke-Scenario {
         "GITGRAPH_FILE_CHANGE_RENAME_HOT_PATH",
         "GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO",
         "GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER",
-        "GITGRAPH_LEVEL3_STREAMING_CSR",
-        "GITGRAPH_LEVEL3_STREAMING_CSR_MODE",
         "GITGRAPH_COMMIT_WALK_SORT",
         "GITGRAPH_COMMIT_WALK_SCOPE",
         "GITGRAPH_FILE_CHANGE_COMMIT_BATCH_SIZE",
@@ -439,8 +437,6 @@ if ($CommitWalkResearch90k) {
         GITGRAPH_FILE_CHANGE_PARENT_TREE_MEMO = "1"
         GITGRAPH_COMMIT_WALK_SCOPE = "frontier"
         GITGRAPH_COMMIT_WALK_SORT = "commit_time_newest"
-        GITGRAPH_LEVEL3_STREAMING_CSR = "1"
-        GITGRAPH_LEVEL3_STREAMING_CSR_MODE = "full_plus_incremental"
         GITGRAPH_COMMIT_INGEST_PIPELINED = "1"
         GITGRAPH_COMMIT_WRITE_WAVE_ADAPTIVE = "1"
         GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY = "32768"
@@ -454,10 +450,6 @@ if ($CommitWalkResearch90k) {
     $controlEnv = Merge-EnvMaps @($baseResearchEnv)
     $scenarios += @{ Name = "control"; Env = $controlEnv }
 
-    $streamingCsrModes = @(
-        @{ Name = "full_only"; Value = "full_only" },
-        @{ Name = "full_plus_incremental"; Value = "full_plus_incremental" }
-    )
     $pipelineLanes = @(
         @{ Name = "off"; Value = "0" },
         @{ Name = "on"; Value = "1" }
@@ -481,30 +473,26 @@ if ($CommitWalkResearch90k) {
         @{ Name = "on"; Value = "1" }
     )
 
-    foreach ($csrMode in $streamingCsrModes) {
-        foreach ($pipeline in $pipelineLanes) {
-            foreach ($adaptive in $adaptiveLanes) {
-                foreach ($queue in $queueLanes) {
-                    foreach ($overlay in $overlayLanes) {
-                        foreach ($prewarm in $prewarmLanes) {
-                            $envVars = Merge-EnvMaps @($baseResearchEnv)
-                            $envVars["GITGRAPH_LEVEL3_STREAMING_CSR"] = "1"
-                            $envVars["GITGRAPH_LEVEL3_STREAMING_CSR_MODE"] = $csrMode.Value
-                            $envVars["GITGRAPH_COMMIT_INGEST_PIPELINED"] = $pipeline.Value
-                            $envVars["GITGRAPH_COMMIT_WRITE_WAVE_ADAPTIVE"] = $adaptive.Value
-                            $envVars["GITGRAPH_COMMIT_WINDOW_PREWARM"] = $prewarm.Value
-                            if ([string]::IsNullOrWhiteSpace($queue.Value)) {
-                                $envVars["GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY"] = ""
-                            } else {
-                                $envVars["GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY"] = $queue.Value
-                            }
-                            $envVars["GITGRAPH_GRAPH_OVERLAY_MAX_COMMITS"] = $overlay.Commits
-                            $envVars["GITGRAPH_GRAPH_OVERLAY_MAX_EDGES"] = $overlay.Edges
-
-                            $scenarioName = ("research-csr={0}-p={1}-a={2}-q={3}-o={4}-w={5}" -f `
-                                $csrMode.Name, $pipeline.Name, $adaptive.Name, $queue.Name, $overlay.Name, $prewarm.Name)
-                            $scenarios += @{ Name = $scenarioName; Env = $envVars }
+    foreach ($pipeline in $pipelineLanes) {
+        foreach ($adaptive in $adaptiveLanes) {
+            foreach ($queue in $queueLanes) {
+                foreach ($overlay in $overlayLanes) {
+                    foreach ($prewarm in $prewarmLanes) {
+                        $envVars = Merge-EnvMaps @($baseResearchEnv)
+                        $envVars["GITGRAPH_COMMIT_INGEST_PIPELINED"] = $pipeline.Value
+                        $envVars["GITGRAPH_COMMIT_WRITE_WAVE_ADAPTIVE"] = $adaptive.Value
+                        $envVars["GITGRAPH_COMMIT_WINDOW_PREWARM"] = $prewarm.Value
+                        if ([string]::IsNullOrWhiteSpace($queue.Value)) {
+                            $envVars["GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY"] = ""
+                        } else {
+                            $envVars["GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY"] = $queue.Value
                         }
+                        $envVars["GITGRAPH_GRAPH_OVERLAY_MAX_COMMITS"] = $overlay.Commits
+                        $envVars["GITGRAPH_GRAPH_OVERLAY_MAX_EDGES"] = $overlay.Edges
+
+                        $scenarioName = ("research-p={0}-a={1}-q={2}-o={3}-w={4}" -f `
+                            $pipeline.Name, $adaptive.Name, $queue.Name, $overlay.Name, $prewarm.Name)
+                        $scenarios += @{ Name = $scenarioName; Env = $envVars }
                     }
                 }
             }

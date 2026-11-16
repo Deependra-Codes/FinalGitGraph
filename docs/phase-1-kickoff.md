@@ -19,5 +19,5 @@ For active architecture and operating model, use:
 1. `docs/engineering-system.md`
 2. `docs/from-scratch-system.md`
 3. `docs/automation-guardrails.md`
-4. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
+4. `docs/adr/0015-lmdb-csr-delta-storage.md`
 

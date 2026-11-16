@@ -256,8 +256,6 @@ function Get-DockerRunArgs {
         "GITGRAPH_FILE_CHANGE_DRAIN_PARALLEL_CHUNK_SIZE",
         "GITGRAPH_FILE_CHANGE_DRAIN_CHANNEL_CAPACITY",
         "GITGRAPH_QUERY_RUNTIME_CACHE",
-        "GITGRAPH_LEVEL3_STREAMING_CSR",
-        "GITGRAPH_LEVEL3_STREAMING_CSR_MODE",
         "GITGRAPH_COMMIT_INGEST_PIPELINED",
         "GITGRAPH_COMMIT_WRITE_WAVE_ADAPTIVE",
         "GITGRAPH_COMMIT_INGEST_QUEUE_CAPACITY",
@@ -457,14 +455,12 @@ try {
     $previousIngestWriteProfile = $env:GITGRAPH_INGEST_WRITE_PROFILE
     $previousWalkSort = $env:GITGRAPH_COMMIT_WALK_SORT
     $previousPerfReportDockerOnly = $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY
-    $previousStreamingCsr = $env:GITGRAPH_LEVEL3_STREAMING_CSR
     if ($EnableLsmRocksdb) {
         $env:GITGRAPH_INGEST_PRIMARY = "rocksdb"
     }
     if ($HardwareMax) {
         $env:GITGRAPH_INGEST_WRITE_PROFILE = "throughput"
         $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = "1"
-        $env:GITGRAPH_LEVEL3_STREAMING_CSR = "0"
         if ([string]::IsNullOrWhiteSpace($previousWalkSort)) {
             $env:GITGRAPH_COMMIT_WALK_SORT = "breadth_first"
         }
@@ -595,11 +591,6 @@ finally {
         Remove-Item Env:GITGRAPH_PERF_REPORT_DOCKER_ONLY -ErrorAction SilentlyContinue
     } else {
         $env:GITGRAPH_PERF_REPORT_DOCKER_ONLY = $previousPerfReportDockerOnly
-    }
-    if ($null -eq $previousStreamingCsr) {
-        Remove-Item Env:GITGRAPH_LEVEL3_STREAMING_CSR -ErrorAction SilentlyContinue
-    } else {
-        $env:GITGRAPH_LEVEL3_STREAMING_CSR = $previousStreamingCsr
     }
     Pop-Location
 }

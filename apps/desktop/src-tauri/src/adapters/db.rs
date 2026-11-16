@@ -22,6 +22,7 @@ use crate::support::error::{AppError, AppResult};
 const LMDB_DEFAULT_MAP_SIZE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const LMDB_MIN_MAP_SIZE_BYTES: usize = 512 * 1024 * 1024;
 const LMDB_MAX_DBS: u32 = 17;
+const CHECKPOINT_KEY_VERSION: u8 = 2;
 const LMDB_NO_READAHEAD_ENV: &str = "GITGRAPH_LMDB_NO_READAHEAD";
 const LMDB_WRITE_MAP_ENV: &str = "GITGRAPH_LMDB_WRITE_MAP";
 const LMDB_MAP_ASYNC_ENV: &str = "GITGRAPH_LMDB_MAP_ASYNC";
@@ -446,6 +447,7 @@ impl GraphStore {
         let _ = delete_prefixed_entries(&mut txn, self.dbs.extraction_queue, repo_prefix.as_str())?;
 
         let repo_key = repo_id.to_be_bytes();
+        let _ = txn.del(self.dbs.checkpoints, &checkpoint_key(repo_id), None);
         let _ = txn.del(self.dbs.checkpoints, &repo_key, None);
         let _ = txn.del(self.dbs.csr_snapshots, &repo_key, None);
         let _ = txn.del(self.dbs.graph_snapshot_metadata, &repo_key, None);
@@ -1272,9 +1274,13 @@ impl GraphStore {
         checkpoint: &IndexCheckpoint,
     ) -> AppResult<()> {
         let mut txn = self.env.begin_rw_txn()?;
-        let key = repo_id.to_be_bytes();
         let raw = serialize(checkpoint, "serialize index checkpoint")?;
-        txn.put(self.dbs.checkpoints, &key, &raw, WriteFlags::empty())?;
+        txn.put(
+            self.dbs.checkpoints,
+            &checkpoint_key(repo_id),
+            &raw,
+            WriteFlags::empty(),
+        )?;
         append_delta_event(
             &mut txn,
             self.dbs,
@@ -1285,10 +1291,18 @@ impl GraphStore {
         Ok(())
     }
 
+    pub fn commit_exists(&self, repo_id: i64, sha: &str) -> AppResult<bool> {
+        let txn = self.env.begin_ro_txn()?;
+        match txn.get(self.dbs.commits, &repository_commit_key(repo_id, sha)) {
+            Ok(_) => Ok(true),
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn load_index_checkpoint(&self, repo_id: i64) -> AppResult<Option<IndexCheckpoint>> {
         let txn = self.env.begin_ro_txn()?;
-        let key = repo_id.to_be_bytes();
-        match txn.get(self.dbs.checkpoints, &key) {
+        match txn.get(self.dbs.checkpoints, &checkpoint_key(repo_id)) {
             Ok(raw) => Ok(Some(deserialize(raw, "deserialize index checkpoint")?)),
             Err(lmdb::Error::NotFound) => Ok(None),
             Err(error) => Err(error.into()),
@@ -1451,32 +1465,6 @@ impl GraphStore {
             Ok(true)
         })?;
         Ok(commits)
-    }
-
-    pub fn initialize_empty_csr_snapshot(&self, repo_id: i64) -> AppResult<()> {
-        let snapshot = CsrSnapshot {
-            generated_at_epoch: now_epoch_seconds(),
-            shas: Vec::new(),
-            parents_offsets: vec![0],
-            parents_neighbors: Vec::new(),
-            children_offsets: vec![0],
-            children_neighbors: Vec::new(),
-            directed_edges: 0,
-        };
-
-        let mut txn = self.env.begin_rw_txn()?;
-        let metadata = self.persist_graph_snapshot_state(&mut txn, repo_id, &snapshot)?;
-        append_delta_event(
-            &mut txn,
-            self.dbs,
-            Some(repo_id),
-            format!(
-                "csr_snapshot_initialize_empty version={} nodes={} directed_edges={}",
-                metadata.snapshot_version, metadata.node_count, metadata.directed_edges
-            ),
-        )?;
-        txn.commit()?;
-        Ok(())
     }
 
     pub fn rebuild_csr_snapshot(&self, repo_id: i64) -> AppResult<(usize, usize)> {
@@ -2226,6 +2214,14 @@ fn repository_prefix(repo_id: i64) -> String {
     format!("{repo_id:0REPO_KEY_WIDTH$}:")
 }
 
+/// Checkpoints written before ADR-0019 sit under the bare repo id and are ignored on purpose:
+/// those indexes may have lost edges, and a missing checkpoint makes the planner rebuild in full.
+fn checkpoint_key(repo_id: i64) -> [u8; 9] {
+    let mut key = [CHECKPOINT_KEY_VERSION; 9];
+    key[1..].copy_from_slice(&repo_id.to_be_bytes());
+    key
+}
+
 fn repository_commit_key(repo_id: i64, sha: &str) -> String {
     format!("{}{}", repository_prefix(repo_id), sha)
 }
@@ -2957,16 +2953,17 @@ fn deserialize<T: DeserializeOwned>(raw: &[u8], context: &str) -> AppResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use lmdb::EnvironmentFlags;
+    use lmdb::{EnvironmentFlags, Transaction, WriteFlags};
     use tempfile::TempDir;
 
     use super::{
-        effective_map_size_bytes, open_store, parse_configured_map_size_bytes, LmdbRuntimeOptions,
-        PlannerSessionWriteInput, FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS, LMDB_MIN_MAP_SIZE_BYTES,
+        effective_map_size_bytes, open_store, parse_configured_map_size_bytes, serialize,
+        LmdbRuntimeOptions, PlannerSessionWriteInput, FILE_CHANGE_EXTRACTION_MAX_ATTEMPTS,
+        LMDB_MIN_MAP_SIZE_BYTES,
     };
     use crate::domain::models::{
-        CommitMetadataState, CommitWindowCursor, IndexingMode, ParsedCommit, PlannerDegradedPolicy,
-        PlannerRiskLevel,
+        CommitMetadataState, CommitWindowCursor, IndexCheckpoint, IndexingMode, ParsedCommit,
+        PlannerDegradedPolicy, PlannerRiskLevel,
     };
 
     #[test]
@@ -3251,5 +3248,50 @@ mod tests {
             .unwrap_or_else(|error| panic!("load commit window page 2: {error}"));
         assert_eq!(page2.len(), 1);
         assert_eq!(page2[0].sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn checkpoint_written_before_the_edge_loss_fix_is_ignored() {
+        let temp = TempDir::new().unwrap_or_else(|error| panic!("create temp dir: {error}"));
+        let db_path = temp.path().join("graph-store");
+        let store = open_store(&db_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let repo_id = 7_i64;
+        let legacy = IndexCheckpoint {
+            last_committer_time: 10,
+            last_commit_sha: "a".repeat(40),
+            indexed_at_epoch: 11,
+        };
+        let raw = serialize(&legacy, "serialize legacy checkpoint")
+            .unwrap_or_else(|error| panic!("serialize legacy checkpoint: {error}"));
+        let mut txn = store
+            .env
+            .begin_rw_txn()
+            .unwrap_or_else(|error| panic!("begin txn: {error}"));
+        txn.put(
+            store.dbs.checkpoints,
+            &repo_id.to_be_bytes(),
+            &raw,
+            WriteFlags::empty(),
+        )
+        .unwrap_or_else(|error| panic!("write legacy checkpoint: {error}"));
+        txn.commit()
+            .unwrap_or_else(|error| panic!("commit legacy checkpoint: {error}"));
+
+        // Indexes built before ADR-0019 may have lost edges; no checkpoint forces one full rebuild.
+        let loaded = store
+            .load_index_checkpoint(repo_id)
+            .unwrap_or_else(|error| panic!("load checkpoint: {error}"));
+        assert!(loaded.is_none());
+
+        store
+            .upsert_index_checkpoint(repo_id, &legacy)
+            .unwrap_or_else(|error| panic!("upsert checkpoint: {error}"));
+        let reloaded = store
+            .load_index_checkpoint(repo_id)
+            .unwrap_or_else(|error| panic!("reload checkpoint: {error}"));
+        assert_eq!(
+            reloaded.map(|value| value.last_commit_sha),
+            Some("a".repeat(40))
+        );
     }
 }

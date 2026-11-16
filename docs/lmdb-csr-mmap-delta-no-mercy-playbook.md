@@ -370,7 +370,7 @@ Validation executed:
 3. Topology-aware extraction:
    - `--topo-order` semantics preserve ancestor-before-descendant visibility constraints.
    - Source: `git-rev-list`.
-4. Streaming CSR materialization:
+4. Streaming CSR materialization (removed by ADR 0019: per-batch deltas dropped edges whose parent arrived in a later batch):
    - Dynamic CSR research emphasizes avoiding full vertex-array rebuilds after every update and preserving fast contiguous traversal.
    - Source: BP-CSR paper (`batch_pcsr.pdf`).
 5. JIT enrichment coscheduling:
@@ -389,7 +389,7 @@ Validation executed:
 3. Topology-aware extraction:
    - Added `reorder_commits_topologically(...)` (Kahn-style parent-before-child ordering with stable tie-break by original chunk order).
    - Indexer uses it when `GITGRAPH_LEVEL3_TOPO_EXTRACTION_ORDER=1`.
-4. Streaming CSR materialization:
+4. Streaming CSR materialization (removed by ADR 0019: per-batch deltas dropped edges whose parent arrived in a later batch):
    - Added `GraphStore::initialize_empty_csr_snapshot(repo_id)` for full-index seed.
    - Indexer can apply CSR deltas per persisted commit batch when `GITGRAPH_LEVEL3_STREAMING_CSR=1`.
    - Fallback rebuild remains for safety when no streaming apply occurs.

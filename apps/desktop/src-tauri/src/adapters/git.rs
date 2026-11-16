@@ -238,10 +238,23 @@ struct CommitWalkPolicy {
     sort_reason: &'static str,
 }
 
+/// Lets an incremental walk skip commits older than the checkpoint that the index already holds.
+#[derive(Clone, Copy)]
+pub struct IncrementalCutoff<'a> {
+    pub since_epoch: i64,
+    pub is_indexed: &'a dyn Fn(&str) -> AppResult<bool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CutoffAction {
+    emit: bool,
+    prune: bool,
+}
+
+#[derive(Clone, Copy)]
 struct CommitWalkContext<'a> {
     sort_mode: CommitWalkSortMode,
-    since_epoch: Option<i64>,
+    cutoff: Option<IncrementalCutoff<'a>>,
     hide_ancestor_sha: Option<&'a str>,
     walk_scope: CommitWalkScope,
     boundary: CommitWalkBoundaryMode,
@@ -531,7 +544,6 @@ struct PackAwareTapeBuildContext<'a> {
     walk: CommitWalkContext<'a>,
     hidden: &'a FastObjectIdSet,
     boundary_oid: Option<ObjectId>,
-    frontier_since_epoch: Option<i64>,
     pack_state: &'a mut PackAwareTraversalState,
     phase_timing: &'a mut CommitWalkPhaseTiming,
 }
@@ -712,31 +724,21 @@ pub fn validate_repository(path: &Path) -> AppResult<CanonicalRepo> {
     })
 }
 
-pub fn load_commits(repo_root: &Path) -> AppResult<Vec<ParsedCommit>> {
-    collect_commits(repo_root, None)
-}
-
-pub fn load_commits_since(repo_root: &Path, since_epoch: i64) -> AppResult<Vec<ParsedCommit>> {
-    collect_commits(repo_root, Some(since_epoch.max(0)))
-}
-
 pub fn stream_commits(
     repo_root: &Path,
-    since_epoch: Option<i64>,
     batch_size: usize,
     on_batch: impl FnMut(Vec<ParsedCommit>) -> AppResult<()>,
 ) -> AppResult<CommitWalkExecutionStats> {
-    stream_commit_batches_with_hide(repo_root, since_epoch, None, batch_size, on_batch)
+    stream_commit_batches_with_hide(repo_root, None, None, batch_size, on_batch)
 }
 
 pub fn stream_commits_with_hide(
     repo_root: &Path,
-    since_epoch: Option<i64>,
     hide_ancestor_sha: Option<&str>,
     on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
 ) -> AppResult<CommitWalkExecutionStats> {
     let mut on_commit = on_commit;
-    stream_commit_batches_with_hide(repo_root, since_epoch, hide_ancestor_sha, 1, |commits| {
+    stream_commit_batches_with_hide(repo_root, None, hide_ancestor_sha, 1, |commits| {
         for commit in commits {
             on_commit(commit)?;
         }
@@ -746,14 +748,14 @@ pub fn stream_commits_with_hide(
 
 pub fn stream_commit_batches_with_hide(
     repo_root: &Path,
-    since_epoch: Option<i64>,
+    cutoff: Option<IncrementalCutoff<'_>>,
     hide_ancestor_sha: Option<&str>,
     batch_size: usize,
     mut on_batch: impl FnMut(Vec<ParsedCommit>) -> AppResult<()>,
 ) -> AppResult<CommitWalkExecutionStats> {
     let batch_size = batch_size.max(1);
     let mut pending = Vec::with_capacity(batch_size);
-    let stats = walk_commits(repo_root, since_epoch, hide_ancestor_sha, |commit| {
+    let stats = walk_commits(repo_root, cutoff, hide_ancestor_sha, |commit| {
         pending.push(commit);
         if pending.len() >= batch_size {
             flush_streamed_commit_batch(&mut pending, batch_size, &mut on_batch)?;
@@ -776,18 +778,9 @@ fn flush_streamed_commit_batch(
     on_batch(batch)
 }
 
-fn collect_commits(repo_root: &Path, since_epoch: Option<i64>) -> AppResult<Vec<ParsedCommit>> {
-    let mut commits = Vec::new();
-    let _ = stream_commits_with_hide(repo_root, since_epoch, None, |commit| {
-        commits.push(commit);
-        Ok(())
-    })?;
-    Ok(commits)
-}
-
 fn walk_commits(
     repo_root: &Path,
-    since_epoch: Option<i64>,
+    cutoff: Option<IncrementalCutoff<'_>>,
     hide_ancestor_sha: Option<&str>,
     mut on_commit: impl FnMut(ParsedCommit) -> AppResult<()>,
 ) -> AppResult<CommitWalkExecutionStats> {
@@ -796,10 +789,10 @@ fn walk_commits(
     let tip_collection_started = Instant::now();
     let (tips, effective_scope) = collect_revision_tips(&repo, requested_scope)?;
     let tip_collection_elapsed = tip_collection_started.elapsed();
-    let walk_policy = resolve_commit_walk_policy(since_epoch, hide_ancestor_sha);
+    let walk_policy = resolve_commit_walk_policy(cutoff.is_some(), hide_ancestor_sha);
     let walk_context = CommitWalkContext {
         sort_mode: walk_policy.sort_mode,
-        since_epoch,
+        cutoff,
         hide_ancestor_sha,
         walk_scope: effective_scope,
         boundary: resolve_commit_walk_boundary_mode(hide_ancestor_sha),
@@ -1020,11 +1013,6 @@ fn walk_commits_from_pack_frontier(
     } else {
         None
     };
-    let frontier_since_epoch = if context.walk_scope == CommitWalkScope::Frontier {
-        context.since_epoch
-    } else {
-        None
-    };
     let PackAwareTapeBuildResult {
         tape,
         mut emit_positions,
@@ -1035,7 +1023,6 @@ fn walk_commits_from_pack_frontier(
             walk: context,
             hidden: &hidden,
             boundary_oid,
-            frontier_since_epoch,
             pack_state,
             phase_timing: &mut phase_timing,
         },
@@ -1121,14 +1108,8 @@ fn build_pack_aware_walk_tape(
 
         let parent_count = parent_positions.len();
         let boundary_stop = build.boundary_oid == Some(oid);
-        let under_since_cutoff = build
-            .frontier_since_epoch
-            .is_some_and(|since| committer_time < since);
-        let should_emit = build
-            .walk
-            .since_epoch
-            .is_none_or(|since| committer_time >= since);
-        let should_expand = !boundary_stop && !under_since_cutoff;
+        let cutoff = cutoff_action(&build.walk, committer_time, || oid.to_hex().to_string())?;
+        let should_expand = !boundary_stop && !cutoff.prune;
 
         if should_expand {
             frontier.push_many(parent_positions.iter().copied());
@@ -1153,7 +1134,7 @@ fn build_pack_aware_walk_tape(
             continue;
         }
 
-        if under_since_cutoff {
+        if cutoff.prune {
             pruned_parent_expansions = pruned_parent_expansions.saturating_add(parent_count);
             build.phase_timing.nodes_pruned_count =
                 build.phase_timing.nodes_pruned_count.saturating_add(1);
@@ -1168,7 +1149,7 @@ fn build_pack_aware_walk_tape(
             .phase_timing
             .parent_resolve
             .saturating_add(parent_resolve_started.elapsed());
-        if should_emit {
+        if cutoff.emit {
             emit_positions.push(position);
         }
     }
@@ -1285,10 +1266,10 @@ fn walk_commits_from_commit_graph(
             }
 
             let committer_time = commit_graph_committer_time(commit);
-            let under_since_cutoff = context
-                .since_epoch
-                .is_some_and(|since| committer_time < since);
-            if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
+            let cutoff = cutoff_action(&context, committer_time, || {
+                commit.id().to_hex().to_string()
+            })?;
+            if cutoff.prune {
                 pruned_parent_expansions =
                     pruned_parent_expansions.saturating_add(parent_positions.len());
                 phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
@@ -1303,10 +1284,7 @@ fn walk_commits_from_commit_graph(
             phase_timing.parent_resolve = phase_timing
                 .parent_resolve
                 .saturating_add(parent_resolve_started.elapsed());
-            if context
-                .since_epoch
-                .is_none_or(|since| committer_time >= since)
-            {
+            if cutoff.emit {
                 phase_timing.metadata_pending_count =
                     phase_timing.metadata_pending_count.saturating_add(1);
                 let emit_started = Instant::now();
@@ -1384,11 +1362,10 @@ fn walk_commits_from_commit_graph(
             continue;
         }
 
-        let committer_time = entry.committer_time;
-        let under_since_cutoff = context
-            .since_epoch
-            .is_some_and(|since| committer_time < since);
-        if under_since_cutoff && context.walk_scope == CommitWalkScope::Frontier {
+        let cutoff = cutoff_action(&context, entry.committer_time, || {
+            commit.id().to_hex().to_string()
+        })?;
+        if cutoff.prune {
             pruned_parent_expansions =
                 pruned_parent_expansions.saturating_add(parent_positions.len());
             phase_timing.nodes_pruned_count = phase_timing.nodes_pruned_count.saturating_add(1);
@@ -1421,10 +1398,7 @@ fn walk_commits_from_commit_graph(
             .saturating_add(ordering_started.elapsed());
         phase_timing.queue_max_depth = phase_timing.queue_max_depth.max(queue.len());
 
-        if context
-            .since_epoch
-            .is_none_or(|since| committer_time >= since)
-        {
+        if cutoff.emit {
             phase_timing.metadata_pending_count =
                 phase_timing.metadata_pending_count.saturating_add(1);
             let emit_started = Instant::now();
@@ -2240,8 +2214,36 @@ fn parse_commit_walk_scope() -> CommitWalkScope {
         .unwrap_or(CommitWalkScope::Frontier)
 }
 
+/// Incremental walks stop only at commits the index already holds. A commit older than the
+/// checkpoint can still be new (an old-dated branch merged later), so age alone never prunes it.
+fn cutoff_action(
+    context: &CommitWalkContext<'_>,
+    committer_time: i64,
+    sha: impl FnOnce() -> String,
+) -> AppResult<CutoffAction> {
+    let Some(cutoff) = context
+        .cutoff
+        .filter(|cutoff| committer_time < cutoff.since_epoch)
+    else {
+        return Ok(CutoffAction {
+            emit: true,
+            prune: false,
+        });
+    };
+    if !(cutoff.is_indexed)(&sha())? {
+        return Ok(CutoffAction {
+            emit: true,
+            prune: false,
+        });
+    }
+    Ok(CutoffAction {
+        emit: false,
+        prune: context.walk_scope == CommitWalkScope::Frontier,
+    })
+}
+
 fn resolve_commit_walk_policy(
-    since_epoch: Option<i64>,
+    incremental: bool,
     hide_ancestor_sha: Option<&str>,
 ) -> CommitWalkPolicy {
     if let Some(explicit) = parse_commit_walk_sort_mode() {
@@ -2251,7 +2253,7 @@ fn resolve_commit_walk_policy(
         };
     }
 
-    if since_epoch.is_some() || hide_ancestor_sha.is_some() {
+    if incremental || hide_ancestor_sha.is_some() {
         return CommitWalkPolicy {
             sort_mode: CommitWalkSortMode::CommitTimeNewest,
             sort_reason: "incremental_default_newest",
@@ -4821,21 +4823,21 @@ mod tests {
 
         std::env::remove_var(COMMIT_WALK_SORT_ENV);
         assert_eq!(
-            resolve_commit_walk_policy(None, None).sort_mode,
+            resolve_commit_walk_policy(false, None).sort_mode,
             CommitWalkSortMode::CommitTimeNewest
         );
         assert_eq!(
-            resolve_commit_walk_policy(Some(123), None).sort_mode,
+            resolve_commit_walk_policy(true, None).sort_mode,
             CommitWalkSortMode::CommitTimeNewest
         );
         assert_eq!(
-            resolve_commit_walk_policy(None, Some("abc")).sort_mode,
+            resolve_commit_walk_policy(false, Some("abc")).sort_mode,
             CommitWalkSortMode::CommitTimeNewest
         );
 
         std::env::set_var(COMMIT_WALK_SORT_ENV, "commit_time_cutoff");
         assert_eq!(
-            resolve_commit_walk_policy(None, None).sort_mode,
+            resolve_commit_walk_policy(false, None).sort_mode,
             CommitWalkSortMode::CommitTimeCutoff
         );
 

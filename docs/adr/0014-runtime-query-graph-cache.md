@@ -1,7 +1,7 @@
 # ADR 0014: Runtime In-Memory Query Graph Cache
 
 Date: 2026-03-09
-Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-relational_query.md`)
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage.md`)
 
 ## Context
 

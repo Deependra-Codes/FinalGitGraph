@@ -135,7 +135,7 @@ Primary-source research points to the same practical design:
 ## References
 
 1. `docs/automation-guardrails.md`
-2. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
+2. `docs/adr/0015-lmdb-csr-delta-storage.md`
 3. `docs/adr/0016-overlay-adjacency-and-lmdb-map-flooring.md`
 4. `apps/desktop/src-tauri/src/adapters/db.rs`
 5. `apps/desktop/src-tauri/src/adapters/git.rs`

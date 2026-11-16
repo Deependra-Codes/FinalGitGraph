@@ -1,7 +1,7 @@
 # ADR 0007: Bounded Rayon Ingestion Compute with Single-Writer legacy_relational_engine Contract
 
 Date: 2026-03-07
-Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-relational_query.md`)
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage.md`)
 
 ## Context
 

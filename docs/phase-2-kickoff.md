@@ -27,5 +27,5 @@ Phase 2 delivered the core direction that remains valid:
 1. `docs/engineering-system.md`
 2. `docs/automation-guardrails.md`
 3. `docs/performance-engineering.md`
-4. `docs/adr/0015-lmdb-csr-delta-storage-no-relational_query.md`
+4. `docs/adr/0015-lmdb-csr-delta-storage.md`
 

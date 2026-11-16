@@ -488,7 +488,7 @@ fn full_commit_walk_uses_commit_graph_fast_path_when_preconditioned() {
         .unwrap_or_else(|error| panic!("parse expected all-ref count: {error}"));
     let mut batch_sizes = Vec::new();
     let mut walked_shas = Vec::new();
-    let walk_stats = stream_commits(&repo_dir, None, 2, |batch| {
+    let walk_stats = stream_commits(&repo_dir, 2, |batch| {
         batch_sizes.push(batch.len());
         walked_shas.extend(batch.into_iter().map(|commit| commit.sha));
         Ok(())
@@ -527,7 +527,7 @@ fn commit_graph_partial_fallback_dedupes_missing_tip_history() {
         .parse()
         .unwrap_or_else(|error| panic!("parse expected branch count: {error}"));
     let mut walked_shas = Vec::new();
-    let walk_stats = stream_commits_with_hide(&repo_dir, None, None, |commit| {
+    let walk_stats = stream_commits_with_hide(&repo_dir, None, |commit| {
         walked_shas.push(commit.sha);
         Ok(())
     })
@@ -565,12 +565,11 @@ fn incremental_pack_walk_uses_checkpoint_boundary_stop_without_duplicates() {
     let head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
 
     let mut walked_shas = Vec::new();
-    let walk_stats =
-        stream_commits_with_hide(&repo_dir, None, Some(checkpoint_sha.as_str()), |commit| {
-            walked_shas.push(commit.sha);
-            Ok(())
-        })
-        .unwrap_or_else(|error| panic!("direct commit walk: {error}"));
+    let walk_stats = stream_commits_with_hide(&repo_dir, Some(checkpoint_sha.as_str()), |commit| {
+        walked_shas.push(commit.sha);
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("direct commit walk: {error}"));
     assert_eq!(walked_shas, vec![head_sha]);
     assert_eq!(walk_stats.engine, "tape");
     assert_eq!(walk_stats.boundary_mode, "checkpoint_stop");
@@ -615,12 +614,11 @@ fn incremental_pack_fallback_stays_safe_when_checkpoint_is_missing_from_commit_g
     let head_sha = run_git_capture(&repo_dir, &["rev-parse", "HEAD"]);
 
     let mut walked_shas = Vec::new();
-    let walk_stats =
-        stream_commits_with_hide(&repo_dir, None, Some(checkpoint_sha.as_str()), |commit| {
-            walked_shas.push(commit.sha);
-            Ok(())
-        })
-        .unwrap_or_else(|error| panic!("direct missing-boundary commit walk: {error}"));
+    let walk_stats = stream_commits_with_hide(&repo_dir, Some(checkpoint_sha.as_str()), |commit| {
+        walked_shas.push(commit.sha);
+        Ok(())
+    })
+    .unwrap_or_else(|error| panic!("direct missing-boundary commit walk: {error}"));
     assert_eq!(walked_shas, vec![head_sha]);
     assert_eq!(walk_stats.engine, "tape");
     assert_eq!(walk_stats.boundary_mode, "checkpoint_stop");

@@ -1,7 +1,7 @@
 # ADR 0009: In-Memory Adjacency Graph from legacy_relational_engine for Perf Harness
 
 Date: 2026-03-07
-Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage-no-relational_query.md`)
+Status: Superseded by ADR 0015 (`0015-lmdb-csr-delta-storage.md`)
 
 ## Context
 
