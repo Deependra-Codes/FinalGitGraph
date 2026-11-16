@@ -33,7 +33,8 @@ Use `NNNN-short-title.md`, for example:
 17. `0017-single-tape-traversal-engine.md`
 18. `0018-commit-graph-fast-path-hardware-ingestion.md`
 19. `0019-remove-streaming-csr-and-age-only-pruning.md`
-20. `0026-level-1-index-session-planner.md`
+20. `0020-portable-automation-cargo-xtask.md`
+21. `0026-level-1-index-session-planner.md`
 
 ## Template
 

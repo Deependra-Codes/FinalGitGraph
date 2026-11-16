@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "apps/desktop/src-tauri",
+  "xtask",
 ]
 default-members = [
   "apps/desktop/src-tauri",

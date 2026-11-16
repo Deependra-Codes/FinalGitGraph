@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     env:
       CARGO_TERM_COLOR: always
 
@@ -60,6 +60,12 @@ jobs:
 
       - name: Unit Tests
         run: cargo test --workspace --locked
+
+      - name: xtask doctor
+        run: cargo xtask doctor
+
+      - name: xtask gate (parity with the steps above)
+        run: cargo xtask gate
 
       - name: Performance Budget
         if: matrix.os == 'ubuntu-latest'
